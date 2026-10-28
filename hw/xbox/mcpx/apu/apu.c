@@ -20,6 +20,7 @@
  */
 
 #include "apu_int.h"
+#include "ui/rombie-engine.h"
 
 MCPXAPUState *g_state; // Used via debug handlers
 
@@ -205,7 +206,7 @@ static void throttle(MCPXAPUState *d)
                 break;
             }
         }
-        d->next_frame_time_us += EP_FRAME_US;
+        d->next_frame_time_us += (int64_t)(EP_FRAME_US / rombie_engine_speed());
 
         /* Avoid drift toward watermark */
         if (queued_bytes >= 0) {

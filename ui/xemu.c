@@ -43,6 +43,7 @@
 #include "system/runstate-action.h"
 #include "system/system.h"
 #include "xui/xemu-hud.h"
+#include "rombie-engine.h"
 #include "xemu-input.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
@@ -744,6 +745,7 @@ static void process_vblank(struct xemu_console *scon)
     assert(bql_locked());
 
     update_fps();
+    rombie_engine_on_vblank();
 
 #if 0
     static uint64_t last_ns = 0;
@@ -762,7 +764,8 @@ static void vblank_timer_callback(void *opaque)
 
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     process_vblank(scon);
-    timer_mod_ns(vblank_timer, now + vblank_interval_ns);
+    timer_mod_ns(vblank_timer,
+                 now + (int64_t)(vblank_interval_ns / rombie_engine_speed()));
 }
 
 static void *vblank_timer_thread(void *opaque)
@@ -772,7 +775,7 @@ static void *vblank_timer_thread(void *opaque)
 
     while (!qatomic_read(&qemu_exiting)) {
         // Schedule next vblank at fixed interval (absolute deadline)
-        next_vblank += vblank_interval_ns;
+        next_vblank += (int64_t)(vblank_interval_ns / rombie_engine_speed());
 
         // Wait until deadline
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -865,6 +868,7 @@ static void gl_render_frame(struct xemu_console *scon)
     glClear(GL_COLOR_BUFFER_BIT);
     xemu_snapshots_set_framebuffer_texture(tex, flip_required);
     xemu_hud_set_framebuffer_texture(tex, flip_required);
+    rombie_engine_capture(tex, flip_required);
 
     /* FIXME: Finer locking. Event handlers in segments of the code expect
      * to be running on the main thread with the BQL. For now, acquire the
@@ -873,6 +877,7 @@ static void gl_render_frame(struct xemu_console *scon)
      */
     xemu_main_loop_lock();
     xemu_hud_update();
+    rombie_engine_run_pending();
     xemu_main_loop_unlock();
 
     xemu_hud_render();
@@ -1075,6 +1080,9 @@ static void display_very_early_init(DisplayOptions *o)
     }
 
     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (rombie_engine_enabled()) {
+        window_flags |= SDL_WINDOW_HIDDEN;
+    }
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1145,9 +1153,12 @@ static void display_early_init(DisplayOptions *o)
     display_opengl = 1;
 
     SDL_GL_MakeCurrent(m_window, m_context);
-    SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
+    SDL_GL_SetSwapInterval(
+        (g_config.display.window.vsync && !rombie_engine_enabled()) ? 1 : 0);
 #ifdef _WIN32
-    win32_dxgi_present_init(m_window);
+    if (!rombie_engine_enabled()) {
+        win32_dxgi_present_init(m_window);
+    }
 #endif
     xemu_hud_init(m_window, m_context);
 }
@@ -1347,7 +1358,7 @@ int main(int argc, char **argv)
         if (_fileno(stderr) == -2) {
             freopen("CONOUT$", "w+", stderr);
         }
-    } else {
+    } else if (!rombie_engine_is_link_launch(argc, argv)) {
         // Launched without a console. Redirect stdout and stderr to a log file.
         HANDLE logfile = CreateFileA("xemu.log",
             GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ,
@@ -1365,10 +1376,17 @@ int main(int argc, char **argv)
     fprintf(stderr, "xemu_commit: %s\n", xemu_commit);
     fprintf(stderr, "xemu_date: %s\n", xemu_date);
 
+    rombie_engine_early_init(argc, argv);
+
     init_sdl_app_metadata();
 
     gArgc = argc;
     gArgv = argv;
+
+    if (rombie_engine_enabled()) {
+        /* The engine's own config file; an explicit -config_path wins. */
+        xemu_settings_set_path(rombie_engine_config_path());
+    }
 
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "-config_path") == 0) {
@@ -1400,6 +1418,10 @@ int main(int argc, char **argv)
 
     display_very_early_init(NULL);
 
+    /* Engine mode: block here until a page's boot message supplies the
+     * firmware and disc, so QEMU below boots straight into the game. */
+    rombie_engine_wait_for_boot();
+
     qemu_sem_init(&display_init_sem, 0);
     qemu_sem_init(&display_shutdown_sem, 0);
     qemu_thread_create(&thread, "qemu_main", qemu_main,
@@ -1425,6 +1447,17 @@ int main(int argc, char **argv)
 
     struct xemu_console *scon = &scon_list[0];
     while (!qatomic_read(&qemu_exiting)) {
+        if (rombie_engine_enabled()) {
+            /* The hidden window gives no vsync to pace against. */
+            static int64_t next_render_ns;
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            next_render_ns += vblank_interval_ns;
+            if (now < next_render_ns) {
+                SDL_DelayPrecise(next_render_ns - now);
+            } else if (now > next_render_ns + vblank_interval_ns) {
+                next_render_ns = now;
+            }
+        }
         poll_events(scon);
         gl_render_frame(scon);
     }

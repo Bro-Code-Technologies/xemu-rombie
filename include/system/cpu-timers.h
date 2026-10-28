@@ -23,6 +23,11 @@ void cpu_timers_init(void);
 void cpu_enable_ticks(void);
 /* Caller must hold BQL */
 void cpu_disable_ticks(void);
+/*
+ * Run the VM's clock and ticks at `speed` times the host's from now on
+ * (Rombie's fast-forward). Caller must hold BQL.
+ */
+void cpu_set_vm_speed(double speed);
 
 /*
  * return the time elapsed in VM between vm_start and vm_stop.

@@ -57,6 +57,7 @@
 
 #include "hw/xbox/xbox.h"
 #include "smbus.h"
+#include "ui/rombie-engine.h"
 
 #define MAX_IDE_BUS 2
 
@@ -70,30 +71,44 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
     bios_name = ms->firmware ?: "bios.bin";
 
     int failed_to_load_bios = 1;
-    char *filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+    char *filename = NULL;
     uint32_t bios_size = 256 * 1024;
+    char *bios_data = NULL;
 
-    if (filename != NULL) {
-        int bios_file_size = get_image_size(filename, NULL);
-        if ((bios_file_size > 0) && ((bios_file_size % 65536) == 0)) {
-            failed_to_load_bios = 0;
-            bios_size = bios_file_size;
-        }
-    }
+    /* In Rombie's engine mode the page supplies the flash BIOS in memory;
+     * nothing firmware-shaped touches the disk. */
+    const uint8_t *rombie_flash;
+    uint32_t rombie_flash_size;
+    if (rombie_engine_get_flash(&rombie_flash, &rombie_flash_size)) {
+        bios_size = rombie_flash_size;
+        bios_data = g_malloc(bios_size);
+        memcpy(bios_data, rombie_flash, bios_size);
+        failed_to_load_bios = 0;
+    } else {
+        filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
 
-    char *bios_data = g_malloc(bios_size);
-    assert(bios_data != NULL);
-
-    if (!failed_to_load_bios && (filename != NULL)) {
-        /* Read BIOS ROM into memory */
-        failed_to_load_bios = 1;
-        int fd = qemu_open(filename, O_RDONLY | O_BINARY, NULL);
-        if (fd >= 0) {
-            int rc = read(fd, bios_data, bios_size);
-            if (rc == bios_size) {
+        if (filename != NULL) {
+            int bios_file_size = get_image_size(filename, NULL);
+            if ((bios_file_size > 0) && ((bios_file_size % 65536) == 0)) {
                 failed_to_load_bios = 0;
+                bios_size = bios_file_size;
             }
-            close(fd);
+        }
+
+        bios_data = g_malloc(bios_size);
+        assert(bios_data != NULL);
+
+        if (!failed_to_load_bios && (filename != NULL)) {
+            /* Read BIOS ROM into memory */
+            failed_to_load_bios = 1;
+            int fd = qemu_open(filename, O_RDONLY | O_BINARY, NULL);
+            if (fd >= 0) {
+                int rc = read(fd, bios_data, bios_size);
+                if (rc == bios_size) {
+                    failed_to_load_bios = 0;
+                }
+                close(fd);
+            }
         }
     }
 
@@ -143,7 +158,13 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
     const char *bootrom_file =
         object_property_get_str(qdev_get_machine(), "bootrom", NULL);
 
-    if ((bootrom_file != NULL) && *bootrom_file) {
+    const uint8_t *rombie_mcpx;
+    uint32_t rombie_mcpx_size;
+    if (rombie_engine_get_mcpx(&rombie_mcpx, &rombie_mcpx_size)) {
+        assert(rombie_mcpx_size == 512);
+        memcpy(bios_data + bios_size - rombie_mcpx_size, rombie_mcpx,
+               rombie_mcpx_size);
+    } else if ((bootrom_file != NULL) && *bootrom_file) {
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bootrom_file);
         assert(filename);
 

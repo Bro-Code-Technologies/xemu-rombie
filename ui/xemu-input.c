@@ -28,6 +28,7 @@
 #include "qemu/timer.h"
 #include "qemu/config-file.h"
 
+#include "rombie-engine.h"
 #include "xemu-input.h"
 #include "xemu-notifications.h"
 #include "xemu-settings.h"
@@ -262,6 +263,24 @@ static const int port_map[4] = { 3, 4, 1, 2 };
 
 void xemu_input_init(void)
 {
+    if (rombie_engine_enabled()) {
+        /* Input only ever comes from the page: four pads in the console's
+         * four ports, and none of this PC's keyboards or gamepads, so a pad
+         * can't drive the game twice or skip Rombie's controls. */
+        for (int port = 0; port < 4; port++) {
+            bound_drivers[port] = DRIVER_DUKE;
+            ControllerState *pad = g_new0(ControllerState, 1);
+            pad->type = INPUT_DEVICE_ROMBIE;
+            pad->name = "Rombie";
+            pad->bound = -1;
+            pad->peripheral_types[0] = PERIPHERAL_NONE;
+            pad->peripheral_types[1] = PERIPHERAL_NONE;
+            QTAILQ_INSERT_TAIL(&available_controllers, pad, entry);
+            xemu_input_bind(port, pad, 0);
+        }
+        return;
+    }
+
     if (g_config.input.background_input_capture) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
@@ -359,6 +378,10 @@ void xemu_save_peripheral_settings(int player_index, int peripheral_index,
 
 void xemu_input_process_sdl_events(const SDL_Event *event)
 {
+    if (rombie_engine_enabled()) {
+        return;
+    }
+
     if (event->type == SDL_EVENT_GAMEPAD_ADDED) {
         DPRINTF("Controller Added: %d\n", event->gdevice.which);
 
@@ -516,6 +539,8 @@ void xemu_input_update_controller(ControllerState *state)
         xemu_input_update_sdl_kbd_controller_state(state);
     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
         xemu_input_update_sdl_controller_state(state);
+    } else if (state->type == INPUT_DEVICE_ROMBIE && state->bound >= 0) {
+        rombie_engine_read_pad(state->bound, &state->buttons, state->axis);
     }
 
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);

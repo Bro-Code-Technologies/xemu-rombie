@@ -206,6 +206,18 @@ bool qemu_clock_expired(QEMUClockType type)
 }
 
 /*
+ * How many times faster than the host the virtual clock runs (Rombie's
+ * fast-forward). Deadlines are waited out in host time, so a virtual
+ * deadline is that much shorter.
+ */
+static volatile double virtual_clock_speed = 1.0;
+
+void qemu_timer_set_virtual_speed(double speed)
+{
+    virtual_clock_speed = speed;
+}
+
+/*
  * As above, but return -1 for no deadline, and do not cap to 2^32
  * as we know the result is always positive.
  */
@@ -238,6 +250,13 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
 
     if (delta <= 0) {
         return 0;
+    }
+
+    if (timer_list->clock->type == QEMU_CLOCK_VIRTUAL) {
+        const double speed = virtual_clock_speed;
+        if (speed > 1.0) {
+            delta = (int64_t)(delta / speed);
+        }
     }
 
     return delta;

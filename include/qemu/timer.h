@@ -200,6 +200,15 @@ int64_t qemu_clock_deadline_ns_all(QEMUClockType type, int attr_mask);
 void qemu_clock_notify(QEMUClockType type);
 
 /**
+ * qemu_timer_set_virtual_speed:
+ * @speed: how many times faster than the host the virtual clock runs
+ *
+ * Shortens waits for virtual-clock deadlines to match (Rombie's
+ * fast-forward; see cpu_set_vm_speed).
+ */
+void qemu_timer_set_virtual_speed(double speed);
+
+/**
  * qemu_clock_enable:
  * @type: the clock type
  * @enabled: true to enable, false to disable

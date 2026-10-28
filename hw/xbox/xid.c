@@ -20,6 +20,7 @@
  */
 
 #include "xid.h"
+#include "ui/rombie-engine.h"
 
 /*
  * http://xbox-linux.cvs.sourceforge.net/viewvc/xbox-linux/kernel-2.6/drivers/usb/input/xpad.c
@@ -62,6 +63,7 @@ void update_input(USBXIDGamepadState *s)
     ControllerState *state = xemu_input_get_bound(s->device_index);
     assert(state);
     xemu_input_update_controller(state);
+    rombie_engine_on_pad_poll(s->device_index, state->buttons);
 
     const int button_map_analog[6][2] = {
         { GAMEPAD_A,     CONTROLLER_BUTTON_A     },

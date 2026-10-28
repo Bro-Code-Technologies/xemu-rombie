@@ -29,6 +29,7 @@ xemu_ss.add(files(
 
   'xemu.c',
   'xemu-data.c',
+  'rombie-engine-media.c',
   'xemu-snapshots.c',
   'xemu-thumbnail.cc',
   'xemu-widescreen.c',

@@ -147,6 +147,7 @@
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-net.h"
 #include "ui/xemu-input.h"
+#include "ui/rombie-engine.h"
 #include "hw/xbox/eeprom_generation.h"
 
 #define MAX_VIRTIO_CONSOLES 1
@@ -3039,7 +3040,9 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *flashrom_path = g_config.sys.files.flashrom_path;
-    if (g_config.general.show_welcome) {
+    if (rombie_engine_enabled()) {
+        // The firmware arrives from the page, in memory (hw/xbox/xbox.c).
+    } else if (g_config.general.show_welcome) {
         // Don't display an error if this is the first boot. Give user a chance
         // to configure the path.
         autostart = 0;
@@ -3084,6 +3087,11 @@ void qemu_init(int argc, char **argv)
             }
             break;
         }
+    }
+
+    if (rombie_engine_enabled()) {
+        // The disc is served by the page in chunks (block/rombie-disc.c).
+        dvd_path = "rombie:";
     }
 
     // Always populate DVD drive. If disc path is the empty string, drive is

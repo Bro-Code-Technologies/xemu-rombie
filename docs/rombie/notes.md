@@ -1,4 +1,4 @@
-# Rombie Xbox engine — Phase 1 notes (fork, build, boot test)
+# Rombie Xbox engine — notes (fork, build, spike, engine mode)
 
 Fork of [xemu](https://github.com/xemu-project/xemu) for Rombie's Xbox
 local engine, following the pcsx2-rombie conventions: work happens on
@@ -114,3 +114,116 @@ Consequences for the engine:
   for Rombie's slots UI is load-bearing.
 - Snapshot shortcuts F5-F8 exist upstream (`general.snapshots.*`) but
   are irrelevant to the windowless engine.
+
+## Phase 2 spike: windowless frames and sound into a canvas
+
+The spike was `ui/xui/rombie-spike.cc`, enabled by an environment
+variable: the SDL window created hidden, the render loop paced to the
+vblank interval (no vsync to lean on), DXGI present skipped, and a
+localhost WebSocket streaming to one page in the PS2 engine's message
+layout. Phase 3's engine mode (below) replaced it and kept its hooks.
+
+Hook points (the Phase 3 engine keeps these):
+
+- Video: in `gl_render_frame` (`ui/xemu.c`), the texture from
+  `nv2a_get_framebuffer_surface()` is the game's framebuffer at its own
+  resolution. Render it into a same-size FBO with the flip inverted
+  (the `RenderFramebufferToPng` recipe in `ui/xui/gl-helpers.cc`), then
+  `glReadPixels` — ~0.6-0.7 ms at 640x480 on the 5950X. Alpha must be
+  forced opaque. Double-buffer to a sender thread; drop when it is
+  mid-send.
+- Audio: `mcpx_apu_monitor_frame` (`hw/xbox/mcpx/apu/monitor.c`) holds
+  the final 48 kHz stereo S16 mix, 256 frames per push; skip opening
+  the SDL audio device so the page is the only speaker.
+
+Measured 2026-10-27, Burnout 2 title scene, headless Chrome driving the
+test page on the 5950X / RTX 5070 Ti:
+
+- 60 fps at 640x480, ~74 MB/s over localhost (PS2 engine: ~65 MB/s).
+- Frame-ready to canvas-drawn delay 0.8-2.3 ms average (PS2: 2-3 ms).
+- Audio at exactly 48 kHz, zero worklet underruns against a 100 ms
+  prime buffer; ~0-1 frame dropped per second by the engine's
+  drop-when-busy policy.
+
+## Phase 3: engine mode
+
+`ui/xui/rombie-engine.cc` (+ `ui/rombie-engine.h`,
+`ui/rombie-engine-version.h`) turns the build into Rombie's engine when it
+is started with `--link <url>` or `--key <key>`; with no engine argument it
+is stock xemu. Launch modes, link registration, one-time key, origin check,
+one page at a time and the port handoff follow `pcsx2-rombie/Main.cpp`; the
+message layout is documented at the top of `rombie-engine.cc`. Releasing:
+`rombie/RELEASING.md`; packaging: `rombie/package.ps1`.
+
+- Port 47653 (the PS2 engine has 47652); data folder
+  `%LOCALAPPDATA%\RombieXbox` (`-<port>` suffix for a dev engine on another
+  port): `xemu.toml`, `eeprom.bin`, `hdd-scratch.qcow2`, and, for a link
+  start, `engine.log` (one per run).
+- Boot: QEMU starts only once the page's boot message arrives. Flash BIOS
+  and MCPX ROM stay in memory (`hw/xbox/xbox.c`); the disc is the `rombie:`
+  block driver (`block/rombie-disc.c`), which forwards each read to the page
+  and completes it in a bottom half. The HDD starts from `xbox_hdd.qcow2`
+  beside the exe until Phase 4 hands that to the page.
+- Input: four `INPUT_DEVICE_ROMBIE` pads bound to the console's four ports
+  (`ui/xemu-input.c`); none of the PC's keyboards or gamepads are opened.
+- Fast-forward: `cpu_set_vm_speed()` (`system/cpu-timers.c`) scales the VM
+  clock and ticks from an anchor so neither jumps; virtual-clock timer waits
+  shrink to match (`util/qemu-timer.c`), and the two real-time pacers, guest
+  vblanks (`ui/xemu.c`) and APU frames (`apu.c`), divide by the speed. The
+  page still gets 48 kHz: the engine forwards 1/speed of the audio blocks.
+- Stats (once a second) include `vbl` (guest vblanks), `speed`, `padMsgs`,
+  `guestPolls` per port and `guestSeen` (buttons the guest read): the first
+  place to look when input seems dead.
+
+Gotchas found on the way (2026-10-28):
+
+- **xemu's HUD swallows input.** `InputManager::Update` turns on "test mode"
+  whenever its ImGui HUD has navigation focus, and test mode makes every
+  pad report zeros to the guest. The hidden HUD can hold focus, so engine
+  mode never sets test mode (`ui/xui/input-manager.cc`).
+- **Browsers fragment big messages.** A boot message with a 1 MB flash BIOS
+  arrives as continuation frames; the reader joins them.
+- **No `exit()` from engine code.** It runs xemu's UI static destructors,
+  which crash (0xC0000005) when the UI never started, as in `--version`,
+  setup or a no-page link start. `QuitNow()` flushes and `_exit()`s.
+- **Listen first, then hand off.** A bind probe before the real bind made
+  link starts fail to listen; the engine now listens on the main thread
+  (with `SO_EXCLUSIVEADDRUSE`) and only tries the handoff when that fails.
+- **Burnout 2 ignores input for about 40 s after boot** while its intro
+  runs; tests that press Start earlier see nothing happen.
+- **`-monitor tcp:127.0.0.1:4555,server,nowait`** passes through to QEMU in
+  engine mode too; `info usb` and `trace-event usb_ohci_* on` found the
+  input bug.
+
+Verified on the 5950X / RTX 5070 Ti with Burnout 2 through Rombie's
+`engine/xbox/engine-test.html` driven by headless Chrome: boot from
+page-supplied firmware and disc chunks; keyboard Start and a gamepad's A
+reach the game (title to LOAD/SAVE); pause freezes picture and sound,
+resume restarts them, exit ends the process; fast-forward x2 runs 120
+guest vblanks/s against 60 at x1; foreign origin and no origin get 403, a
+stale key 4001, a second tab 4002. From the release zip, unzipped fresh:
+`--version` prints the version, a `--link` start plays, ends 10 s after
+its page leaves, and ends after 60 s when no page comes.
+
+## Phase 4: the game's media
+
+`ui/rombie-engine-media.c` (+ `.h`) runs on the UI thread with the BQL
+held, as xemu's own snapshot actions do.
+
+- One blob per game, which the page stores: `RXBX`, u32 format (1), u32
+  EEPROM size, u64 image size, the EEPROM, the qcow2 image. The page sends
+  it before boot (0x08; empty means a new game: the bundled blank disk and
+  a freshly generated EEPROM); the engine validates it (header sizes, qcow2
+  magic) and refuses to boot on a bad one rather than hand back a blank
+  disk as the game's data.
+- The engine returns the blob (0x85) a second after the game's last disk
+  write (the HDD BlockBackend's write counter, `ide0-hd0`), after every
+  state change, before a pause and on exit. Reading it: drain all I/O,
+  flush, read the qcow2 file and the EEPROM, end the drain.
+- Save states are xemu snapshots inside that image, one per slot, tagged
+  `slot<N>@<engine version>`. A load of a state made on another version is
+  refused with a `state-version` event. Thumbnails stay xemu's (inside the
+  snapshot); Rombie's own slot records keep the page's thumbnail.
+- Sizes on Burnout 2: blank disk 1.6 MB, 2.1 MB with one profile saved,
+  52.4 MB with one state. Deleting a state frees its space inside the file
+  but does not shrink the file.

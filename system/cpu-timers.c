@@ -40,11 +40,58 @@
 
 /* clock and ticks */
 
+/*
+ * Rombie's fast-forward: the host clock and ticks the VM's are built from,
+ * running at vm_speed times the host's. Each speed change starts from an
+ * anchor at the current value, so neither ever jumps. Written under
+ * vm_clock_seqlock and vm_clock_lock, like the offsets.
+ */
+static double vm_speed = 1.0;
+static bool vm_speed_anchored;
+static int64_t vm_clock_anchor_host, vm_clock_anchor;
+static int64_t vm_ticks_anchor_host, vm_ticks_anchor;
+
+static int64_t vm_host_clock(void)
+{
+    if (!vm_speed_anchored) {
+        return get_clock();
+    }
+    return vm_clock_anchor +
+           (int64_t)((get_clock() - vm_clock_anchor_host) * vm_speed);
+}
+
+static int64_t vm_host_ticks(void)
+{
+    if (!vm_speed_anchored) {
+        return cpu_get_host_ticks();
+    }
+    return vm_ticks_anchor +
+           (int64_t)((cpu_get_host_ticks() - vm_ticks_anchor_host) * vm_speed);
+}
+
+void cpu_set_vm_speed(double speed)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    const int64_t clock = vm_host_clock();
+    const int64_t ticks = vm_host_ticks();
+    vm_clock_anchor_host = get_clock();
+    vm_clock_anchor = clock;
+    vm_ticks_anchor_host = cpu_get_host_ticks();
+    vm_ticks_anchor = ticks;
+    vm_speed = speed;
+    vm_speed_anchored = true;
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    qemu_timer_set_virtual_speed(speed);
+    qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+}
+
 static int64_t cpu_get_ticks_locked(void)
 {
     int64_t ticks = timers_state.cpu_ticks_offset;
     if (timers_state.cpu_ticks_enabled) {
-        ticks += cpu_get_host_ticks();
+        ticks += vm_host_ticks();
     }
 
     if (timers_state.cpu_ticks_prev > ticks) {
@@ -77,7 +124,7 @@ int64_t cpu_get_clock_locked(void)
 
     time = timers_state.cpu_clock_offset;
     if (timers_state.cpu_ticks_enabled) {
-        time += get_clock();
+        time += vm_host_clock();
     }
 
     return time;
@@ -109,8 +156,8 @@ void cpu_enable_ticks(void)
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     if (!timers_state.cpu_ticks_enabled) {
-        timers_state.cpu_ticks_offset -= cpu_get_host_ticks();
-        timers_state.cpu_clock_offset -= get_clock();
+        timers_state.cpu_ticks_offset -= vm_host_ticks();
+        timers_state.cpu_clock_offset -= vm_host_clock();
         timers_state.cpu_ticks_enabled = 1;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
@@ -127,7 +174,7 @@ void cpu_disable_ticks(void)
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     if (timers_state.cpu_ticks_enabled) {
-        timers_state.cpu_ticks_offset += cpu_get_host_ticks();
+        timers_state.cpu_ticks_offset += vm_host_ticks();
         timers_state.cpu_clock_offset = cpu_get_clock_locked();
         timers_state.cpu_ticks_enabled = 0;
     }

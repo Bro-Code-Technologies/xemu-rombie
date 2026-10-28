@@ -18,6 +18,7 @@
  */
 
 #include "apu_int.h"
+#include "ui/rombie-engine.h"
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
@@ -28,6 +29,11 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     };
 
     d->monitor.stream = NULL;
+
+    /* The page is the speaker; don't open a host audio device. */
+    if (rombie_engine_enabled()) {
+        return;
+    }
 
     if (!SDL_Init(SDL_INIT_AUDIO)) {
         error_setg(errp, "SDL_Init failed: %s", SDL_GetError());
@@ -72,6 +78,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
+
+    rombie_engine_submit_audio(d->monitor.frame_buf, 256);
 
     if (d->monitor.stream) {
         float vu = pow(fmax(0.0, fmin(g_config.audio.volume_limit, 1.0)), M_E);
