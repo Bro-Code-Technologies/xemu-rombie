@@ -37,8 +37,14 @@ foreach ($file in $pinned.Keys) {
 Copy-Item (Join-Path $cache 'xbox_hdd.qcow2') "$stage\xbox_hdd.qcow2"
 
 New-Item -ItemType Directory "$stage\licenses" | Out-Null
-# xemu's own license with every library it links (written by the build's gen-license.py).
-Copy-Item "$Dist\LICENSE.txt" "$stage\LICENSE.txt"
+# xemu's own license with every library it links (written by the build's gen-license.py). Its
+# header sends readers to upstream xemu for the source; this build's source is the fork, at the
+# release's tag.
+$license = [IO.File]::ReadAllText((Resolve-Path "$Dist\LICENSE.txt"))
+$upstream = 'is available at:' + "`n`n" + (' ' * 32) + 'https://xemu.app'
+if (-not $license.Contains($upstream)) { throw "LICENSE.txt's source line changed; update package.ps1 to match." }
+$fork = 'is available at:' + "`n`n" + (' ' * 32) + "https://github.com/Bro-Code-Technologies/xemu-rombie/tree/rombie-xbox-engine-$version"
+[IO.File]::WriteAllText((Join-Path (Resolve-Path $stage) 'LICENSE.txt'), $license.Replace($upstream, $fork))
 Copy-Item (Join-Path $cache 'LICENSE') "$stage\licenses\xemu-dashboard.txt"
 
 $readme = @"
