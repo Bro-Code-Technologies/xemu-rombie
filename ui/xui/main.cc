@@ -50,6 +50,7 @@
 #include "welcome.hh"
 #include "menubar.hh"
 #include "compat.hh"
+#include "../rombie-engine.h"
 #if defined(_WIN32)
 #include "update.hh"
 #endif
@@ -149,7 +150,9 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     ImPlot::CreateContext();
 
 #if defined(_WIN32)
-    if (!g_config.general.show_welcome && g_config.general.updates.check) {
+    // Engine mode has no window to show it, and makes no internet connection.
+    if (!rombie_engine_enabled() && !g_config.general.show_welcome &&
+        g_config.general.updates.check) {
         update_window.CheckForUpdates();
     }
 #endif

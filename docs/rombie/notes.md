@@ -194,6 +194,11 @@ Gotchas found on the way (2026-10-28):
 - **`-monitor tcp:127.0.0.1:4555,server,nowait`** passes through to QEMU in
   engine mode too; `info usb` and `trace-event usb_ohci_* on` found the
   input bug.
+- **No update check.** With `general.updates.check` on, xemu asks GitHub's
+  API for its latest release at every start (`ui/xui/main.cc`,
+  `ui/xui/update.cc`). Engine mode skips it: it has no window to show the
+  answer, and the engine makes no internet connection. 2026.0.0 still made
+  it (found 2026-11-12); 2026.0.1 doesn't.
 
 Verified on the 5950X / RTX 5070 Ti with Burnout 2 through Rombie's
 `engine/xbox/engine-test.html` driven by headless Chrome: boot from
