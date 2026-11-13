@@ -132,13 +132,19 @@ static constexpr size_t AUDIO_RING_FRAMES = 48000; /* 1 s of 48 kHz stereo */
 /* The game data blob carries every save state (~50 MB each) with the disk. */
 static constexpr size_t MAX_MESSAGE_SIZE = (size_t)1 << 30;
 
-/* The only pages that may drive the engine. */
+/* The only pages that may drive the engine: Rombie in production, its staging site, and Rombie's local servers below. */
 static constexpr const char *ALLOWED_ORIGINS[] = {
     "https://rombie.app",
     "https://staged.rombie.app",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
 };
+/* Rombie's local port block (brotocol's web-apps profile): its dev server, its preview and the rest of the block, on
+ * either local host name. */
+static constexpr const char *DEV_BLOCK_HOSTS[] = {
+    "http://localhost:",
+    "http://127.0.0.1:",
+};
+static constexpr int DEV_BLOCK_FIRST_PORT = 10020;
+static constexpr int DEV_BLOCK_LAST_PORT = 10029;
 
 /* How long a link-started engine waits for its page before booting, and how
  * long a running game outlives its page, so a reload can reconnect. */
@@ -362,6 +368,27 @@ static std::string QueryParam(const std::string &url, const char *name)
     return "";
 }
 
+/* Exactly a block host and five digits within the block, with nothing after them. */
+static bool IsDevBlockOrigin(const std::string &origin)
+{
+    for (const char *host : DEV_BLOCK_HOSTS) {
+        const size_t length = strlen(host);
+        if (origin.size() != length + 5 || origin.compare(0, length, host) != 0) {
+            continue;
+        }
+        int port = 0;
+        for (size_t i = length; i < origin.size(); i++) {
+            const char ch = origin[i];
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            port = port * 10 + (ch - '0');
+        }
+        return port >= DEV_BLOCK_FIRST_PORT && port <= DEV_BLOCK_LAST_PORT;
+    }
+    return false;
+}
+
 static bool IsAllowedOrigin(const std::string &origin)
 {
     for (const char *allowed : ALLOWED_ORIGINS) {
@@ -369,7 +396,7 @@ static bool IsAllowedOrigin(const std::string &origin)
             return true;
         }
     }
-    return !s_dev_origin.empty() && origin == s_dev_origin;
+    return IsDevBlockOrigin(origin) || (!s_dev_origin.empty() && origin == s_dev_origin);
 }
 
 /* --------------------------------------------------------------------------
