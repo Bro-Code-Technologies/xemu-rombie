@@ -20,10 +20,13 @@
  *   0x0E delete state [u8 type][u8 slot]
  *   0x0B lockstep  [u8 type][u8 flags][2 pad][u32 hash every][u16 year]
  *                  [u8 month][u8 day][u8 hour][u8 minute][u8 second][pad]
- *                  (before boot; flags: 1 lockstep, 2 unthrottled; 0x08
- *                  keeps the GPU from working ahead between the CPU's
- *                  waits; 0x10, 0x20 and 0x40 leave the APU, GPU and I/O
- *                  syncs off; 0x08 and up for development tests only)
+ *                  (before boot; flags: 1 lockstep, 2 unthrottled; 0x04
+ *                  a speed test, which sends one frame in ten and no game
+ *                  data, so its page and tools cost the PC little; 0x08
+ *                  keeps the GPU from working
+ *                  ahead between the CPU's waits; 0x10, 0x20 and 0x40
+ *                  leave the APU, GPU and I/O syncs off; 0x04 and up for
+ *                  development tests only)
  *   0x0C inputs    [u8 type][3 pad][u32 first vblank][u32 count]
  *                  [count x 4 pads: u16 buttons, i8 lx, ly, rx, ry,
  *                  u8 lt, rt]     (lockstep: vblank N runs once N's are in)
@@ -147,6 +150,7 @@ static constexpr uint8_t MSG_VBLANK = 0x87;
 
 static constexpr uint8_t LOCKSTEP_ON = 0x01;
 static constexpr uint8_t LOCKSTEP_UNTHROTTLED = 0x02;
+static constexpr uint8_t LOCKSTEP_SPEED_TEST = 0x04;
 static constexpr uint8_t LOCKSTEP_GPU_SERIAL = 0x08;
 static constexpr uint8_t LOCKSTEP_NO_APU_SYNC = 0x10;
 static constexpr uint8_t LOCKSTEP_NO_GPU_SYNC = 0x20;
@@ -1245,6 +1249,12 @@ static void HandleGameData(const std::vector<uint8_t> &data)
 static void SendGameData(void)
 {
     s_hdd_dirty = false;
+    /* A speed test keeps nothing, and a game that fills its cache
+     * partitions (Halo 2: 700 MB) would have it read and sent again and
+     * again. */
+    if (rombie_engine_lockstep() && (s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
+        return;
+    }
     uint8_t *blob = nullptr;
     size_t size = 0;
     char *error = nullptr;
@@ -2172,6 +2182,12 @@ void rombie_engine_capture(uint32_t tex, bool flip)
     if (!rombie_engine_enabled() ||
         !s_page_connected.load(std::memory_order_acquire) || tex == 0) {
         return;
+    }
+    if (rombie_engine_lockstep() && (s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
+        static unsigned skipped;
+        if (++skipped % 10) {
+            return;
+        }
     }
     const double start_ms = NowMs();
 
