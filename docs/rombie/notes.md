@@ -485,8 +485,8 @@ into a machine that has never run.
   and a GPU running ahead first does all it was given, as if the CPU waited
   for it (`pfifo_lockstep_reset`), so its held writes land before the
   registers go.
-- **What only the host does.** In lockstep a save, a load, the host's
-  handoff and exit run on the UI thread while the CPU holds at a vblank
+- **What only the host does.** In lockstep a save, a load, a pause, the
+  host's handoff and exit run on the UI thread while the CPU holds at a vblank
   (`QueueAtVblank`), where the GPU has done all it was given: stopped
   anywhere else its thread may be parked on an interrupt for a CPU that no
   longer runs. A slot save there leaves the GPU's surfaces out of memory
@@ -495,11 +495,18 @@ into a machine that has never run.
   holds memory as the game left it; a surface the game doesn't draw again
   after a load shows its old pixels. A state saved in lockstep carries its
   guest time in `cpu_clock_offset`, where an engine running alone reads it.
+  The game data read-back (0x85: a drain, a flush and the files read, at
+  the engine's own moments) changes nothing the game sees: both engines of a
+  check read theirs back every 0.7-2 s (`ROMBIE_LOCKSTEP_READBACK_MS`) and
+  stay identical.
 - **0x0D end**: the vblanks stop waiting for input and the guest reads the
   page's own pads again, at the guest speed reached.
 - **Development**: with `ROMBIE_HANDOFF_DIR` set the host writes the
   handoff there and sends 0x88 empty, and a join with no state reads it from
   there, so the test page's DevTools connection never carries Halo 2's disk.
+  With `ROMBIE_LOCKSTEP_READBACK_MS` set, a speed test (which sends no game
+  data) still reads its game data back that often while it runs, and drops
+  it.
 
 Figures (main PC): TimeSplitters 2's state is 61-62 MB (8.1-8.5 MB
 gzipped), the guests' game data 3.1 MB (0.9 MB), the host's stop and copy

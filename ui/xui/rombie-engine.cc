@@ -50,7 +50,9 @@
  *                  state.bin) and sends 0x88 empty, and a join with no state
  *                  reads the state and the game data from there ([2]: 1 the
  *                  guests', 2 the host's own), so a test page's DevTools
- *                  connection never carries them (Halo 2's disk: 700 MB)
+ *                  connection never carries them (Halo 2's disk: 700 MB);
+ *                  ROMBIE_LOCKSTEP_READBACK_MS has a speed test read its
+ *                  game data back that often, as 0x85 would, and drop it
  *   0x0F speed at  [u8 type][3 pad][u32 vblank][u32 guest speed, as 0x0B's]
  *                  (lockstep: from that vblank on; every engine needs the
  *                  same before it gets there, so the page slows or speeds
@@ -1268,11 +1270,12 @@ static void HandleControl(const std::vector<uint8_t> &data)
         return;
     }
     const uint8_t op = data[1];
-    QueueWork([op]() {
-        if (!s_vm_ready.load()) {
-            return;
-        }
-        if (op == CONTROL_PAUSE && runstate_is_running()) {
+    if (op == CONTROL_PAUSE) {
+        /* In lockstep at a vblank, as a save is. */
+        QueueAtVblank([]() {
+            if (!s_vm_ready.load() || !runstate_is_running()) {
+                return;
+            }
             /* A save written just before pausing shouldn't wait for the
              * game to resume. */
             if (s_hdd_dirty) {
@@ -1280,7 +1283,14 @@ static void HandleControl(const std::vector<uint8_t> &data)
             }
             vm_stop(RUN_STATE_PAUSED);
             SendEvent("paused");
-        } else if (op == CONTROL_RESUME && !runstate_is_running()) {
+        });
+        return;
+    }
+    QueueWork([op]() {
+        if (!s_vm_ready.load()) {
+            return;
+        }
+        if (op == CONTROL_RESUME && !runstate_is_running()) {
             vm_start();
             SendEvent("resumed");
         } else if (op == CONTROL_RESTART) {
@@ -1405,6 +1415,39 @@ static void SendGameDataNow(void)
     uint8_t header[8] = { MSG_GAME_DATA_SAVED };
     SendMessageParts(0x2, header, sizeof(header), blob, size);
     g_free(blob);
+}
+
+/* Development: with ROMBIE_LOCKSTEP_READBACK_MS set, a speed test (which
+ * sends no game data) still reads its game data back every that many ms
+ * while it runs, as 0x85 would at its own moments, and drops it: a check that
+ * the drain and the read don't change what the game sees. */
+static void ReadBackForTest(void)
+{
+    static const double every = [] {
+        const char *env = getenv("ROMBIE_LOCKSTEP_READBACK_MS");
+        return env ? atof(env) : 0.0;
+    }();
+    static double last;
+    static int count;
+    if (every <= 0 || !rombie_engine_lockstep() || !runstate_is_running() ||
+        NowMs() - last < every) {
+        return;
+    }
+    uint8_t *blob = nullptr;
+    size_t size = 0;
+    char *error = nullptr;
+    const double from = NowMs();
+    const bool ok = rombie_media_read_blob(&blob, &size, &error);
+    last = NowMs();
+    if (++count % 10 == 1 || !ok) {
+        fprintf(stderr,
+                "rombie-engine: game data read back (development) %d: %s, "
+                "%zu bytes in %.0f ms\n",
+                count, ok ? "ok" : (error ? error : "failed"), size,
+                last - from);
+    }
+    g_free(blob);
+    g_free(error);
 }
 
 static void SendGameData(void)
@@ -2496,6 +2539,7 @@ void rombie_engine_run_pending(void)
         if (s_hdd_dirty && NowMs() - s_hdd_written_ms >= HDD_SETTLE_MS) {
             SendGameData();
         }
+        ReadBackForTest();
     }
 
     /* A running game whose page stays gone has nobody to play it. */
