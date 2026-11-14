@@ -315,3 +315,75 @@ Measured on Burnout 2, two engines on the 5950X, flat out, the first
   Windows' file cache reached 100% and 98%. Solo (no lockstep), the same
   stretch plays at 60 frames a second.
 - Flat out, hashing every vblank: 7,200 vblanks match (seed 2).
+
+### Lockstep speed: four-player TimeSplitters 2 and Halo 2 (2026-11-14)
+
+Burnout 2 idles; four-player split-screen games don't. Their first runs
+held 57% of real time on one engine on the 5950X (TimeSplitters 2) and 18%
+on the guest laptop (i7-8750H, GTX 1060). What fixed it, in order, each step
+in step at every vblank on the main PC (TimeSplitters 2 and Halo 2 from
+boot into their matches, flat out, hashed every vblank):
+
+- **The guest's CPU speed** (`accel/tcg/icount-common.c`): guest time an
+  instruction in sixteenths of a ns (`rombie_icount_set_scale`), finer than
+  the shift, changed on the CPU thread at a vblank with the clock kept
+  continuous (the bias takes up the change). The page sets it: 0x0B's start
+  and 0x0F changes at a named vblank, which every engine gets before it gets
+  there; `ROMBIE_ICOUNT_NS="vblank:ns,..."` schedules it for development.
+  In lockstep a CPU-bound game slows as a whole where solo it drops frames,
+  so the guest must be no faster than the slowest PC runs it. The test
+  page's adaptive mode slows it by 15% when an engine falls behind and
+  speeds it by 5% when every engine has more than 15% to spare (stats'
+  `pace`, the time the CPU thread slept ahead of real time).
+- **The GPU works ahead** (`hw/xbox/nv2a/pfifo.c`, `pgraph.c`, `nv2a.c`): a
+  DMA_PUT starts the pusher at once; the CPU waits only at its old points.
+  While the CPU runs, the GPU's semaphore and report writes are held
+  (`nv2a_lockstep_gpu_write`) and land as the CPU starts waiting, and an
+  interrupt parks the GPU thread until then (`nv2a_lockstep_park`). Its
+  other writes (downloads, blits) land in surfaces' memory, whose every CPU
+  access waits for the GPU first. The SDK polls USER's DMA_GET after kicks:
+  a first read since the CPU last waited gets that wait's value, which the
+  GPU has passed, and a second read with no wait between is a poll and
+  waits. The PFB flush (WBC, `0x410`) it writes and polls doesn't wait; PFB
+  reads never follow the GPU, though its tiles do, so other PFB writes
+  still wait. Flag 0x08 keeps the serial GPU.
+- **The display doesn't touch a surface's age** (`gl/display.c`,
+  `vk/renderer.c`): the age decides eviction, which downloads into guest
+  memory, so only the GPU's work sets it.
+- **Voices read guest RAM straight from its block** (`vp.c` `vp_ldl` and
+  kin): dozens of memory-API lookups a voice every frame, and a sample's
+  each, halved the APU's time. Writes still go through the API, for its
+  dirty tracking.
+- **Voices resample linearly in lockstep** (xemu's note allows the hardware
+  may be linear) instead of the sinc; **HRTF** walks its ring buffer without
+  divisions (the same sums); the APU's threads **flush denormals** alike on
+  every PC (the guest's floats are softfloat, unaffected).
+- **An APU frame's voices run ahead** (`apu.c` `lockstep_launch`,
+  `lockstep_commit_locked`): at a frame's tick its voices start on the frame
+  thread from a copy of the voice descriptors, and the guest runs on. Their
+  changes (only the words they changed), notifications, the DSPs' frame, the
+  sound and interrupts land at the next APU access, vblank, spin or tick.
+  Flag 0x80 keeps the serial APU.
+- **Flag 0x04, a speed test**: one frame in ten and no game data.
+  Playwright's DevTools connection carries every WebSocket frame (1.2 MB,
+  60 a second); on the laptop that cost three threads beside the engine,
+  and Halo 2's game data (700 MB, its cache partitions) crashed the driver.
+
+Figures, one engine in real time in the match, flag 0x04:
+
+| | main PC (5950X, RTX 5070 Ti) | laptop (i7-8750H, GTX 1060) |
+|---|---|---|
+| TimeSplitters 2, 6 ns | 100.6% (lowest 30 s 100.6%) | 49% |
+| TimeSplitters 2, adaptive | | 100.7%, at 13.3 ns, 18 frames a second |
+| Halo 2, 6 ns | 90.5% (GL), 100.4% (Vulkan) | |
+| Halo 2, adaptive | | 100.4%, at 20.3 ns, 8 frames a second |
+
+Two engines on the main PC, adaptive, TimeSplitters 2: 100% each, 5.4-6.9
+ns, 41 frames a second, 150 hashes matching across nine speed changes. On
+the laptop TCG runs 50-73 million instructions a second against the main
+PC's 125-165, and with the APU and the GPU off the CPU thread that is its
+limit. On the main PC Halo 2's limit is the GL renderer (the GPU thread
+busy 660 ms a second); Vulkan cuts it to about 550, but two Vulkan engines
+differ in RAM alone at 24 of 9,000 vblanks (transient, every other part
+equal), from something that still writes guest RAM on host time; lockstep
+stays on GL until that's found.
