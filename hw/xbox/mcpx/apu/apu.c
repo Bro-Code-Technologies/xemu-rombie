@@ -550,6 +550,17 @@ static void mcpx_apu_resume(MCPXAPUState *d)
 
 static void mcpx_apu_reset_locked(MCPXAPUState *d)
 {
+    /* Lockstep's frame in flight belongs to the machine before the reset (or
+     * the load): its voices end, and nothing of it lands. */
+    if (d->pipeline) {
+        while (qatomic_read(&d->vp_running)) {
+            qemu_cond_wait(&d->vp_cond, &d->lock);
+        }
+        d->vp_pending = false;
+        qemu_mutex_lock(&d->vp_notify_lock);
+        g_array_set_size(d->vp_notify, 0);
+        qemu_mutex_unlock(&d->vp_notify_lock);
+    }
     memset(d->regs, 0, sizeof(d->regs));
 
     mcpx_apu_vp_reset(d);

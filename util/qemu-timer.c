@@ -172,19 +172,28 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
 
 #ifdef XBOX
 /*
- * Rombie's lockstep vblank waits for input inside a QEMU_CLOCK_VIRTUAL
- * timer's callback, with the BQL let go. A stop (pause, save, exit) holds
- * the BQL while it disables the clock, which waits for the callbacks in
- * flight: while the vblank waits, the list says it has none, so the stop
- * goes on, and the vblank ends once the stop lets go of the BQL.
+ * Rombie's lockstep waits inside QEMU_CLOCK_VIRTUAL timers' callbacks with
+ * the BQL let go: the vblank for input, for the GPU, a disc read for the
+ * page. A stop or a reset (pause_all_vcpus) holds the BQL while it disables
+ * the clock, which waits for the callbacks in flight, so it waited forever
+ * on one that waited for the BQL. While a callback has let go of the BQL its
+ * list says it has none in flight (bql_unlock and bql_lock call these), so
+ * the stop goes on, and the callback ends once the stop lets go of the BQL
+ * to wait for the CPU.
  */
-void rombie_timers_waiting(bool waiting)
+static __thread QEMUTimerList *rombie_running_list;
+
+void rombie_timers_bql_released(void)
 {
-    QEMUTimerList *tl = main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL];
-    if (waiting) {
-        qemu_event_set(&tl->timers_done_ev);
-    } else {
-        qemu_event_reset(&tl->timers_done_ev);
+    if (rombie_running_list) {
+        qemu_event_set(&rombie_running_list->timers_done_ev);
+    }
+}
+
+void rombie_timers_bql_taken(void)
+{
+    if (rombie_running_list) {
+        qemu_event_reset(&rombie_running_list->timers_done_ev);
     }
 }
 #endif
@@ -614,7 +623,15 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
 
         /* run the callback (the timer list can be modified) */
         qemu_mutex_unlock(&timer_list->active_timers_lock);
+#ifdef XBOX
+        QEMUTimerList *outer = rombie_running_list;
+        rombie_running_list =
+            timer_list->clock->type == QEMU_CLOCK_VIRTUAL ? timer_list : NULL;
+#endif
         cb(opaque);
+#ifdef XBOX
+        rombie_running_list = outer;
+#endif
         qemu_mutex_lock(&timer_list->active_timers_lock);
 
         progress = true;

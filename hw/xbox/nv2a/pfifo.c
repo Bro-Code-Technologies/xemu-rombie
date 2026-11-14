@@ -154,6 +154,17 @@ static void set_cpu_waiting(NV2AState *d, bool waiting)
     qemu_mutex_unlock(&d->pfifo.effects_lock);
 }
 
+/* Lockstep ahead, at a reset (main thread, the CPU stopped): the GPU does
+ * the work it was given as if the CPU waited for it, so a GPU parked on an
+ * interrupt goes on and the held writes land, before the registers go. Done
+ * at the reset's own point of guest time, so every PC does the same. */
+void pfifo_lockstep_reset(NV2AState *d, bool begin)
+{
+    if (d->pfifo.ahead) {
+        set_cpu_waiting(d, begin);
+    }
+}
+
 void pfifo_lockstep_sync(NV2AState *d)
 {
     if (!d->pfifo.lockstep || !qemu_in_vcpu_thread()) {

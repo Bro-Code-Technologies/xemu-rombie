@@ -153,7 +153,6 @@ extern uint64_t vblank_interval_ns; /* ui/xemu.c */
 void rombie_icount_set_scale(int64_t q16); /* accel/tcg/icount-common.c */
 void nv2a_lockstep_dump(uint32_t vblank);  /* hw/xbox/nv2a/nv2a.c */
 void rombie_rtc_restart_clock(void);       /* hw/rtc/mc146818rtc.c */
-void rombie_timers_waiting(bool waiting);  /* util/qemu-timer.c */
 void xemu_lockstep_vblank_rebase(int64_t epoch_ns); /* ui/xemu.c */
 void mcpx_apu_lockstep_rebase(int64_t epoch_ns);   /* hw/xbox/mcpx/apu */
 }
@@ -2939,7 +2938,6 @@ bool rombie_engine_lockstep_vblank(void)
     bool have = false;
     const double wait_from = NowMs();
     rombie_lockstep_unlock();
-    rombie_timers_waiting(true);
     {
         std::unique_lock<std::mutex> lock(s_input_mutex);
         for (;;) {
@@ -2991,8 +2989,6 @@ bool rombie_engine_lockstep_vblank(void)
         }
     }
     rombie_lockstep_relock();
-    /* With the BQL again, no stop is waiting on the timer list. */
-    rombie_timers_waiting(false);
     if (!have) {
         return false;
     }

@@ -298,6 +298,7 @@ void pgraph_gl_lockstep_dump_surfaces(NV2AState *d);
 void pfifo_lockstep_init(NV2AState *d, bool lockstep, bool ahead);
 void pfifo_lockstep_exit(NV2AState *d);
 void pfifo_lockstep_sync(NV2AState *d);
+void pfifo_lockstep_reset(NV2AState *d, bool begin);
 void pfifo_lockstep_defer(NV2AState *d);
 void nv2a_lockstep_gpu_write(NV2AState *d, void *dest, const void *data,
                          size_t len);

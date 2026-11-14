@@ -1023,4 +1023,11 @@ static inline int64_t cpu_get_host_ticks(void)
 }
 #endif
 
+#ifdef XBOX
+/* Rombie's lockstep: a virtual-clock timer's callback letting go of the BQL
+ * counts as not in flight until it takes it again (util/qemu-timer.c). */
+void rombie_timers_bql_released(void);
+void rombie_timers_bql_taken(void);
+#endif
+
 #endif

@@ -433,6 +433,7 @@ static void nv2a_unlock_fifo(NV2AState *d)
 
 static void nv2a_reset(NV2AState *d)
 {
+    pfifo_lockstep_reset(d, true);
     nv2a_lock_fifo(d);
     bool halted = qatomic_read(&d->pfifo.halt);
     if (!halted) {
@@ -487,6 +488,7 @@ static void nv2a_reset(NV2AState *d)
     }
 
     nv2a_unlock_fifo(d);
+    pfifo_lockstep_reset(d, false);
 }
 
 static void nv2a_realize(PCIDevice *dev, Error **errp)

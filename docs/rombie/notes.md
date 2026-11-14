@@ -453,13 +453,23 @@ into a machine that has never run.
   0x0B's guest speed applies at once. The RTC starts again from 0x0B's date
   plus guest time (`rombie_rtc_restart_clock`): a solo host's RTC runs on
   the host's clock, which lockstep doesn't use.
-- **Stops in lockstep.** The vblank waits for input inside a
-  QEMU_CLOCK_VIRTUAL timer's callback with the BQL let go, and a stop holds
-  the BQL while it disables that clock, which waits for the callbacks in
-  flight: every pause, save or exit there deadlocked. While the vblank waits,
-  the timer list now says it has none (`rombie_timers_waiting`,
-  `util/qemu-timer.c`), and the vblank sees the stop by the run state
-  (`rombie_lockstep_stopping`), which a stop sets first.
+- **Stops in lockstep.** Lockstep waits inside QEMU_CLOCK_VIRTUAL timers'
+  callbacks with the BQL let go (the vblank for input, its GPU sync, a disc
+  read), and a stop or a reset (`pause_all_vcpus`) holds the BQL while it
+  disables that clock, which waits for the callbacks in flight: every pause,
+  save, exit or guest reboot there deadlocked. While a virtual-clock
+  callback has let go of the BQL its list now says it has none in flight
+  (`bql_unlock` and `bql_lock` call `rombie_timers_bql_released` and
+  `rombie_timers_bql_taken`, `util/qemu-timer.c`), and the vblank sees the
+  stop by the run state (`rombie_lockstep_stopping`), which a stop sets
+  first.
+- **The guest's own reset** (Halo 2 reboots in its opening) comes at the
+  same guest point on every PC. Lockstep's APU frame in flight belongs to
+  the machine before it, so the reset waits for it and drops it (its voice
+  writes would land on the reset's registers and run the DSP on garbage),
+  and a GPU running ahead first does all it was given, as if the CPU waited
+  for it (`pfifo_lockstep_reset`), so its held writes land before the
+  registers go.
 - **What only the host does.** In lockstep a save, a load, the host's
   handoff and exit run on the UI thread while the CPU holds at a vblank
   (`QueueAtVblank`), where the GPU has done all it was given: stopped
