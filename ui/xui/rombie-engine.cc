@@ -27,9 +27,15 @@
  *                  ahead between the CPU's waits; 0x10, 0x20 and 0x40
  *                  leave the APU, GPU and I/O syncs off; 0x04 and up for
  *                  development tests only)
+ *                  [u32 guest speed, optional: sixteenths of a ns an
+ *                  instruction, 8-1024; 0 or absent: QEMU's shift]
  *   0x0C inputs    [u8 type][3 pad][u32 first vblank][u32 count]
  *                  [count x 4 pads: u16 buttons, i8 lx, ly, rx, ry,
  *                  u8 lt, rt]     (lockstep: vblank N runs once N's are in)
+ *   0x0F speed at  [u8 type][3 pad][u32 vblank][u32 guest speed, as 0x0B's]
+ *                  (lockstep: from that vblank on; every engine needs the
+ *                  same before it gets there, so the page slows or speeds
+ *                  the guest's CPU for all to what the slowest keeps up with)
  * Engine to page (binary):
  *   0x81 disc read [u8 type][3 pad][u32 request id][u64 offset][u32 length]
  *   0x82 frame     [u8 type][3 pad][u32 frame no][f64 engine time, ms]
@@ -141,6 +147,7 @@ static constexpr uint8_t MSG_SPEED = 0x09;
 static constexpr uint8_t MSG_DELETE_STATE = 0x0E;
 static constexpr uint8_t MSG_LOCKSTEP = 0x0B;
 static constexpr uint8_t MSG_INPUTS = 0x0C;
+static constexpr uint8_t MSG_SPEED_AT = 0x0F;
 static constexpr uint8_t MSG_DISC_READ = 0x81;
 static constexpr uint8_t MSG_FRAME = 0x82;
 static constexpr uint8_t MSG_AUDIO = 0x83;
@@ -424,6 +431,7 @@ struct Stats {
     std::atomic<uint64_t> disc_bytes{0};
     std::atomic<uint64_t> disc_wait_us{0};
     std::atomic<uint64_t> lockstep_wait_us{0}; /* waiting for input */
+    std::atomic<uint64_t> lockstep_pace_us{0}; /* ahead of real time */
     std::atomic<uint32_t> width{0}, height{0};
 };
 static Stats s_stats;
@@ -1021,6 +1029,34 @@ static float ClampUnit(float v, float lo)
     return (v != v) ? 0.0f : (v < lo ? lo : (v > 1.0f ? 1.0f : v));
 }
 
+/* Lockstep's guest speed, in sixteenths of a ns an instruction: 0x0B's to
+ * start with and 0x0F's changes, each from the vblank it names, applied by
+ * the CPU thread (ApplyIcountSchedule). Every engine gets the same, ahead
+ * of that vblank, so all change at the same point of guest time. */
+static constexpr uint32_t SPEED_Q16_MIN = 8;    /* 0.5 ns */
+static constexpr uint32_t SPEED_Q16_MAX = 1024; /* 64 ns */
+static std::mutex s_speed_mutex;
+static std::vector<std::pair<uint32_t, uint32_t>> s_speed_changes;
+static std::atomic<uint32_t> s_speed_q16{0};
+
+static void QueueSpeedChange(uint32_t vblank, uint32_t q16)
+{
+    if (q16 < SPEED_Q16_MIN || q16 > SPEED_Q16_MAX) {
+        SendEvent("error", "A lockstep speed is out of range.");
+        return;
+    }
+    std::unique_lock<std::mutex> lock(s_speed_mutex);
+    s_speed_changes.emplace_back(vblank, q16);
+}
+
+static void HandleSpeedAt(const std::vector<uint8_t> &data)
+{
+    if (!rombie_engine_lockstep() || data.size() < 12) {
+        return;
+    }
+    QueueSpeedChange(ReadValue<uint32_t>(data, 4), ReadValue<uint32_t>(data, 8));
+}
+
 static void HandleLockstep(const std::vector<uint8_t> &data)
 {
     if (data.size() < 16) {
@@ -1035,6 +1071,12 @@ static void HandleLockstep(const std::vector<uint8_t> &data)
         day > 31 || hour > 23 || minute > 59 || second > 59) {
         SendEvent("error", "The lockstep message's clock isn't a valid date.");
         return;
+    }
+    if (data.size() >= 20) {
+        const uint32_t q16 = ReadValue<uint32_t>(data, 16);
+        if (q16) {
+            QueueSpeedChange(0, q16);
+        }
     }
     char rtc[64];
     snprintf(rtc, sizeof(rtc), "base=%04u-%02u-%02uT%02u:%02u:%02u,clock=vm",
@@ -1357,6 +1399,9 @@ static void HandleBinary(const std::vector<uint8_t> &message)
     case MSG_INPUTS:
         HandleInputs(message);
         break;
+    case MSG_SPEED_AT:
+        HandleSpeedAt(message);
+        break;
     default:
         break;
     }
@@ -1664,6 +1709,7 @@ static void SenderThread(void)
             char stats[640];
             snprintf(stats, sizeof(stats),
                      "{\"t\":\"stats\",\"ms\":%.0f,\"lw\":%.0f,"
+                     "\"pace\":%.0f,\"ns\":%.4g,"
                      "\"flips\":%.1f,\"pusher\":%.0f,"
                      "\"vbl\":%.1f,\"speed\":%.1f,"
                      "\"padMsgs\":%u,"
@@ -1673,6 +1719,8 @@ static void SenderThread(void)
                      "\"overflow\":%u,\"dr\":%u,\"drBytes\":%llu,"
                      "\"drMs\":%.2f,\"w\":%u,\"h\":%u}",
                      seconds * 1000.0, lockstep_wait_us / 1000.0,
+                     s_stats.lockstep_pace_us.exchange(0) / 1000.0,
+                     s_speed_q16.load() / 16.0,
                      flips / seconds, pusher_ns / 1e6 / seconds,
                      vblanks / seconds, s_speed.load(),
                      pad_messages,
@@ -2468,9 +2516,28 @@ static void ApplyIcountSchedule(uint32_t vblank)
     for (const auto &entry : schedule) {
         if (entry.first == vblank) {
             rombie_icount_set_scale(entry.second);
+            s_speed_q16.store((uint32_t)entry.second);
             fprintf(stderr, "rombie-engine: lockstep from vblank %u at %.4g ns an instruction\n",
                     vblank, entry.second / 16.0);
         }
+    }
+
+    std::unique_lock<std::mutex> lock(s_speed_mutex);
+    for (size_t i = 0; i < s_speed_changes.size();) {
+        const auto change = s_speed_changes[i];
+        if (change.first > vblank) {
+            i++;
+            continue;
+        }
+        if (change.first < vblank) {
+            /* Too late to land where the other engines' will. */
+            SendEvent("error", "A lockstep speed change for vblank " +
+                                   std::to_string(change.first) +
+                                   " arrived at " + std::to_string(vblank) + ".");
+        }
+        rombie_icount_set_scale(change.second);
+        s_speed_q16.store(change.second);
+        s_speed_changes.erase(s_speed_changes.begin() + i);
     }
 }
 
@@ -2528,6 +2595,10 @@ bool rombie_engine_lockstep_vblank(void)
             s_pace_from_ms + (vblank + 1 - s_pace_from_vblank) * interval_ms;
         if (now < due) {
             SDL_DelayPrecise((Uint64)((due - now) * 1e6));
+            /* The CPU thread's spare time: what the page's speed control
+             * reads to know this engine could run the guest faster. */
+            s_stats.lockstep_pace_us.fetch_add((uint64_t)((due - now) * 1000.0),
+                                               std::memory_order_relaxed);
         }
     }
     rombie_lockstep_relock();
