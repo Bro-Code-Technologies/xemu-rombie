@@ -21,6 +21,9 @@
 
 #include "apu_int.h"
 #include "ui/rombie-engine.h"
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 
 MCPXAPUState *g_state; // Used via debug handlers
 
@@ -334,7 +337,16 @@ static void mcpx_apu_lockstep_tick(void *opaque)
             d->set_irq = false;
         }
         if (!stopped) {
+#if defined(__x86_64__) || defined(__i386__)
+            /* As the voice workers do: denormals flushed alike everywhere,
+             * here only, so nothing else on this thread changes. */
+            const unsigned int csr = _mm_getcsr();
+            _mm_setcsr(csr | 0x8040);
             se_frame(d);
+            _mm_setcsr(csr);
+#else
+            se_frame(d);
+#endif
         }
     }
     qemu_mutex_unlock(&d->lock);

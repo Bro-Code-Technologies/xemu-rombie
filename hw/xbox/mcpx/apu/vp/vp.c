@@ -22,6 +22,9 @@
 #include "hw/xbox/mcpx/apu/apu_int.h"
 #include "ui/rombie-engine.h"
 #include "adpcm.h"
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 
 static const struct {
     hwaddr top, current, next;
@@ -1367,6 +1370,7 @@ static void voice_process(MCPXAPUState *d,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS);
     dbg->multipass = multipass;
 
+    const uint64_t samples_from = rombie_prof_now();
     if (multipass) {
         get_multipass_samples(d, mixbins, v, samples);
     } else {
@@ -1374,6 +1378,8 @@ static void voice_process(MCPXAPUState *d,
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
             if (!active) {
+                rombie_prof_add(ROMBIE_PROF_VP_SAMPLES_NS,
+                                rombie_prof_now() - samples_from);
                 return;
             }
             int count =
@@ -1385,6 +1391,7 @@ static void voice_process(MCPXAPUState *d,
             sample_count += count;
         }
     }
+    rombie_prof_add(ROMBIE_PROF_VP_SAMPLES_NS, rombie_prof_now() - samples_from);
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
@@ -1456,6 +1463,7 @@ static void voice_process(MCPXAPUState *d,
         return;
     }
 
+    const uint64_t fx_from = rombie_prof_now();
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
 
@@ -1496,6 +1504,7 @@ static void voice_process(MCPXAPUState *d,
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
         }
     }
+    rombie_prof_add(ROMBIE_PROF_VP_FX_NS, rombie_prof_now() - fx_from);
 
     // FIXME: ParaEQ
 
@@ -1621,6 +1630,14 @@ static void *voice_worker_thread(void *arg)
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
     rcu_register_thread();
+#if defined(__x86_64__) || defined(__i386__)
+    /* Lockstep: a voice's filter decaying toward silence goes denormal, and
+     * each step on one costs as much as a hundred others; every PC flushes
+     * them alike (the guest's own floats are softfloat, unaffected). */
+    if (rombie_engine_lockstep_sync(ROMBIE_SYNC_APU)) {
+        _mm_setcsr(_mm_getcsr() | 0x8040); /* FTZ | DAZ */
+    }
+#endif
     qemu_mutex_lock(&vwd->lock);
 
     int worker_id = ctz64(vwd->workers_pending);
