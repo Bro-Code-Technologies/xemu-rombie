@@ -24,5 +24,7 @@
 
 void mcpx_apu_init(PCIBus *bus, int devfn, MemoryRegion *ram);
 uint64_t mcpx_apu_lockstep_hash(void);
+/* Lockstep's pipeline: lands a frame whose voices ran ahead; true if one. */
+bool mcpx_apu_lockstep_catch_up(void);
 
 #endif

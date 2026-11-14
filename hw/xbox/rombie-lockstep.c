@@ -208,9 +208,13 @@ void rombie_spin_capture(void *opaque, int slot)
     s->mxcsr = env->mxcsr;
 }
 
+/* At a vblank or a spin: the GPU's work the guest left waiting, and an APU
+ * frame whose voices ran ahead, land now. */
 bool rombie_lockstep_catch_up(void)
 {
-    return nv2a_lockstep_catch_up();
+    const bool gpu = nv2a_lockstep_catch_up();
+    const bool apu = mcpx_apu_lockstep_catch_up();
+    return gpu || apu;
 }
 
 bool rombie_spin_same(void)

@@ -44,11 +44,19 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     // FIXME: Check notify enable
     // FIXME: Set NV1BA0_NOTIFICATION_STATUS_IN_PROGRESS when appropriate
-    stb_phys(&address_space_memory, notify_offset, status);
-
     // FIXME: Refactor this out of here
     // FIXME: Actually provied current envelope state
-    stb_phys(&address_space_memory, notify_offset - 1, 1);
+    if (d->vp_running) {
+        /* Lockstep's pipeline: the guest sees it at the frame's commit. */
+        MCPXAPUHeldByte held[2] = { { notify_offset, status },
+                                    { notify_offset - 1, 1 } };
+        qemu_mutex_lock(&d->vp_notify_lock);
+        g_array_append_vals(d->vp_notify, held, 2);
+        qemu_mutex_unlock(&d->vp_notify_lock);
+    } else {
+        stb_phys(&address_space_memory, notify_offset, status);
+        stb_phys(&address_space_memory, notify_offset - 1, 1);
+    }
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
               NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -134,6 +142,11 @@ static inline uint32_t vp_ldub(MCPXAPUState *d, hwaddr addr)
 static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
                                hwaddr offset, uint32_t mask)
 {
+    if (d->vp_running) {
+        /* Lockstep's pipeline: the frame's copy of the descriptors. */
+        uint32_t v = ldl_le_p(d->vp_desc + voice_handle * NV_PAVS_SIZE + offset);
+        return (v & mask) >> ctz32(mask);
+    }
     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
     return (vp_ldl(d, voice + offset) & mask) >> ctz32(mask);
 }
@@ -141,6 +154,11 @@ static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
+    if (d->vp_running) {
+        uint8_t *p = d->vp_desc + voice_handle * NV_PAVS_SIZE + offset;
+        stl_le_p(p, (ldl_le_p(p) & ~mask) | ((val << ctz32(mask)) & mask));
+        return;
+    }
     hwaddr voice = d->regs[NV_PAPU_VPVADDR]
                     + voice_handle * NV_PAVS_SIZE;
     uint32_t v = vp_ldl(d, voice + offset) & ~mask;
@@ -610,6 +628,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
 static uint64_t vp_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    mcpx_apu_lockstep_commit(opaque);
     DPRINTF("mcpx apu VP: read [0x%" HWADDR_PRIx "] (%s)\n", addr,
             get_method_str(addr));
 
@@ -628,6 +647,7 @@ static uint64_t vp_read(void *opaque, hwaddr addr, unsigned int size)
 static void vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    mcpx_apu_lockstep_commit(d);
 
     DPRINTF("mcpx apu VP: [0x%" HWADDR_PRIx "] %s = 0x%lx\n", addr,
             get_method_str(addr), val);

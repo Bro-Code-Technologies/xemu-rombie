@@ -25,7 +25,8 @@
  *                  data, so its page and tools cost the PC little; 0x08
  *                  keeps the GPU from working
  *                  ahead between the CPU's waits; 0x10, 0x20 and 0x40
- *                  leave the APU, GPU and I/O syncs off; 0x04 and up for
+ *                  leave the APU, GPU and I/O syncs off; 0x80 runs each
+ *                  APU frame's voices on the CPU thread; 0x04 and up for
  *                  development tests only)
  *                  [u32 guest speed, optional: sixteenths of a ns an
  *                  instruction, 8-1024; 0 or absent: QEMU's shift]
@@ -162,6 +163,7 @@ static constexpr uint8_t LOCKSTEP_GPU_SERIAL = 0x08;
 static constexpr uint8_t LOCKSTEP_NO_APU_SYNC = 0x10;
 static constexpr uint8_t LOCKSTEP_NO_GPU_SYNC = 0x20;
 static constexpr uint8_t LOCKSTEP_NO_IO_SYNC = 0x40;
+static constexpr uint8_t LOCKSTEP_APU_SERIAL = 0x80;
 static constexpr size_t LOCKSTEP_PAD_SIZE = 8;
 static constexpr uint32_t MAX_INPUT_FRAMES = 3600;
 /* Further behind real time than this (a pause, a long wait for the other
@@ -2435,6 +2437,8 @@ bool rombie_engine_lockstep_sync(RombieSync part)
         return !(s_lockstep_flags & LOCKSTEP_NO_IO_SYNC);
     case ROMBIE_SYNC_GPU_AHEAD:
         return !(s_lockstep_flags & (LOCKSTEP_NO_GPU_SYNC | LOCKSTEP_GPU_SERIAL));
+    case ROMBIE_SYNC_APU_AHEAD:
+        return !(s_lockstep_flags & (LOCKSTEP_NO_APU_SYNC | LOCKSTEP_APU_SERIAL));
     }
     return true;
 }

@@ -90,6 +90,23 @@ typedef struct MCPXAPUState {
     bool lockstep;
     QEMUTimer *lockstep_timer;
     uint64_t lockstep_frames;
+    /* Lockstep's pipeline: at a frame's tick its voices start on the frame
+     * thread, from a copy of the voice descriptors (vp_desc, as launched in
+     * vp_desc_base), while the guest runs on. What the guest could see of
+     * them (the descriptors' changes, notifications, the DSPs' frame, the
+     * sound, interrupts) lands at the next APU access, hash or tick
+     * (mcpx_apu_lockstep_commit), points of guest time. */
+    bool pipeline;
+    bool vp_pending;  /* launched, not yet committed */
+    bool vp_running;  /* the frame thread's at it; voices use the copy */
+    QemuCond vp_cond;
+    float vp_mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    uint8_t *vp_desc;
+    uint8_t *vp_desc_base;
+    hwaddr vp_desc_addr;
+    GArray *vp_notify; /* { hwaddr, value } byte writes held; each voice's
+                        * own notifiers, so their order can't matter */
+    QemuMutex vp_notify_lock; /* the voice workers add to it at once */
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
@@ -141,5 +158,12 @@ void mcpx_debug_end_frame(void);
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp);
 void mcpx_apu_monitor_finalize(MCPXAPUState *d);
 void mcpx_apu_monitor_frame(MCPXAPUState *d);
+
+void mcpx_apu_lockstep_commit(MCPXAPUState *d);
+
+typedef struct MCPXAPUHeldByte {
+    hwaddr addr;
+    uint8_t value;
+} MCPXAPUHeldByte;
 
 #endif

@@ -98,6 +98,7 @@ typedef enum {
     ROMBIE_SYNC_GPU = 2, /* the CPU waits for PFIFO after every kick */
     ROMBIE_SYNC_IO = 4,  /* the CPU waits for disc and disk I/O it started */
     ROMBIE_SYNC_GPU_AHEAD = 8, /* with GPU: PFIFO works ahead between waits */
+    ROMBIE_SYNC_APU_AHEAD = 16, /* with APU: a frame's voices run ahead */
 } RombieSync;
 bool rombie_engine_lockstep_sync(RombieSync part);
 
