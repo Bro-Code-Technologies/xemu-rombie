@@ -56,6 +56,10 @@ int64_t icount_get(void);
  */
 int64_t icount_to_ns(int64_t icount);
 
+/* Rombie lockstep: guest ns per instruction, in sixteenths (0: the shift). */
+void rombie_icount_set_scale(int64_t q16);
+int64_t rombie_icount_scale(void);
+
 /**
  * icount_configure: configure the icount options, including "shift"
  * @opts: Options to parse

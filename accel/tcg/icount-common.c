@@ -154,9 +154,40 @@ int64_t icount_get(void)
     return icount;
 }
 
+/*
+ * Rombie lockstep: guest time per instruction in sixteenths of a
+ * nanosecond, finer than the shift's powers of two; 0 keeps the shift.
+ * Changed only on the vCPU thread between slices (rombie_icount_set_scale).
+ */
+static int64_t rombie_icount_q16;
+
 int64_t icount_to_ns(int64_t icount)
 {
+    const int64_t q16 = qatomic_read_i64(&rombie_icount_q16);
+    if (q16) {
+        return (icount * q16) >> 4;
+    }
     return icount << qatomic_read(&timers_state.icount_time_shift);
+}
+
+void rombie_icount_set_scale(int64_t q16)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    /* The clock goes on from where it is: the bias takes up the change. */
+    const int64_t now = icount_get_locked();
+    qatomic_set_i64(&rombie_icount_q16, q16);
+    qatomic_set_i64(&timers_state.qemu_icount_bias,
+                    now - icount_to_ns(qatomic_read_i64(
+                              &timers_state.qemu_icount)));
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+int64_t rombie_icount_scale(void)
+{
+    const int64_t q16 = qatomic_read_i64(&rombie_icount_q16);
+    return q16 ? q16 : (int64_t)16 << qatomic_read(&timers_state.icount_time_shift);
 }
 
 /*
@@ -225,6 +256,10 @@ static void icount_adjust_vm(void *opaque)
 
 int64_t icount_round(int64_t count)
 {
+    const int64_t q16 = qatomic_read_i64(&rombie_icount_q16);
+    if (q16) {
+        return (count * 16 + q16 - 1) / q16;
+    }
     int shift = qatomic_read(&timers_state.icount_time_shift);
     return (count + (1 << shift) - 1) >> shift;
 }

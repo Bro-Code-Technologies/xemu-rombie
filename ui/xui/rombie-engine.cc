@@ -115,6 +115,7 @@ typedef int engine_socket;
 extern "C" {
 #include "system/cpu-timers.h"
 extern uint64_t vblank_interval_ns; /* ui/xemu.c */
+void rombie_icount_set_scale(int64_t q16); /* accel/tcg/icount-common.c */
 }
 
 #include "../rombie-engine-media.h"
@@ -2416,6 +2417,39 @@ static void SendVblank(uint32_t vblank)
     QueueLockstepMessage(msg, sizeof(msg));
 }
 
+/* Development: ROMBIE_ICOUNT_NS="vblank:ns,..." sets the guest time an
+ * instruction takes (to a sixteenth of a ns) from those vblanks on, so a
+ * test's opening can run at one CPU speed and its play at another. */
+static void ApplyIcountSchedule(uint32_t vblank)
+{
+    static std::vector<std::pair<uint32_t, int64_t>> schedule;
+    static bool parsed;
+    if (!parsed) {
+        parsed = true;
+        const char *env = getenv("ROMBIE_ICOUNT_NS");
+        for (const char *p = env; p && *p;) {
+            unsigned at = 0;
+            double ns = 0.0;
+            int used = 0;
+            if (sscanf(p, "%u:%lf%n", &at, &ns, &used) != 2 || ns <= 0.0) {
+                break;
+            }
+            schedule.emplace_back(at, (int64_t)(ns * 16.0 + 0.5));
+            p += used;
+            if (*p == ',') {
+                p++;
+            }
+        }
+    }
+    for (const auto &entry : schedule) {
+        if (entry.first == vblank) {
+            rombie_icount_set_scale(entry.second);
+            fprintf(stderr, "rombie-engine: lockstep from vblank %u at %.4g ns an instruction\n",
+                    vblank, entry.second / 16.0);
+        }
+    }
+}
+
 bool rombie_engine_lockstep_vblank(void)
 {
     const uint32_t vblank = s_lockstep_vblank;
@@ -2481,6 +2515,7 @@ bool rombie_engine_lockstep_vblank(void)
         std::unique_lock<std::mutex> lock(s_pad_mutex);
         s_lockstep_pads = input;
     }
+    ApplyIcountSchedule(vblank);
     s_lockstep_vblank = vblank + 1;
     return true;
 }
