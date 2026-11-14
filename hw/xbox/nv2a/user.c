@@ -118,4 +118,5 @@ void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     qemu_mutex_unlock(&d->pfifo.lock);
 
+    pfifo_lockstep_sync(d);
 }

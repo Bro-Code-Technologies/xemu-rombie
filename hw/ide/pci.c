@@ -33,6 +33,7 @@
 #include "hw/ide/pci.h"
 #include "ide-internal.h"
 #include "trace.h"
+#include "ui/rombie-engine.h"
 
 #define BMDMA_PAGE_SIZE 4096
 
@@ -398,6 +399,10 @@ void bmdma_cmd_writeb(BMDMAState *bm, uint32_t val)
     }
 
     bm->cmd = val & 0x09;
+
+    /* Rombie's lockstep: the DMA this started completes before the CPU goes
+     * on (hw/ide/core.c's accesses do the same). */
+    rombie_lockstep_io_settle();
 }
 
 void bmdma_status_writeb(BMDMAState *bm, uint32_t val)

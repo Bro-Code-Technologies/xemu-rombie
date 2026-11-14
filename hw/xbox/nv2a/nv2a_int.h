@@ -103,6 +103,13 @@ typedef struct NV2AState {
         QemuCond fifo_idle_cond;
         bool fifo_kick;
         bool halt;
+        /* Rombie's lockstep (ROMBIE_SYNC_GPU): the pusher runs only for
+         * the guest's register writes, each of which waits for the pass it
+         * asked for (pfifo_lockstep_sync), so the GPU's work lands at the
+         * guest time of the write. */
+        bool lockstep;
+        uint64_t guest_kicks;
+        uint64_t guest_done;
     } pfifo;
 
     struct {

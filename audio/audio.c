@@ -43,6 +43,7 @@
 
 #define AUDIO_CAP "audio"
 #include "audio_int.h"
+#include "ui/rombie-engine.h"
 
 /* #define DEBUG_LIVE */
 /* #define DEBUG_OUT */
@@ -1718,6 +1719,11 @@ static const VMStateDescription vmstate_audio = {
 void audio_create_default_audiodevs(void)
 {
     for (int i = 0; audio_prio_list[i]; i++) {
+        /* Rombie's lockstep: the AC97's buffers drain in guest time, not
+         * as fast as a sound card takes them. The page hears the APU. */
+        if (rombie_engine_lockstep() && strcmp(audio_prio_list[i], "none")) {
+            continue;
+        }
         if (audio_driver_lookup(audio_prio_list[i])) {
             QDict *dict = qdict_new();
             Audiodev *dev = NULL;

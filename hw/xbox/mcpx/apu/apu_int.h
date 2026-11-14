@@ -85,6 +85,12 @@ typedef struct MCPXAPUState {
     bool pause_requested;
     bool is_idle;
 
+    /* Rombie's lockstep (ROMBIE_SYNC_APU): frames run on the CPU thread
+     * from a guest-time timer, and the frame thread stays idle. */
+    bool lockstep;
+    QEMUTimer *lockstep_timer;
+    uint64_t lockstep_frames;
+
     MemoryRegion *ram;
     uint8_t *ram_ptr;
     MemoryRegion mmio;

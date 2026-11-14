@@ -42,6 +42,7 @@
 #include "system/replay.h"
 #include "system/runstate.h"
 #include "ide-internal.h"
+#include "ui/rombie-engine.h"
 #include "trace.h"
 
 /* These values were based on a Seagate ST3500418AS but have been modified
@@ -1283,7 +1284,17 @@ const char *ATA_IOPORT_WR_lookup[ATA_IOPORT_WR_NUM_REGISTERS] = {
     [ATA_IOPORT_WR_COMMAND] = "Command"
 };
 
+static void do_ide_ioport_write(void *opaque, uint32_t addr, uint32_t val);
+
+/* Rombie's lockstep: the CPU waits here for any I/O the access started
+ * (rombie_lockstep_io_settle), as after the other data and DMA accesses. */
 void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+{
+    do_ide_ioport_write(opaque, addr, val);
+    rombie_lockstep_io_settle();
+}
+
+static void do_ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 {
     IDEBus *bus = opaque;
     IDEState *s = ide_bus_active_if(bus);
@@ -2412,7 +2423,15 @@ static bool ide_is_pio_out(IDEState *s)
     abort();
 }
 
+static void do_ide_data_writew(void *opaque, uint32_t addr, uint32_t val);
+
 void ide_data_writew(void *opaque, uint32_t addr, uint32_t val)
+{
+    do_ide_data_writew(opaque, addr, val);
+    rombie_lockstep_io_settle();
+}
+
+static void do_ide_data_writew(void *opaque, uint32_t addr, uint32_t val)
 {
     IDEBus *bus = opaque;
     IDEState *s = ide_bus_active_if(bus);
@@ -2448,7 +2467,16 @@ void ide_data_writew(void *opaque, uint32_t addr, uint32_t val)
     }
 }
 
+static uint32_t do_ide_data_readw(void *opaque, uint32_t addr);
+
 uint32_t ide_data_readw(void *opaque, uint32_t addr)
+{
+    uint32_t r = do_ide_data_readw(opaque, addr);
+    rombie_lockstep_io_settle();
+    return r;
+}
+
+static uint32_t do_ide_data_readw(void *opaque, uint32_t addr)
 {
     IDEBus *bus = opaque;
     IDEState *s = ide_bus_active_if(bus);
@@ -2486,7 +2514,15 @@ uint32_t ide_data_readw(void *opaque, uint32_t addr)
     return ret;
 }
 
+static void do_ide_data_writel(void *opaque, uint32_t addr, uint32_t val);
+
 void ide_data_writel(void *opaque, uint32_t addr, uint32_t val)
+{
+    do_ide_data_writel(opaque, addr, val);
+    rombie_lockstep_io_settle();
+}
+
+static void do_ide_data_writel(void *opaque, uint32_t addr, uint32_t val)
 {
     IDEBus *bus = opaque;
     IDEState *s = ide_bus_active_if(bus);
@@ -2514,7 +2550,16 @@ void ide_data_writel(void *opaque, uint32_t addr, uint32_t val)
     }
 }
 
+static uint32_t do_ide_data_readl(void *opaque, uint32_t addr);
+
 uint32_t ide_data_readl(void *opaque, uint32_t addr)
+{
+    uint32_t r = do_ide_data_readl(opaque, addr);
+    rombie_lockstep_io_settle();
+    return r;
+}
+
+static uint32_t do_ide_data_readl(void *opaque, uint32_t addr)
 {
     IDEBus *bus = opaque;
     IDEState *s = ide_bus_active_if(bus);

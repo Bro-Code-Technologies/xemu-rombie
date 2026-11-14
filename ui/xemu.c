@@ -768,6 +768,40 @@ static void vblank_timer_callback(void *opaque)
                  now + (int64_t)(vblank_interval_ns / rombie_engine_speed()));
 }
 
+/*
+ * Lockstep: vblank N at guest time N+1 intervals, on the CPU thread (a
+ * QEMU_CLOCK_VIRTUAL timer, run there under icount). Its wait for input ends
+ * early when the machine is stopping; then the vblank is armed again for
+ * the same guest time, from a bottom half once the timer list is done (one
+ * armed for "now" from inside it would run at once, forever), and runs as
+ * soon as the machine goes on.
+ */
+static uint64_t lockstep_vblanks;
+
+static void lockstep_vblank_rearm(void *opaque)
+{
+    timer_mod_ns(vblank_timer, (int64_t)((lockstep_vblanks + 1) *
+                                         vblank_interval_ns));
+}
+
+static void lockstep_vblank_callback(void *opaque)
+{
+    struct xemu_console *scon = (struct xemu_console *)opaque;
+    const uint64_t from = rombie_prof_now();
+
+    if (!rombie_engine_lockstep_vblank()) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                lockstep_vblank_rearm, NULL);
+        return;
+    }
+    const uint64_t display_from = rombie_prof_now();
+    process_vblank(scon);
+    rombie_prof_add(ROMBIE_PROF_DISPLAY_NS, rombie_prof_now() - display_from);
+    lockstep_vblanks++;
+    lockstep_vblank_rearm(NULL);
+    rombie_prof_add(ROMBIE_PROF_VBLANK_NS, rombie_prof_now() - from);
+}
+
 static void *vblank_timer_thread(void *opaque)
 {
     struct xemu_console *scon = (struct xemu_console *)opaque;
@@ -1224,7 +1258,12 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     // Register event watch to handle rendering during these operations.
     SDL_AddEventWatch(event_watch_callback, &scon_list[0]);
 
-    if (use_vblank_timer_thread) {
+    if (rombie_engine_lockstep()) {
+        use_vblank_timer_thread = false;
+        vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    lockstep_vblank_callback, &scon_list[0]);
+        lockstep_vblank_rearm(NULL);
+    } else if (use_vblank_timer_thread) {
         qemu_thread_create(&vblank_thread, "vblank-timer", vblank_timer_thread,
                            &scon_list[0], QEMU_THREAD_JOINABLE);
     } else {

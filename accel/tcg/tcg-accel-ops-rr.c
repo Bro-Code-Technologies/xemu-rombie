@@ -36,6 +36,7 @@
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
+#include "ui/rombie-engine.h"
 
 /* Kick all RR vCPUs */
 void rr_kick_vcpu_thread(CPUState *unused)
@@ -177,6 +178,77 @@ static int rr_cpu_count(void)
  * elsewhere.
  */
 
+/*
+ * Rombie's lockstep: the Xbox kernel's idle loop and the games' waits on
+ * the GPU spin rather than halt, and under icount every spin instruction is
+ * paid for. So each timer interval opens with two probes of SPIN_PROBE
+ * instructions (a multiple of every loop length up to 8); when both leave
+ * the CPU's registers exactly the same, it is spinning on memory nothing
+ * changes before the next timer runs, and guest time jumps there. That
+ * depends on guest state alone, so every engine jumps alike. A probe may
+ * take several runs: a timer that re-arms itself kicks the CPU out after
+ * one block.
+ */
+enum { SPIN_RUN, SPIN_FIRST, SPIN_SECOND, SPIN_REST };
+#define SPIN_PROBE 840
+static int spin_phase;
+static int64_t spin_left;
+
+/* The budget for the next run: a probe's remainder, if one is under way and
+ * fits before the next timer; otherwise the probe gives up for this
+ * interval. */
+static int64_t rr_spin_budget(CPUState *cpu, int64_t budget)
+{
+    if (!rombie_engine_lockstep() || !cpu || cpu->halted) {
+        spin_phase = SPIN_RUN;
+        return budget;
+    }
+    if (spin_phase == SPIN_RUN && budget > 3 * SPIN_PROBE) {
+        spin_phase = SPIN_FIRST;
+        spin_left = SPIN_PROBE;
+    }
+    if (spin_phase == SPIN_FIRST || spin_phase == SPIN_SECOND) {
+        if (budget < spin_left) {
+            spin_phase = SPIN_REST;
+            return budget;
+        }
+        return spin_left;
+    }
+    return budget;
+}
+
+static void rr_spin_ran(CPUState *cpu, int64_t executed)
+{
+    if (spin_phase == SPIN_REST) {
+        spin_phase = SPIN_RUN;
+        return;
+    }
+    if (spin_phase != SPIN_FIRST && spin_phase != SPIN_SECOND) {
+        return;
+    }
+    if (cpu->halted || executed <= 0) {
+        spin_phase = SPIN_REST;
+        return;
+    }
+    spin_left -= executed;
+    if (spin_left > 0) {
+        return;
+    }
+    if (spin_phase == SPIN_FIRST) {
+        rombie_spin_capture(cpu, 0);
+        spin_phase = SPIN_SECOND;
+        spin_left = SPIN_PROBE;
+        return;
+    }
+    rombie_spin_capture(cpu, 1);
+    if (rombie_spin_same() && icount_warp_to_deadline()) {
+        rombie_prof_add(ROMBIE_PROF_SPINS, 1);
+        spin_phase = SPIN_RUN;
+    } else {
+        spin_phase = SPIN_REST;
+    }
+}
+
 static void *rr_cpu_thread_fn(void *arg)
 {
     Notifier force_rcu;
@@ -225,6 +297,14 @@ static void *rr_cpu_thread_fn(void *arg)
         }
 
         if (icount_enabled() && all_cpu_threads_idle()) {
+            /* With icount sleep off, warp here until a timer wakes a CPU. */
+            const uint64_t warp_from = rombie_prof_now();
+            while (icount_warp_in_vcpu() && all_cpu_threads_idle()) {
+                rombie_prof_add(ROMBIE_PROF_WARPS, 1);
+            }
+            rombie_prof_add(ROMBIE_PROF_TIMERS_NS, rombie_prof_now() - warp_from);
+        }
+        if (icount_enabled() && all_cpu_threads_idle()) {
             /*
              * When all cpus are sleeping (e.g in WFI), to avoid a deadlock
              * in the main_loop, wake it up in order to start the warp timer.
@@ -232,12 +312,16 @@ static void *rr_cpu_thread_fn(void *arg)
             qemu_notify_event();
         }
 
+        const uint64_t idle_from = rombie_prof_now();
         rr_wait_io_event();
+        rombie_prof_add(ROMBIE_PROF_IDLE_NS, rombie_prof_now() - idle_from);
         rr_deal_with_unplugged_cpus();
 
         bql_unlock();
         replay_mutex_lock();
+        const uint64_t bql_from = rombie_prof_now();
         bql_lock();
+        rombie_prof_add(ROMBIE_PROF_BQL_NS, rombie_prof_now() - bql_from);
 
         if (icount_enabled()) {
             int cpu_count = rr_cpu_count();
@@ -248,9 +332,12 @@ static void *rr_cpu_thread_fn(void *arg)
              * Run the timers here.  This is much more efficient than
              * waking up the I/O thread and waiting for completion.
              */
+            const uint64_t timers_from = rombie_prof_now();
             icount_handle_deadline();
+            rombie_prof_add(ROMBIE_PROF_TIMERS_NS, rombie_prof_now() - timers_from);
 
-            cpu_budget = icount_percpu_budget(cpu_count);
+            cpu_budget = rr_spin_budget(cpu ? cpu : first_cpu,
+                                        icount_percpu_budget(cpu_count));
         }
 
         replay_mutex_unlock();
@@ -281,12 +368,28 @@ static void *rr_cpu_thread_fn(void *arg)
                 bql_unlock();
                 if (icount_enabled()) {
                     icount_prepare_for_run(cpu, cpu_budget);
+                    rombie_prof_add(ROMBIE_PROF_LOOPS, 1);
+                    if (!cpu->icount_budget) {
+                        rombie_prof_add(ROMBIE_PROF_EMPTY_LOOPS, 1);
+                    }
                 }
+                const uint64_t exec_from = rombie_prof_now();
+                const int64_t insns_from = icount_enabled() ? icount_get_raw() : 0;
                 r = tcg_cpu_exec(cpu);
+                rombie_prof_add(ROMBIE_PROF_EXEC_NS, rombie_prof_now() - exec_from);
+                if (icount_enabled()) {
+                    rombie_prof_sample_pc(cpu);
+                }
                 if (icount_enabled()) {
                     icount_process_data(cpu);
                 }
+                const uint64_t relock_from = rombie_prof_now();
                 bql_lock();
+                rombie_prof_add(ROMBIE_PROF_BQL_NS, rombie_prof_now() - relock_from);
+
+                if (icount_enabled()) {
+                    rr_spin_ran(cpu, icount_get_raw() - insns_from);
+                }
 
                 if (r == EXCP_DEBUG) {
                     cpu_handle_guest_debug(cpu);

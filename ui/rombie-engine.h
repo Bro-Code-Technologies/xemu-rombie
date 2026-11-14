@@ -21,6 +21,7 @@
 #define ROMBIE_ENGINE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -83,6 +84,86 @@ uint64_t rombie_engine_disc_size(void);
 typedef void (*rombie_disc_read_cb)(void *opaque, bool ok);
 void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
                              rombie_disc_read_cb cb, void *opaque);
+
+/* Lockstep (netplay): set by the page's 0x0B before boot, fixed after. The
+ * guest's time is its instruction count, and everything it can see happens
+ * at a point of that time, so two engines given the same inputs stay
+ * identical. */
+bool rombie_engine_lockstep(void);
+
+/* The parts of the determinism work, each on in lockstep unless the page
+ * turned it off for a development test. */
+typedef enum {
+    ROMBIE_SYNC_APU = 1, /* APU frames run on the CPU thread, on guest time */
+    ROMBIE_SYNC_GPU = 2, /* the CPU waits for PFIFO after every kick */
+    ROMBIE_SYNC_IO = 4,  /* the CPU waits for disc and disk I/O it started */
+} RombieSync;
+bool rombie_engine_lockstep_sync(RombieSync part);
+
+/* QEMU's -icount and -rtc values for lockstep (system/vl.c). */
+const char *rombie_engine_icount_option(void);
+const char *rombie_engine_rtc_option(void);
+
+/* Lockstep's vblank, on the CPU thread from a guest-time timer: hashes,
+ * announces, waits for this vblank's input, keeps real time and applies
+ * the input. False when the machine is stopping instead; the caller runs
+ * the vblank again at the same guest time. */
+bool rombie_engine_lockstep_vblank(void);
+
+/* block/block-backend.c: every BlockBackend's requests in flight. */
+unsigned int blk_lockstep_in_flight(void);
+
+/* hw/xbox/rombie-lockstep.c */
+/* The CPU thread waits here, after an IDE register access, until the I/O it
+ * started has completed, so it completes at the guest time it started. */
+void rombie_lockstep_io_settle(void);
+/* The state's hashes, in the order 0x86 sends them. */
+#define ROMBIE_HASH_PARTS 6
+void rombie_lockstep_hash(uint64_t out[ROMBIE_HASH_PARTS]);
+uint64_t rombie_hash64(const void *data, size_t size, uint64_t seed);
+/* For the CPU thread's waits: whether the machine is being stopped, and the
+ * main-loop lock let go and taken again. */
+bool rombie_lockstep_stopping(void);
+void rombie_lockstep_unlock(void);
+void rombie_lockstep_relock(void);
+
+/* Where lockstep's time goes, for the stats: host nanoseconds (or counts)
+ * since the stats last took them. */
+typedef enum {
+    ROMBIE_PROF_EXEC_NS,     /* the CPU thread running guest code */
+    ROMBIE_PROF_LOOPS,       /* its trips round the TCG loop */
+    ROMBIE_PROF_EMPTY_LOOPS, /* trips with no instructions to run */
+    ROMBIE_PROF_GPU_NS,      /* waiting for PFIFO */
+    ROMBIE_PROF_APU_NS,      /* APU frames */
+    ROMBIE_PROF_IO_NS,       /* waiting for I/O */
+    ROMBIE_PROF_HASH_NS,     /* hashing */
+    ROMBIE_PROF_IDLE_NS,     /* waiting with every CPU idle */
+    ROMBIE_PROF_BQL_NS,      /* taking the main-loop lock */
+    ROMBIE_PROF_TIMERS_NS,   /* guest-time timers, warps included */
+    ROMBIE_PROF_WARPS,       /* warps over idle time */
+    ROMBIE_PROF_VBLANK_NS,   /* lockstep's vblank, waits included */
+    ROMBIE_PROF_DISPLAY_NS,  /* its display update (process_vblank) */
+    ROMBIE_PROF_SEND_NS,     /* its messages to the page */
+    ROMBIE_PROF_SPINS,       /* spins skipped to the next timer */
+    ROMBIE_PROF_GPU_SYNCS,   /* PFIFO waits */
+    ROMBIE_PROF_GPU_WORK_NS, /* the PFIFO thread's passes the CPU waited for */
+    ROMBIE_PROF_GPU_PENDING_NS, /* ... in their pending work (display, ...) */
+    ROMBIE_PROF_GPU_REPORTS_NS, /* ... in their reports */
+    ROMBIE_PROF_COUNT
+} RombieProf;
+void rombie_prof_add(RombieProf what, uint64_t amount);
+/* Development (ROMBIE_LOCKSTEP_PROFILE=1): where the guest was when the CPU
+ * thread left guest code, reported to stderr every so many samples, with
+ * the code at the hottest place. */
+void rombie_prof_sample_pc(void *cpu);
+/* Lockstep's spin finder (accel/tcg/tcg-accel-ops-rr.c): the registers a
+ * program can see after a probe (slot 0 or 1), and whether two probes left
+ * them the same. */
+void rombie_spin_capture(void *cpu, int slot);
+bool rombie_spin_same(void);
+uint64_t rombie_prof_take(RombieProf what);
+uint64_t rombie_prof_now(void);
+uint64_t rombie_prof_insns(void);
 
 #ifdef __cplusplus
 }

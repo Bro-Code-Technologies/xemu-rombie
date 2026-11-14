@@ -232,3 +232,59 @@ held, as xemu's own snapshot actions do.
 - Sizes on Burnout 2: blank disk 1.6 MB, 2.1 MB with one profile saved,
   52.4 MB with one state. Deleting a state frees its space inside the file
   but does not shrink the file.
+
+## Lockstep (Rombie BRAIN-38, `.docs/plans/xbox-online.md` Phase 2)
+
+Two engines given the same game data, clock and input stay identical at
+every vblank. The protocol (0x0B, 0x0C, 0x86, 0x87, `lw`; protocol 2) is at
+the top of `ui/xui/rombie-engine.cc`; the parts:
+
+- **Guest time is the instruction count**: `-icount shift=N,sleep=off,
+  align=off` and `-rtc base=<0x0B's clock>,clock=vm` (`system/vl.c`).
+  `ROMBIE_ICOUNT_SHIFT` (development) sets N, 2^N ns an instruction; 0 by
+  default for now, 1 is about a real Xbox's rate.
+- **Vblanks on guest time** (`ui/xemu.c`): a `QEMU_CLOCK_VIRTUAL` timer on
+  the CPU thread instead of the real-time vblank thread. It hashes, sends
+  0x87, waits for that vblank's 0x0C input, keeps real time at fixed
+  deadlines (unless unthrottled) and latches the pads; the guest's pad polls
+  read only the latched pads (`ui/xemu-input.c`). Its messages go out on the
+  sender thread: sent from the CPU thread, they waited on the socket behind
+  1.2 MB frames and cost half of every second.
+- **APU frames on the CPU thread** (`hw/xbox/mcpx/apu/apu.c`), one every
+  2/3 ms of guest time, with the frame thread idle; four voice workers on
+  every PC, their mixes added in worker order (`vp.c`).
+- **The GPU's work at the guest time of the write that asked for it**
+  (`hw/xbox/nv2a/pfifo.c`): after every PFIFO, USER or PGRAPH register
+  write the CPU waits for a pusher pass started after it, and only those
+  passes run the pusher (the display's syncs don't).
+- **I/O completes at the guest time it started** (`hw/xbox/rombie-lockstep.c`,
+  `hw/ide/core.c`, `hw/ide/pci.c`, `block/block-backend.c`): after an IDE
+  register access the CPU waits until no request is in flight.
+- **The AC97 drains in guest time**: lockstep's default audio backend is
+  `none` (`audio/audio.c`); the page hears the APU as before.
+- **Spins skipped** (`accel/tcg/tcg-accel-ops-rr.c`): under icount every
+  instruction costs host time, and the Xbox spins rather than halts. The
+  kernel's idle loop is `sti; nop; nop; cli` and two compares (`8001b02e`
+  on the 4627 BIOS); Burnout 2 waits on the GPU by reading a word in RAM
+  (`0021b180`). Together they were 98% of the guest's instructions. Each
+  timer interval now opens with two 840-instruction probes; when both leave
+  the registers identical, guest time jumps to the next timer. Halts warp on
+  the CPU thread too (`icount_warp_in_vcpu`), saving the main loop's two
+  wake-ups.
+- **Hashes** (0x86): RAM, CPU, NV2A registers, APU registers and DSP
+  memories, each drive's I/O counts, and guest time. The stats carry a
+  `prof` line in lockstep (where the CPU thread's time went);
+  `ROMBIE_LOCKSTEP_PROFILE=1` also prints the guest's hot places.
+
+Measured on Burnout 2, two engines on the 5950X, flat out, the first
+40-60 s from boot:
+
+- Each sync off alone (0x10, 0x20, 0x40) diverges by vblank 60; all on,
+  every hash matches.
+- TCG under icount runs about 230 million guest instructions a second.
+  Before the spin skip the guest needed 1,000 million a second at shift 0
+  (500 million at shift 1), so it ran at about 10 vblanks a second.
+- With the spin skip, shift 1: 3,600 vblanks in 76 s. Light stretches run
+  at 110-130 vblanks a second; others at about 25, where the CPU waits
+  ~450 ms a second for the GPU thread's own method processing, which normal
+  xemu runs alongside the CPU. Overlapping it deterministically is next.

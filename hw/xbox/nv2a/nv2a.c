@@ -21,6 +21,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/main-loop.h"
+#include "ui/rombie-engine.h"
 
 void nv2a_update_irq(NV2AState *d)
 {
@@ -241,9 +242,47 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
 
     pgraph_init(d);
 
+    d->pfifo.lockstep = rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU);
+
     /* fire up pfifo */
     qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo_thread",
                        pfifo_thread, d, QEMU_THREAD_JOINABLE);
+}
+
+/* Lockstep's RAM hash: the Xbox's memory is the GPU's (UMA). */
+uint64_t nv2a_lockstep_ram_hash(void)
+{
+    NV2AState *d = g_nv2a;
+    return d ? rombie_hash64(d->vram_ptr, memory_region_size(d->vram), 0) : 0;
+}
+
+/* Lockstep's NV2A hash: the registers the guest can read, and the state of
+ * the interrupts and the scanout. */
+uint64_t nv2a_lockstep_hash(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        return 0;
+    }
+    qemu_mutex_lock(&d->pfifo.lock);
+    qemu_mutex_lock(&d->pgraph.lock);
+    uint64_t h = rombie_hash64(d->pfifo.regs, sizeof(d->pfifo.regs), 1);
+    h = rombie_hash64(d->pgraph.regs_, sizeof(d->pgraph.regs_), h);
+    const uint64_t small[] = {
+        d->pmc.pending_interrupts,     d->pmc.enabled_interrupts,
+        d->pfifo.pending_interrupts,   d->pfifo.enabled_interrupts,
+        d->pgraph.pending_interrupts,  d->pgraph.enabled_interrupts,
+        d->ptimer.pending_interrupts,  d->ptimer.enabled_interrupts,
+        d->ptimer.numerator,           d->ptimer.denominator,
+        d->ptimer.alarm_time,          d->pcrtc.pending_interrupts,
+        d->pcrtc.enabled_interrupts,   d->pcrtc.start,
+        d->pcrtc.raster,
+    };
+    h = rombie_hash64(small, sizeof(small), h);
+    h = rombie_hash64(d->pvideo.regs, sizeof(d->pvideo.regs), h);
+    qemu_mutex_unlock(&d->pgraph.lock);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    return h;
 }
 
 static void nv2a_init_vga(NV2AState *d)

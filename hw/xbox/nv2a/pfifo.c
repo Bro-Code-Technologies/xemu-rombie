@@ -20,6 +20,8 @@
  */
 
 #include "nv2a_int.h"
+#include "system/cpus.h"
+#include "ui/rombie-engine.h"
 
 typedef struct RAMHTEntry {
     uint32_t handle;
@@ -91,12 +93,45 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     pfifo_kick(d);
 
     qemu_mutex_unlock(&d->pfifo.lock);
+
+    pfifo_lockstep_sync(d);
 }
 
 void pfifo_kick(NV2AState *d)
 {
     d->pfifo.fifo_kick = true;
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
+}
+
+/*
+ * Lockstep: after the guest writes a PFIFO, USER or PGRAPH register, the CPU
+ * waits for a pusher pass that starts after the write and ends with nothing
+ * more to do. Other threads' kicks (the display, surface downloads) never
+ * run the pusher, so the guest sees the GPU's progress, its interrupts and
+ * its writes to memory only at the guest times of its own writes.
+ */
+void pfifo_lockstep_sync(NV2AState *d)
+{
+    if (!d->pfifo.lockstep || !qemu_in_vcpu_thread()) {
+        return;
+    }
+    const uint64_t from = rombie_prof_now();
+    qemu_mutex_lock(&d->pfifo.lock);
+    const uint64_t kick = ++d->pfifo.guest_kicks;
+    pfifo_kick(d);
+    const bool locked = bql_locked();
+    if (locked) {
+        bql_unlock();
+    }
+    while (d->pfifo.guest_done < kick) {
+        qemu_cond_wait(&d->pfifo.fifo_idle_cond, &d->pfifo.lock);
+    }
+    qemu_mutex_unlock(&d->pfifo.lock);
+    if (locked) {
+        bql_lock();
+    }
+    rombie_prof_add(ROMBIE_PROF_GPU_NS, rombie_prof_now() - from);
+    rombie_prof_add(ROMBIE_PROF_GPU_SYNCS, 1);
 }
 
 static bool can_fifo_access(NV2AState *d) {
@@ -464,16 +499,29 @@ void *pfifo_thread(void *arg)
     qemu_mutex_lock(&d->pfifo.lock);
     while (true) {
         d->pfifo.fifo_kick = false;
+        const uint64_t guest_kicks = d->pfifo.guest_kicks;
+        const uint64_t pass_from = rombie_prof_now();
 
         pgraph_process_pending(d);
+        const uint64_t pusher_from = rombie_prof_now();
 
-        if (!d->pfifo.halt) {
+        if (!d->pfifo.halt &&
+            (!d->pfifo.lockstep || d->pfifo.guest_done < guest_kicks)) {
             pfifo_run_pusher(d);
         }
 
+        const uint64_t reports_from = rombie_prof_now();
         pgraph_process_pending_reports(d);
+        if (d->pfifo.lockstep && d->pfifo.guest_done < guest_kicks) {
+            const uint64_t now = rombie_prof_now();
+            rombie_prof_add(ROMBIE_PROF_GPU_WORK_NS, now - pass_from);
+            rombie_prof_add(ROMBIE_PROF_GPU_PENDING_NS,
+                            pusher_from - pass_from);
+            rombie_prof_add(ROMBIE_PROF_GPU_REPORTS_NS, now - reports_from);
+        }
 
         if (!d->pfifo.fifo_kick) {
+            d->pfifo.guest_done = guest_kicks;
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);
 
             // Both the pusher and puller are waiting for some action

@@ -260,7 +260,7 @@ static void *mcpx_apu_frame_thread(void *arg)
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
     qemu_mutex_lock(&d->lock);
     while (!qatomic_read(&d->exiting)) {
-        if (d->pause_requested) {
+        if (d->pause_requested || d->lockstep) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
             qemu_cond_wait(&d->cond, &d->lock);
@@ -301,6 +301,79 @@ static void *mcpx_apu_frame_thread(void *arg)
     }
     qemu_mutex_unlock(&d->lock);
     return NULL;
+}
+
+/* 32 samples at 48 kHz, in nanoseconds: 2/3 of a millisecond. */
+#define LOCKSTEP_FRAME_NS(n) ((int64_t)((n) * 2000000ULL / 3))
+
+/*
+ * Lockstep: one frame on the CPU thread, as the frame thread's loop runs one,
+ * at its own point of guest time. The vblank keeps real time, so there is no
+ * throttle; and a voice the guest has locked isn't waited for, since the
+ * guest can't run until the frame is done.
+ */
+static void mcpx_apu_lockstep_tick(void *opaque)
+{
+    MCPXAPUState *d = opaque;
+    const uint64_t from = rombie_prof_now();
+
+    qemu_mutex_lock(&d->lock);
+    if (!d->pause_requested) {
+        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                NV_PAPU_SECTL_XCNTMODE);
+        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        bool stopped = xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF ||
+                       (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) ||
+                       (fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        if (stopped || d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+        if (!stopped) {
+            se_frame(d);
+        }
+    }
+    qemu_mutex_unlock(&d->lock);
+
+    d->lockstep_frames++;
+    timer_mod_ns(d->lockstep_timer, LOCKSTEP_FRAME_NS(d->lockstep_frames));
+    rombie_prof_add(ROMBIE_PROF_APU_NS, rombie_prof_now() - from);
+}
+
+/* Lockstep's APU hash: its registers and both DSPs' memories. */
+uint64_t mcpx_apu_lockstep_hash(void)
+{
+    MCPXAPUState *d = g_state;
+    if (!d) {
+        return 0;
+    }
+    qemu_mutex_lock(&d->lock);
+    uint64_t h = rombie_hash64(d->regs, sizeof(d->regs), 2);
+    h = rombie_hash64(d->gp.regs, sizeof(d->gp.regs), h);
+    h = rombie_hash64(d->ep.regs, sizeof(d->ep.regs), h);
+    DSPState *dsps[2] = { d->gp.dsp, d->ep.dsp };
+    static const struct {
+        char space;
+        uint32_t size;
+    } spaces[] = {
+        { 'X', DSP_XRAM_SIZE }, { 'Y', DSP_YRAM_SIZE }, { 'P', DSP_PRAM_SIZE },
+    };
+    static uint32_t words[DSP_XRAM_SIZE];
+    for (int i = 0; i < 2; i++) {
+        if (!dsps[i]) {
+            continue;
+        }
+        for (size_t s = 0; s < ARRAY_SIZE(spaces); s++) {
+            for (uint32_t a = 0; a < spaces[s].size; a++) {
+                words[a] = dsp_read_memory(dsps[i], spaces[s].space, a);
+            }
+            h = rombie_hash64(words, spaces[s].size * sizeof(words[0]), h);
+        }
+    }
+    const uint64_t counters[] = { d->ep_frame_div, d->lockstep_frames };
+    h = rombie_hash64(counters, sizeof(counters), h);
+    qemu_mutex_unlock(&d->lock);
+    return h;
 }
 
 static void mcpx_apu_wait_for_idle(MCPXAPUState *d)
@@ -423,6 +496,14 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
     mcpx_apu_monitor_init(d, &local_err);
     if (local_err) {
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
+    }
+
+    d->lockstep = rombie_engine_lockstep_sync(ROMBIE_SYNC_APU);
+    if (d->lockstep) {
+        d->lockstep_timer =
+            timer_new_ns(QEMU_CLOCK_VIRTUAL, mcpx_apu_lockstep_tick, d);
+        d->lockstep_frames = 1;
+        timer_mod_ns(d->lockstep_timer, LOCKSTEP_FRAME_NS(1));
     }
 
     qemu_add_vm_change_state_handler(mcpx_apu_vm_state_change, d);

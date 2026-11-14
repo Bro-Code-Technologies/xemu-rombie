@@ -20,6 +20,7 @@
  */
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
+#include "ui/rombie-engine.h"
 #include "adpcm.h"
 
 static const struct {
@@ -1613,19 +1614,9 @@ static void *voice_worker_thread(void *arg)
 
             qemu_mutex_lock(&vwd->lock);
 
-            // Add voice contributions
-            for (int b = 0; b < NUM_MIXBINS; b++) {
-                for (int s = 0; s < NUM_SAMPLES_PER_FRAME; s++) {
-                    vwd->mixbins[b][s] += self->mixbins[b][s];
-                }
-            }
-            if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
-                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-                    d->vp.sample_buf[i][0] += self->sample_buf[i][0];
-                    d->vp.sample_buf[i][1] += self->sample_buf[i][1];
-                }
-            }
-
+            /* The dispatcher adds the workers' mixes in worker order, so
+             * the sum is the same whichever finishes first. */
+            self->mixed = true;
             self->queue_len = 0;
         }
 
@@ -1731,7 +1722,9 @@ voice_work_dispatch(MCPXAPUState *d,
             return;
         }
 
-        if (!any_queued_voice_locked(d)) {
+        /* In lockstep the guest can't unlock a voice until the frame is
+         * done (mcpx_apu_lockstep_tick). */
+        if (d->lockstep || !any_queued_voice_locked(d)) {
             break;
         }
 
@@ -1749,6 +1742,25 @@ voice_work_dispatch(MCPXAPUState *d,
         qemu_cond_wait(&vwd->work_finished, &vwd->lock);
         assert(!vwd->workers_pending);
         vwd->queue_len = 0;
+
+        for (int w = 0; w < vwd->num_workers; w++) {
+            VoiceWorker *worker = &vwd->workers[w];
+            if (!worker->mixed) {
+                continue;
+            }
+            worker->mixed = false;
+            for (int b = 0; b < NUM_MIXBINS; b++) {
+                for (int s = 0; s < NUM_SAMPLES_PER_FRAME; s++) {
+                    vwd->mixbins[b][s] += worker->mixbins[b][s];
+                }
+            }
+            if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    d->vp.sample_buf[i][0] += worker->sample_buf[i][0];
+                    d->vp.sample_buf[i][1] += worker->sample_buf[i][1];
+                }
+            }
+        }
 
         // Add voice contributions
         for (int b = 0; b < NUM_MIXBINS; b++) {
@@ -1769,6 +1781,11 @@ static void voice_work_init(MCPXAPUState *d)
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
     int num_workers = g_config.audio.vp.num_workers ?: SDL_GetNumLogicalCPUCores();
+    /* How voices are shared out decides the order their mixes are added in,
+     * so lockstep has the same number of workers on every PC. */
+    if (rombie_engine_lockstep_sync(ROMBIE_SYNC_APU)) {
+        num_workers = 4;
+    }
     vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
     vwd->workers = g_malloc0_n(vwd->num_workers, sizeof(VoiceWorker));
     vwd->workers_should_exit = false;

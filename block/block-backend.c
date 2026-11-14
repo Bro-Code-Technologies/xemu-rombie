@@ -26,6 +26,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "trace.h"
+#include "ui/rombie-engine.h"
 #include "migration/misc.h"
 
 /* Number of coroutines to reserve per attached device model */
@@ -1510,16 +1511,27 @@ int blk_make_zero(BlockBackend *blk, BdrvRequestFlags flags)
     return bdrv_make_zero(blk->root, flags);
 }
 
+/* Every BlockBackend's requests in flight, for Rombie's lockstep, whose CPU
+ * waits for the I/O it starts (hw/xbox/rombie-lockstep.c). */
+static unsigned int blk_all_in_flight;
+
+unsigned int blk_lockstep_in_flight(void)
+{
+    return qatomic_read(&blk_all_in_flight);
+}
+
 void blk_inc_in_flight(BlockBackend *blk)
 {
     IO_CODE();
     qatomic_inc(&blk->in_flight);
+    qatomic_inc(&blk_all_in_flight);
 }
 
 void blk_dec_in_flight(BlockBackend *blk)
 {
     IO_CODE();
     qatomic_dec(&blk->in_flight);
+    qatomic_dec(&blk_all_in_flight);
     aio_wait_kick();
 }
 

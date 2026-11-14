@@ -529,9 +529,12 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
 
 void xemu_input_update_controller(ControllerState *state)
 {
+    /* In lockstep the guest reads the pads its vblank applied, every time,
+     * not as often as real time allows. */
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    if (ABS(now - state->last_input_updated_ts) <
-        XEMU_INPUT_MIN_INPUT_UPDATE_INTERVAL_US) {
+    if (!(state->type == INPUT_DEVICE_ROMBIE && rombie_engine_lockstep()) &&
+        ABS(now - state->last_input_updated_ts) <
+            XEMU_INPUT_MIN_INPUT_UPDATE_INTERVAL_US) {
         return;
     }
 
@@ -550,6 +553,11 @@ void xemu_input_update_controllers(void)
 {
     ControllerState *iter;
     QTAILQ_FOREACH(iter, &available_controllers, entry) {
+        /* In lockstep only the guest's own poll updates the page's pads, so
+         * this thread never writes a pad the guest is reading. */
+        if (iter->type == INPUT_DEVICE_ROMBIE && rombie_engine_lockstep()) {
+            continue;
+        }
         xemu_input_update_controller(iter);
     }
     QTAILQ_FOREACH(iter, &available_controllers, entry) {

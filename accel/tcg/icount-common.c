@@ -290,6 +290,51 @@ static void icount_timer_cb(void *opaque)
     icount_warp_rt();
 }
 
+/*
+ * Rombie's lockstep (sleep off): an idle vCPU moves QEMU_CLOCK_VIRTUAL on to
+ * its next deadline itself and runs the timers there, the warp
+ * icount_start_warp_timer() makes below. Left to the main loop, every halt
+ * cost two thread wake-ups, and on Windows that ran the guest at a sixth of
+ * its speed. Returns whether it warped.
+ */
+bool icount_warp_in_vcpu(void)
+{
+    if (!all_cpu_threads_idle() || !icount_warp_to_deadline()) {
+        return false;
+    }
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    return true;
+}
+
+/*
+ * The warp itself, for a vCPU that is idle or spinning (Rombie's lockstep
+ * finds the spins): QEMU_CLOCK_VIRTUAL jumps to its next deadline, whose
+ * timers the vCPU loop then runs. Only with sleep off, outside replay.
+ */
+bool icount_warp_to_deadline(void)
+{
+    int64_t deadline;
+
+    if (icount_sleep || replay_mode != REPLAY_MODE_NONE ||
+        !runstate_is_running()) {
+        return false;
+    }
+    deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                          ~QEMU_TIMER_ATTR_EXTERNAL);
+    if (deadline < 0) {
+        return false;
+    }
+    if (deadline > 0) {
+        seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                           &timers_state.vm_clock_lock);
+        qatomic_set_i64(&timers_state.qemu_icount_bias,
+                        timers_state.qemu_icount_bias + deadline);
+        seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                             &timers_state.vm_clock_lock);
+    }
+    return true;
+}
+
 void icount_start_warp_timer(void)
 {
     int64_t clock;

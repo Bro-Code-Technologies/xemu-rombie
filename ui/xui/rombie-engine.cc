@@ -18,6 +18,14 @@
  *                  game, which starts from the blank hard disk)
  *   0x09 speed     [u8 type][3 pad][f32 ratio] (1 = normal; more = faster)
  *   0x0E delete state [u8 type][u8 slot]
+ *   0x0B lockstep  [u8 type][u8 flags][2 pad][u32 hash every][u16 year]
+ *                  [u8 month][u8 day][u8 hour][u8 minute][u8 second][pad]
+ *                  (before boot; flags: 1 lockstep, 2 unthrottled; 0x10,
+ *                  0x20 and 0x40 leave the APU, GPU and I/O syncs off, for
+ *                  development tests only)
+ *   0x0C inputs    [u8 type][3 pad][u32 first vblank][u32 count]
+ *                  [count x 4 pads: u16 buttons, i8 lx, ly, rx, ry,
+ *                  u8 lt, rt]     (lockstep: vblank N runs once N's are in)
  * Engine to page (binary):
  *   0x81 disc read [u8 type][3 pad][u32 request id][u64 offset][u32 length]
  *   0x82 frame     [u8 type][3 pad][u32 frame no][f64 engine time, ms]
@@ -26,6 +34,11 @@
  *   0x85 game data [u8 type][7 pad][blob]    (a second after the game last
  *                  wrote its hard disk, after every state change, before a
  *                  pause and on exit)
+ *   0x86 hashes    [u8 type][3 pad][u32 vblank][u32 count][count x u64]
+ *                  (lockstep, at the start of the vblank: RAM, CPU, NV2A,
+ *                  APU, I/O, guest time)
+ *   0x87 vblank    [u8 type][3 pad][u32 vblank] (lockstep: runs next, once
+ *                  its input is in)
  * Engine to page (text, JSON): hello, event, stats (once a second), pong,
  * and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after boot
  * and after every state change.
@@ -35,7 +48,8 @@
  * Pad buttons: bit i is the Duke's button i in xemu's ControllerState order
  * (A, B, X, Y, d-pad left, up, right, down, Back, Start, White, Black,
  * left stick, right stick). Sticks and triggers run -1..1 and 0..1, with +y
- * down as in the browser's standard gamepad mapping.
+ * down as in the browser's standard gamepad mapping; lockstep's are the same
+ * in eight bits (-128..127, 0..255).
  *
  * One game per process: the machine boots when the page's boot message
  * arrives and the process ends when the game stops or the page stays gone.
@@ -52,6 +66,7 @@
 
 #include "../rombie-engine.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -95,12 +110,14 @@ typedef int engine_socket;
 
 extern "C" {
 #include "system/cpu-timers.h"
+extern uint64_t vblank_interval_ns; /* ui/xemu.c */
 }
 
 #include "../rombie-engine-media.h"
 #include "../rombie-engine-version.h"
 
-static constexpr int PROTOCOL_VERSION = 1;
+/* 2: lockstep (0x0B, 0x0C, 0x86, 0x87, lw in the stats). */
+static constexpr int PROTOCOL_VERSION = 2;
 static constexpr uint16_t ENGINE_PORT = 47653;
 
 static constexpr uint8_t MSG_BOOT = 0x01;
@@ -113,10 +130,25 @@ static constexpr uint8_t MSG_LOAD_STATE = 0x07;
 static constexpr uint8_t MSG_GAME_DATA = 0x08;
 static constexpr uint8_t MSG_SPEED = 0x09;
 static constexpr uint8_t MSG_DELETE_STATE = 0x0E;
+static constexpr uint8_t MSG_LOCKSTEP = 0x0B;
+static constexpr uint8_t MSG_INPUTS = 0x0C;
 static constexpr uint8_t MSG_DISC_READ = 0x81;
 static constexpr uint8_t MSG_FRAME = 0x82;
 static constexpr uint8_t MSG_AUDIO = 0x83;
 static constexpr uint8_t MSG_GAME_DATA_SAVED = 0x85;
+static constexpr uint8_t MSG_HASHES = 0x86;
+static constexpr uint8_t MSG_VBLANK = 0x87;
+
+static constexpr uint8_t LOCKSTEP_ON = 0x01;
+static constexpr uint8_t LOCKSTEP_UNTHROTTLED = 0x02;
+static constexpr uint8_t LOCKSTEP_NO_APU_SYNC = 0x10;
+static constexpr uint8_t LOCKSTEP_NO_GPU_SYNC = 0x20;
+static constexpr uint8_t LOCKSTEP_NO_IO_SYNC = 0x40;
+static constexpr size_t LOCKSTEP_PAD_SIZE = 8;
+static constexpr uint32_t MAX_INPUT_FRAMES = 3600;
+/* Further behind real time than this (a pause, a long wait for the other
+ * PCs), lockstep starts keeping time afresh rather than run flat out. */
+static constexpr double PACE_RESET_MS = 1000.0;
 
 /* A game usually writes several times in a row when it saves; wait for it
  * to finish before sending the image. */
@@ -218,6 +250,37 @@ static PadState s_pads[4];
 static constexpr float MAX_SPEED = 10.0f;
 static std::atomic<double> s_speed{1.0};
 
+/* Lockstep, as 0x0B set it before boot (s_boot_mutex until then; read-only
+ * once QEMU starts). */
+static uint8_t s_lockstep_flags;
+static uint32_t s_hash_every;
+static std::string s_icount_option;
+static std::string s_rtc_option;
+
+struct LockstepPad {
+    uint16_t buttons;
+    int8_t axes[4]; /* lx, ly, rx, ry; +y down */
+    uint8_t triggers[2];
+};
+using LockstepInput = std::array<LockstepPad, 4>;
+/* Input for the vblanks from s_inputs_first on, as 0x0C brought it. */
+static std::mutex s_input_mutex;
+static std::condition_variable s_input_cv;
+static std::deque<LockstepInput> s_inputs;
+static uint32_t s_inputs_first;
+/* What the guest's pads read in lockstep (s_pad_mutex), from the vblank
+ * that applied them. */
+static LockstepInput s_lockstep_pads;
+/* The CPU thread's: the vblank that runs next, and real time's anchor. */
+static uint32_t s_lockstep_vblank;
+static uint32_t s_announced_vblank = UINT32_MAX;
+static double s_pace_from_ms = -1.0;
+static uint32_t s_pace_from_vblank;
+/* Its 0x86 and 0x87, for the sender thread. */
+static std::mutex s_lockstep_out_mutex;
+static std::deque<std::vector<uint8_t>> s_lockstep_out;
+static void SendLockstepMessages(void);
+
 /* Pending disc reads (s_disc_mutex). */
 struct PendingRead {
     void *dst;
@@ -256,6 +319,7 @@ struct Stats {
     std::atomic<uint32_t> disc_reads{0};
     std::atomic<uint64_t> disc_bytes{0};
     std::atomic<uint64_t> disc_wait_us{0};
+    std::atomic<uint64_t> lockstep_wait_us{0}; /* waiting for input */
     std::atomic<uint32_t> width{0}, height{0};
 };
 static Stats s_stats;
@@ -801,9 +865,92 @@ static float ClampUnit(float v, float lo)
     return (v != v) ? 0.0f : (v < lo ? lo : (v > 1.0f ? 1.0f : v));
 }
 
+static void HandleLockstep(const std::vector<uint8_t> &data)
+{
+    if (data.size() < 16) {
+        return;
+    }
+    const uint8_t flags = data[1];
+    const uint32_t every = ReadValue<uint32_t>(data, 4);
+    const unsigned year = ReadValue<uint16_t>(data, 8);
+    const unsigned month = data[10], day = data[11], hour = data[12],
+                   minute = data[13], second = data[14];
+    if (year < 2001 || year > 2099 || month < 1 || month > 12 || day < 1 ||
+        day > 31 || hour > 23 || minute > 59 || second > 59) {
+        SendEvent("error", "The lockstep message's clock isn't a valid date.");
+        return;
+    }
+    char rtc[64];
+    snprintf(rtc, sizeof(rtc), "base=%04u-%02u-%02uT%02u:%02u:%02u,clock=vm",
+             year, month, day, hour, minute, second);
+
+    /* Development only: how many guest instructions make a nanosecond, as
+     * QEMU's icount shift (2^shift ns an instruction). */
+    int shift = 0;
+    const char *shift_env = getenv("ROMBIE_ICOUNT_SHIFT");
+    if (shift_env && shift_env[0] >= '0' && shift_env[0] <= '9' &&
+        !shift_env[1]) {
+        shift = shift_env[0] - '0';
+    }
+
+    std::unique_lock<std::mutex> lock(s_boot_mutex);
+    if (s_boot_ready) {
+        lock.unlock();
+        SendEvent("error", "Lockstep must be set before the boot message.");
+        return;
+    }
+    s_lockstep_flags = (flags & LOCKSTEP_ON) ? flags : 0;
+    s_hash_every = every;
+    s_rtc_option = rtc;
+    s_icount_option =
+        "shift=" + std::to_string(shift) + ",sleep=off,align=off";
+}
+
+static void HandleInputs(const std::vector<uint8_t> &data)
+{
+    if (!rombie_engine_lockstep() || data.size() < 12) {
+        return;
+    }
+    const uint32_t first = ReadValue<uint32_t>(data, 4);
+    const uint32_t count = ReadValue<uint32_t>(data, 8);
+    if (count > MAX_INPUT_FRAMES ||
+        data.size() < 12 + (size_t)count * 4 * LOCKSTEP_PAD_SIZE) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(s_input_mutex);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t vblank = first + i;
+        if (vblank < s_inputs_first) {
+            continue; /* already run */
+        }
+        const size_t index = vblank - s_inputs_first;
+        if (index > s_inputs.size()) {
+            break; /* a gap; what fills it comes first */
+        }
+        LockstepInput input;
+        for (int p = 0; p < 4; p++) {
+            const size_t at = 12 + ((size_t)i * 4 + p) * LOCKSTEP_PAD_SIZE;
+            input[p].buttons = ReadValue<uint16_t>(data, at);
+            for (int a = 0; a < 4; a++) {
+                input[p].axes[a] = (int8_t)data[at + 2 + a];
+            }
+            input[p].triggers[0] = data[at + 6];
+            input[p].triggers[1] = data[at + 7];
+        }
+        if (index == s_inputs.size()) {
+            s_inputs.push_back(input);
+        } else {
+            s_inputs[index] = input;
+        }
+    }
+    lock.unlock();
+    s_input_cv.notify_all();
+}
+
 static void HandlePad(const std::vector<uint8_t> &data)
 {
-    if (data.size() < 32 || data[1] >= 4) {
+    /* In lockstep the pads are the vblanks' inputs (0x0C). */
+    if (data.size() < 32 || data[1] >= 4 || rombie_engine_lockstep()) {
         return;
     }
     PadState pad;
@@ -864,7 +1011,8 @@ static void HandlePing(const std::vector<uint8_t> &data)
 
 static void HandleSpeed(const std::vector<uint8_t> &data)
 {
-    if (data.size() < 8) {
+    /* Lockstep runs at the console's own speed, or flat out (0x0B). */
+    if (data.size() < 8 || rombie_engine_lockstep()) {
         return;
     }
     const float ratio = ReadValue<float>(data, 4);
@@ -1040,6 +1188,12 @@ static void HandleBinary(const std::vector<uint8_t> &message)
         break;
     case MSG_SPEED:
         HandleSpeed(message);
+        break;
+    case MSG_LOCKSTEP:
+        HandleLockstep(message);
+        break;
+    case MSG_INPUTS:
+        HandleInputs(message);
         break;
     default:
         break;
@@ -1265,6 +1419,7 @@ static void SenderThread(void)
             continue;
         }
 
+        SendLockstepMessages();
         SendPendingAudio(audio);
 
         if (!frame.empty()) {
@@ -1296,15 +1451,57 @@ static void SenderThread(void)
             const uint32_t reads = s_stats.disc_reads.exchange(0);
             const uint64_t read_bytes = s_stats.disc_bytes.exchange(0);
             const uint64_t read_us = s_stats.disc_wait_us.exchange(0);
-            char stats[512];
+            const uint64_t lockstep_wait_us =
+                s_stats.lockstep_wait_us.exchange(0);
+            if (rombie_engine_lockstep()) {
+                /* Where lockstep's time went this second, in ms (counts
+                 * for loops), and the guest instructions run. */
+                static uint64_t last_insns;
+                const uint64_t insns = rombie_prof_insns();
+                double ms[ROMBIE_PROF_COUNT];
+                for (int i = 0; i < ROMBIE_PROF_COUNT; i++) {
+                    ms[i] = rombie_prof_take((RombieProf)i) / 1e6;
+                }
+                char prof[640];
+                snprintf(prof, sizeof(prof),
+                         "{\"t\":\"prof\",\"minsns\":%.1f,\"exec\":%.0f,"
+                         "\"loops\":%.0f,\"empty\":%.0f,\"gpu\":%.0f,"
+                         "\"apu\":%.0f,\"io\":%.0f,\"hash\":%.0f,"
+                         "\"idle\":%.0f,\"bql\":%.0f,\"timers\":%.0f,"
+                         "\"warps\":%.0f,\"vblank\":%.0f,\"display\":%.0f,"
+                         "\"send\":%.0f,\"spins\":%.0f,\"syncs\":%.0f,"
+                         "\"gpuWork\":%.0f,\"gpuPending\":%.0f,"
+                         "\"gpuReports\":%.0f}",
+                         (insns - last_insns) / 1e6 / seconds,
+                         ms[ROMBIE_PROF_EXEC_NS],
+                         ms[ROMBIE_PROF_LOOPS] * 1e6,
+                         ms[ROMBIE_PROF_EMPTY_LOOPS] * 1e6,
+                         ms[ROMBIE_PROF_GPU_NS], ms[ROMBIE_PROF_APU_NS],
+                         ms[ROMBIE_PROF_IO_NS], ms[ROMBIE_PROF_HASH_NS],
+                         ms[ROMBIE_PROF_IDLE_NS], ms[ROMBIE_PROF_BQL_NS],
+                         ms[ROMBIE_PROF_TIMERS_NS],
+                         ms[ROMBIE_PROF_WARPS] * 1e6,
+                         ms[ROMBIE_PROF_VBLANK_NS],
+                         ms[ROMBIE_PROF_DISPLAY_NS], ms[ROMBIE_PROF_SEND_NS],
+                         ms[ROMBIE_PROF_SPINS] * 1e6,
+                         ms[ROMBIE_PROF_GPU_SYNCS] * 1e6,
+                         ms[ROMBIE_PROF_GPU_WORK_NS],
+                         ms[ROMBIE_PROF_GPU_PENDING_NS],
+                         ms[ROMBIE_PROF_GPU_REPORTS_NS]);
+                last_insns = insns;
+                SendText(prof);
+            }
+            char stats[576];
             snprintf(stats, sizeof(stats),
-                     "{\"t\":\"stats\",\"vbl\":%.1f,\"speed\":%.1f,"
+                     "{\"t\":\"stats\",\"ms\":%.0f,\"lw\":%.0f,"
+                     "\"vbl\":%.1f,\"speed\":%.1f,"
                      "\"padMsgs\":%u,"
                      "\"guestPolls\":[%u,%u,%u,%u],\"guestSeen\":%u,"
                      "\"fps\":%.1f,\"mbps\":%.1f,"
                      "\"readback_us\":%u,\"drop\":%u,\"audio\":%u,"
                      "\"overflow\":%u,\"dr\":%u,\"drBytes\":%llu,"
                      "\"drMs\":%.2f,\"w\":%u,\"h\":%u}",
+                     seconds * 1000.0, lockstep_wait_us / 1000.0,
                      vblanks / seconds, s_speed.load(),
                      pad_messages,
                      polls[0], polls[1], polls[2], polls[3], guest_seen,
@@ -1891,8 +2088,30 @@ static int16_t ToAxis(float v)
     return (int16_t)(v >= 0.0f ? v * 32767.0f : v * 32768.0f);
 }
 
+static int16_t StickFrom8(int v)
+{
+    v = v < -128 ? -128 : (v > 127 ? 127 : v);
+    return (int16_t)(v >= 0 ? v * 32767 / 127 : v * 256);
+}
+
 void rombie_engine_read_pad(int player, uint16_t *buttons, int16_t axis[6])
 {
+    if (rombie_engine_lockstep()) {
+        LockstepPad pad;
+        {
+            std::unique_lock<std::mutex> lock(s_pad_mutex);
+            pad = s_lockstep_pads[player & 3];
+        }
+        *buttons = (uint16_t)(pad.buttons & 0x3FFF);
+        axis[CONTROLLER_AXIS_LTRIG] = (int16_t)(pad.triggers[0] * 32767 / 255);
+        axis[CONTROLLER_AXIS_RTRIG] = (int16_t)(pad.triggers[1] * 32767 / 255);
+        axis[CONTROLLER_AXIS_LSTICK_X] = StickFrom8(pad.axes[0]);
+        axis[CONTROLLER_AXIS_LSTICK_Y] = StickFrom8(-pad.axes[1]);
+        axis[CONTROLLER_AXIS_RSTICK_X] = StickFrom8(pad.axes[2]);
+        axis[CONTROLLER_AXIS_RSTICK_Y] = StickFrom8(-pad.axes[3]);
+        return;
+    }
+
     PadState pad;
     {
         std::unique_lock<std::mutex> lock(s_pad_mutex);
@@ -1925,4 +2144,150 @@ void rombie_engine_on_pad_poll(int port, uint16_t buttons)
     }
     s_stats.guest_polls[port].fetch_add(1, std::memory_order_relaxed);
     s_stats.guest_buttons_seen.fetch_or(buttons, std::memory_order_relaxed);
+}
+
+/* --------------------------------------------------------------------------
+ * Lockstep.
+ */
+
+bool rombie_engine_lockstep(void)
+{
+    return s_lockstep_flags != 0;
+}
+
+bool rombie_engine_lockstep_sync(RombieSync part)
+{
+    if (!rombie_engine_lockstep()) {
+        return false;
+    }
+    switch (part) {
+    case ROMBIE_SYNC_APU:
+        return !(s_lockstep_flags & LOCKSTEP_NO_APU_SYNC);
+    case ROMBIE_SYNC_GPU:
+        return !(s_lockstep_flags & LOCKSTEP_NO_GPU_SYNC);
+    case ROMBIE_SYNC_IO:
+        return !(s_lockstep_flags & LOCKSTEP_NO_IO_SYNC);
+    }
+    return true;
+}
+
+const char *rombie_engine_icount_option(void)
+{
+    return s_icount_option.c_str();
+}
+
+const char *rombie_engine_rtc_option(void)
+{
+    return s_rtc_option.c_str();
+}
+
+/* The CPU thread never waits on the socket: its messages go out on the
+ * sender thread, ahead of frames and sound (SendLockstepMessages). */
+static void QueueLockstepMessage(const uint8_t *msg, size_t size)
+{
+    {
+        std::unique_lock<std::mutex> lock(s_lockstep_out_mutex);
+        s_lockstep_out.emplace_back(msg, msg + size);
+    }
+    s_wake.notify_one();
+}
+
+static void SendLockstepMessages(void)
+{
+    std::deque<std::vector<uint8_t>> out;
+    {
+        std::unique_lock<std::mutex> lock(s_lockstep_out_mutex);
+        out.swap(s_lockstep_out);
+    }
+    for (const auto &msg : out) {
+        SendMessageParts(0x2, msg.data(), msg.size(), nullptr, 0);
+    }
+}
+
+static void SendHashes(uint32_t vblank)
+{
+    uint64_t parts[ROMBIE_HASH_PARTS];
+    rombie_lockstep_hash(parts);
+    uint8_t msg[12 + sizeof(parts)] = { MSG_HASHES };
+    const uint32_t count = ROMBIE_HASH_PARTS;
+    memcpy(msg + 4, &vblank, 4);
+    memcpy(msg + 8, &count, 4);
+    memcpy(msg + 12, parts, sizeof(parts));
+    QueueLockstepMessage(msg, sizeof(msg));
+}
+
+static void SendVblank(uint32_t vblank)
+{
+    uint8_t msg[8] = { MSG_VBLANK };
+    memcpy(msg + 4, &vblank, 4);
+    QueueLockstepMessage(msg, sizeof(msg));
+}
+
+bool rombie_engine_lockstep_vblank(void)
+{
+    const uint32_t vblank = s_lockstep_vblank;
+    if (s_announced_vblank != vblank) {
+        s_announced_vblank = vblank;
+        if (s_hash_every && vblank % s_hash_every == 0) {
+            SendHashes(vblank);
+        }
+        const uint64_t send_from = rombie_prof_now();
+        SendVblank(vblank);
+        rombie_prof_add(ROMBIE_PROF_SEND_NS, rombie_prof_now() - send_from);
+    }
+
+    /* The rest of the machine runs on while this waits: the page's work on
+     * the UI thread, disc reads, a stop. */
+    LockstepInput input;
+    bool have = false;
+    const double wait_from = NowMs();
+    rombie_lockstep_unlock();
+    {
+        std::unique_lock<std::mutex> lock(s_input_mutex);
+        for (;;) {
+            if (!s_inputs.empty()) {
+                input = s_inputs.front();
+                s_inputs.pop_front();
+                s_inputs_first++;
+                have = true;
+                break;
+            }
+            if (rombie_lockstep_stopping()) {
+                break;
+            }
+            s_input_cv.wait_for(lock, std::chrono::milliseconds(5));
+        }
+    }
+    double now = NowMs();
+    s_stats.lockstep_wait_us.fetch_add((uint64_t)((now - wait_from) * 1000.0),
+                                       std::memory_order_relaxed);
+
+    /* Real time at fixed deadlines from an anchor, so a late vblank's time
+     * is made back over the ones after it. */
+    if (have && !(s_lockstep_flags & LOCKSTEP_UNTHROTTLED)) {
+        const double interval_ms = vblank_interval_ns / 1e6;
+        if (s_pace_from_ms < 0.0 ||
+            now - (s_pace_from_ms +
+                   (vblank - s_pace_from_vblank) * interval_ms) >
+                PACE_RESET_MS) {
+            s_pace_from_ms = now;
+            s_pace_from_vblank = vblank;
+        }
+        const double due =
+            s_pace_from_ms + (vblank + 1 - s_pace_from_vblank) * interval_ms;
+        if (now < due) {
+            SDL_DelayPrecise((Uint64)((due - now) * 1e6));
+        }
+    }
+    rombie_lockstep_relock();
+    if (!have) {
+        return false;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(s_pad_mutex);
+        s_lockstep_pads = input;
+    }
+    s_lockstep_vblank = vblank + 1;
+    return true;
 }

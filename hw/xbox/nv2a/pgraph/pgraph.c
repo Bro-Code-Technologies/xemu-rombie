@@ -175,6 +175,8 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     qemu_mutex_unlock(&pg->lock);
     qemu_mutex_unlock(&d->pfifo.lock);
+
+    pfifo_lockstep_sync(d);
 }
 
 void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
