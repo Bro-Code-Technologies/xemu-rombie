@@ -185,14 +185,25 @@ static int rr_cpu_count(void)
  * instructions (a multiple of every loop length up to 8); when both leave
  * the CPU's registers exactly the same, it is spinning on memory nothing
  * changes before the next timer runs, and guest time jumps there. That
- * depends on guest state alone, so every engine jumps alike. A probe may
- * take several runs: a timer that re-arms itself kicks the CPU out after
- * one block.
+ * depends on guest state alone, so every engine jumps alike: a probe may
+ * take several runs (a timer that re-arms itself, or another thread, kicks
+ * the CPU out after a block), and an interval that found no spin runs to
+ * its end however often it is kicked.
  */
 enum { SPIN_RUN, SPIN_FIRST, SPIN_SECOND, SPIN_REST };
 #define SPIN_PROBE 840
 static int spin_phase;
 static int64_t spin_left;
+static int64_t spin_rest_until; /* guest time the interval without one ends */
+
+static void rr_spin_rest(void)
+{
+    const int64_t deadline =
+        qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL, QEMU_TIMER_ATTR_ALL);
+    spin_phase = SPIN_REST;
+    spin_rest_until = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (deadline > 0 ? deadline : 0);
+}
 
 /* The budget for the next run: a probe's remainder, if one is under way and
  * fits before the next timer; otherwise the probe gives up for this
@@ -203,13 +214,17 @@ static int64_t rr_spin_budget(CPUState *cpu, int64_t budget)
         spin_phase = SPIN_RUN;
         return budget;
     }
+    if (spin_phase == SPIN_REST &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= spin_rest_until) {
+        spin_phase = SPIN_RUN;
+    }
     if (spin_phase == SPIN_RUN && budget > 3 * SPIN_PROBE) {
         spin_phase = SPIN_FIRST;
         spin_left = SPIN_PROBE;
     }
     if (spin_phase == SPIN_FIRST || spin_phase == SPIN_SECOND) {
         if (budget < spin_left) {
-            spin_phase = SPIN_REST;
+            rr_spin_rest();
             return budget;
         }
         return spin_left;
@@ -219,15 +234,11 @@ static int64_t rr_spin_budget(CPUState *cpu, int64_t budget)
 
 static void rr_spin_ran(CPUState *cpu, int64_t executed)
 {
-    if (spin_phase == SPIN_REST) {
-        spin_phase = SPIN_RUN;
-        return;
-    }
     if (spin_phase != SPIN_FIRST && spin_phase != SPIN_SECOND) {
         return;
     }
-    if (cpu->halted || executed <= 0) {
-        spin_phase = SPIN_REST;
+    if (cpu->halted) {
+        rr_spin_rest();
         return;
     }
     spin_left -= executed;
@@ -241,11 +252,17 @@ static void rr_spin_ran(CPUState *cpu, int64_t executed)
         return;
     }
     rombie_spin_capture(cpu, 1);
+    /* A spin is most often a wait on the GPU: work the guest left waiting
+     * runs first, and the probes start again. */
+    if (rombie_spin_same() && rombie_lockstep_catch_up()) {
+        spin_phase = SPIN_RUN;
+        return;
+    }
     if (rombie_spin_same() && icount_warp_to_deadline()) {
         rombie_prof_add(ROMBIE_PROF_SPINS, 1);
         spin_phase = SPIN_RUN;
     } else {
-        spin_phase = SPIN_REST;
+        rr_spin_rest();
     }
 }
 

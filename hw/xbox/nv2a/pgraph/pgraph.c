@@ -22,6 +22,7 @@
 #include <math.h>
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "ui/rombie-engine.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
@@ -927,6 +928,7 @@ DEF_METHOD(NV097, FLIP_STALL)
     d->pgraph.renderer->ops.flip_stall(d);
     nv2a_profile_flip_stall();
     pg->waiting_for_flip = true;
+    rombie_prof_add(ROMBIE_PROF_FLIPS, 1);
 }
 
 // TODO: these should be loading the dma objects from ramin here?

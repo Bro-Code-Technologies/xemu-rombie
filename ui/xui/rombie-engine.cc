@@ -39,9 +39,11 @@
  *                  APU, I/O, guest time)
  *   0x87 vblank    [u8 type][3 pad][u32 vblank] (lockstep: runs next, once
  *                  its input is in)
- * Engine to page (text, JSON): hello, event, stats (once a second), pong,
- * and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after boot
- * and after every state change.
+ * Engine to page (text, JSON): hello, event, stats (once a second: with
+ * flips, the game's own frames, and lw, the ms lockstep waited for input),
+ * pong, and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after
+ * boot and after every state change. In lockstep, prof (once a second,
+ * before stats) says where the CPU thread's time went.
  * The game data blob is the game's one stored object: its hard disk image,
  * whose save states live inside it as snapshots, and its EEPROM
  * (rombie-engine-media.h has the layout).
@@ -66,6 +68,7 @@
 
 #include "../rombie-engine.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -75,6 +78,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -281,16 +285,109 @@ static std::mutex s_lockstep_out_mutex;
 static std::deque<std::vector<uint8_t>> s_lockstep_out;
 static void SendLockstepMessages(void);
 
-/* Pending disc reads (s_disc_mutex). */
-struct PendingRead {
+/* The disc, read from the page in whole chunks (s_disc_mutex). The page
+ * answers each read in tens of milliseconds, so every read also asks for
+ * the chunks after it, which a sequential stream then finds here, and the
+ * last few dozen chunks stay for reads that come back to them. */
+static constexpr uint32_t DISC_CHUNK = 1024 * 1024;
+static constexpr uint64_t DISC_AHEAD = 2; /* chunks asked for past a read */
+static constexpr size_t DISC_KEEP = 24;   /* chunks kept */
+struct DiscWaiter {
     void *dst;
+    uint64_t offset;
     uint32_t length;
     rombie_disc_read_cb cb;
     void *opaque;
+    int missing; /* its chunks still to come */
+    bool settled;
+};
+struct DiscChunk {
+    std::vector<uint8_t> data;
+    bool ready;
+    uint32_t id; /* the page request, until ready */
+    double asked_ms;
+    uint64_t used; /* for keeping the most recent */
+    std::vector<std::shared_ptr<DiscWaiter>> waiters;
+    /* Reads still to copy from it: it stays until they have. One that went
+     * while a read waited on its other chunk handed that read whatever was
+     * left, which differed between PCs. */
+    int pins;
 };
 static std::mutex s_disc_mutex;
-static std::unordered_map<uint32_t, PendingRead> s_reads;
+static std::unordered_map<uint64_t, DiscChunk> s_chunks; /* by index */
+static std::unordered_map<uint32_t, uint64_t> s_chunk_ids;
 static uint32_t s_next_read_id;
+static uint64_t s_chunk_clock;
+static double NowMs(void);
+
+/* s_disc_mutex held, every chunk of the read ready. */
+static void CopyFromChunksLocked(const DiscWaiter &w)
+{
+    uint64_t at = w.offset;
+    const uint64_t end = w.offset + w.length;
+    while (at < end) {
+        const DiscChunk &chunk = s_chunks[at / DISC_CHUNK];
+        const uint64_t in = at % DISC_CHUNK;
+        const uint64_t n = std::min<uint64_t>(end - at, chunk.data.size() - in);
+        memcpy((uint8_t *)w.dst + (at - w.offset), chunk.data.data() + in, n);
+        at += n;
+    }
+}
+
+/* s_disc_mutex held: a settled read lets go of its chunks. */
+static void UnpinLocked(const DiscWaiter &w)
+{
+    const uint64_t last = (w.offset + w.length - 1) / DISC_CHUNK;
+    for (uint64_t i = w.offset / DISC_CHUNK; i <= last; i++) {
+        const auto it = s_chunks.find(i);
+        if (it != s_chunks.end() && it->second.pins > 0) {
+            it->second.pins--;
+        }
+    }
+}
+
+/* s_disc_mutex held: the least recently used chunks go, if no read still
+ * needs them. */
+static void EvictChunksLocked(void)
+{
+    while (s_chunks.size() >= DISC_KEEP) {
+        auto victim = s_chunks.end();
+        for (auto it = s_chunks.begin(); it != s_chunks.end(); ++it) {
+            if (it->second.ready && it->second.pins == 0 &&
+                (victim == s_chunks.end() ||
+                 it->second.used < victim->second.used)) {
+                victim = it;
+            }
+        }
+        if (victim == s_chunks.end()) {
+            break;
+        }
+        s_chunks.erase(victim);
+    }
+}
+
+/* s_disc_mutex held: chunk `index` is here or on its way. Returns the id of
+ * a request to send for it, or 0. */
+static uint32_t AskChunkLocked(uint64_t index)
+{
+    if (index * DISC_CHUNK >= s_disc_size) {
+        return 0;
+    }
+    const auto it = s_chunks.find(index);
+    if (it != s_chunks.end()) {
+        it->second.used = ++s_chunk_clock;
+        return 0;
+    }
+    EvictChunksLocked();
+    DiscChunk &chunk = s_chunks[index];
+    chunk.ready = false;
+    chunk.pins = 0;
+    chunk.id = ++s_next_read_id;
+    chunk.asked_ms = NowMs();
+    chunk.used = ++s_chunk_clock;
+    s_chunk_ids[chunk.id] = index;
+    return chunk.id;
+}
 
 /* Frame handoff: capture writes `back`, swaps it in as `pending`. */
 static std::mutex s_frame_mutex;
@@ -831,32 +928,84 @@ static void HandleDiscData(const std::vector<uint8_t> &data)
     }
     const uint32_t id = ReadValue<uint32_t>(data, 4);
 
-    PendingRead read;
+    std::vector<std::shared_ptr<DiscWaiter>> done, failed;
     {
         std::unique_lock<std::mutex> lock(s_disc_mutex);
-        const auto it = s_reads.find(id);
-        if (it == s_reads.end()) {
+        const auto idit = s_chunk_ids.find(id);
+        if (idit == s_chunk_ids.end()) {
             return;
         }
-        read = it->second;
-        s_reads.erase(it);
+        const uint64_t index = idit->second;
+        s_chunk_ids.erase(idit);
+        const auto it = s_chunks.find(index);
+        if (it == s_chunks.end()) {
+            return;
+        }
+        DiscChunk &chunk = it->second;
+        s_stats.disc_wait_us.fetch_add(
+            (uint64_t)((NowMs() - chunk.asked_ms) * 1000),
+            std::memory_order_relaxed);
+        const uint64_t offset = index * DISC_CHUNK;
+        const size_t expect = (size_t)std::min<uint64_t>(DISC_CHUNK,
+                                                         s_disc_size - offset);
+        if (data.size() - 8 != expect) {
+            const auto waiters = std::move(chunk.waiters);
+            s_chunks.erase(it);
+            for (auto &w : waiters) {
+                if (!w->settled) {
+                    w->settled = true;
+                    UnpinLocked(*w);
+                    failed.push_back(w);
+                }
+            }
+        } else {
+            chunk.data.assign(data.begin() + 8, data.end());
+            chunk.ready = true;
+            const auto waiters = std::move(chunk.waiters);
+            chunk.waiters.clear();
+            for (auto &w : waiters) {
+                if (!w->settled && --w->missing == 0) {
+                    CopyFromChunksLocked(*w);
+                    w->settled = true;
+                    UnpinLocked(*w);
+                    done.push_back(w);
+                }
+            }
+        }
     }
-    const bool ok = data.size() - 8 == read.length;
-    if (ok) {
-        memcpy(read.dst, data.data() + 8, read.length);
+    for (auto &w : done) {
+        w->cb(w->opaque, true);
     }
-    read.cb(read.opaque, ok);
+    for (auto &w : failed) {
+        w->cb(w->opaque, false);
+    }
 }
 
 static void FailAllDiscReads(void)
 {
-    std::unordered_map<uint32_t, PendingRead> reads;
+    std::vector<std::shared_ptr<DiscWaiter>> failed;
     {
         std::unique_lock<std::mutex> lock(s_disc_mutex);
-        reads.swap(s_reads);
+        for (auto it = s_chunks.begin(); it != s_chunks.end();) {
+            if (it->second.ready) {
+                ++it;
+                continue;
+            }
+            for (auto &w : it->second.waiters) {
+                if (!w->settled) {
+                    w->settled = true;
+                    failed.push_back(w);
+                }
+            }
+            it = s_chunks.erase(it);
+        }
+        for (auto &w : failed) {
+            UnpinLocked(*w);
+        }
+        s_chunk_ids.clear();
     }
-    for (auto &entry : reads) {
-        entry.second.cb(entry.second.opaque, false);
+    for (auto &w : failed) {
+        w->cb(w->opaque, false);
     }
 }
 
@@ -1453,6 +1602,10 @@ static void SenderThread(void)
             const uint64_t read_us = s_stats.disc_wait_us.exchange(0);
             const uint64_t lockstep_wait_us =
                 s_stats.lockstep_wait_us.exchange(0);
+            /* The game's own frame rate, and the GPU's work, solo or
+             * lockstep. */
+            const uint64_t flips = rombie_prof_take(ROMBIE_PROF_FLIPS);
+            const uint64_t pusher_ns = rombie_prof_take(ROMBIE_PROF_PUSHER_NS);
             if (rombie_engine_lockstep()) {
                 /* Where lockstep's time went this second, in ms (counts
                  * for loops), and the guest instructions run. */
@@ -1491,9 +1644,10 @@ static void SenderThread(void)
                 last_insns = insns;
                 SendText(prof);
             }
-            char stats[576];
+            char stats[640];
             snprintf(stats, sizeof(stats),
                      "{\"t\":\"stats\",\"ms\":%.0f,\"lw\":%.0f,"
+                     "\"flips\":%.1f,\"pusher\":%.0f,"
                      "\"vbl\":%.1f,\"speed\":%.1f,"
                      "\"padMsgs\":%u,"
                      "\"guestPolls\":[%u,%u,%u,%u],\"guestSeen\":%u,"
@@ -1502,6 +1656,7 @@ static void SenderThread(void)
                      "\"overflow\":%u,\"dr\":%u,\"drBytes\":%llu,"
                      "\"drMs\":%.2f,\"w\":%u,\"h\":%u}",
                      seconds * 1000.0, lockstep_wait_us / 1000.0,
+                     flips / seconds, pusher_ns / 1e6 / seconds,
                      vblanks / seconds, s_speed.load(),
                      pad_messages,
                      polls[0], polls[1], polls[2], polls[3], guest_seen,
@@ -1932,35 +2087,73 @@ uint64_t rombie_engine_disc_size(void)
     return s_disc_size;
 }
 
-void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
-                             rombie_disc_read_cb cb, void *opaque)
+static void SendChunkRequest(uint32_t id, uint64_t index)
 {
-    uint32_t id;
-    {
-        std::unique_lock<std::mutex> lock(s_disc_mutex);
-        if (!s_page_connected.load(std::memory_order_acquire)) {
-            lock.unlock();
-            cb(opaque, false);
-            return;
-        }
-        id = ++s_next_read_id;
-        s_reads.emplace(id, PendingRead{ dst, length, cb, opaque });
-    }
-
+    const uint64_t offset = index * DISC_CHUNK;
+    const uint32_t length =
+        (uint32_t)std::min<uint64_t>(DISC_CHUNK, s_disc_size - offset);
     uint8_t request[20] = { MSG_DISC_READ };
     memcpy(&request[4], &id, sizeof(id));
     memcpy(&request[8], &offset, sizeof(offset));
     memcpy(&request[16], &length, sizeof(length));
     if (!SendMessageParts(0x2, request, sizeof(request), nullptr, 0)) {
-        std::unique_lock<std::mutex> lock(s_disc_mutex);
-        if (s_reads.erase(id)) {
-            lock.unlock();
-            cb(opaque, false);
-        }
+        FailAllDiscReads(); /* the page has gone */
         return;
     }
     s_stats.disc_reads.fetch_add(1, std::memory_order_relaxed);
     s_stats.disc_bytes.fetch_add(length, std::memory_order_relaxed);
+}
+
+void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
+                             rombie_disc_read_cb cb, void *opaque)
+{
+    std::vector<std::pair<uint32_t, uint64_t>> asks;
+    bool done = false, failed = false;
+    {
+        std::unique_lock<std::mutex> lock(s_disc_mutex);
+        if (!s_page_connected.load(std::memory_order_acquire) ||
+            length == 0 || offset + length > s_disc_size) {
+            failed = length != 0;
+            done = length == 0;
+        } else {
+            auto w = std::make_shared<DiscWaiter>(
+                DiscWaiter{ dst, offset, length, cb, opaque, 0, false });
+            const uint64_t first = offset / DISC_CHUNK;
+            const uint64_t last = (offset + length - 1) / DISC_CHUNK;
+            /* Its own chunks are pinned before any chunk past it is asked
+             * for, which might evict one. */
+            for (uint64_t i = first; i <= last; i++) {
+                if (const uint32_t id = AskChunkLocked(i)) {
+                    asks.emplace_back(id, i);
+                }
+                DiscChunk &chunk = s_chunks[i];
+                chunk.pins++;
+                if (!chunk.ready) {
+                    chunk.waiters.push_back(w);
+                    w->missing++;
+                }
+            }
+            for (uint64_t i = last + 1; i <= last + DISC_AHEAD; i++) {
+                if (const uint32_t id = AskChunkLocked(i)) {
+                    asks.emplace_back(id, i);
+                }
+            }
+            if (w->missing == 0) {
+                CopyFromChunksLocked(*w);
+                w->settled = true;
+                UnpinLocked(*w);
+                done = true;
+            }
+        }
+    }
+    for (const auto &ask : asks) {
+        SendChunkRequest(ask.first, ask.second);
+    }
+    if (done) {
+        cb(opaque, true);
+    } else if (failed) {
+        cb(opaque, false);
+    }
 }
 
 /* --------------------------------------------------------------------------

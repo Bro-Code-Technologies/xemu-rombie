@@ -1531,7 +1531,9 @@ void blk_dec_in_flight(BlockBackend *blk)
 {
     IO_CODE();
     qatomic_dec(&blk->in_flight);
-    qatomic_dec(&blk_all_in_flight);
+    if (qatomic_fetch_dec(&blk_all_in_flight) == 1) {
+        rombie_lockstep_io_idle();
+    }
     aio_wait_kick();
 }
 

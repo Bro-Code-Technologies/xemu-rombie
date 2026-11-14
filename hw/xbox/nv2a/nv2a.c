@@ -249,6 +249,25 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
                        pfifo_thread, d, QEMU_THREAD_JOINABLE);
 }
 
+/* Lockstep's MMIO: work the guest left waiting (DMA_PUT) runs before it
+ * reads or writes any NV2A register but DMA_PUT itself. */
+static uint64_t nv2a_lockstep_read(void *opaque, hwaddr addr, unsigned size)
+{
+    typeof(g_nv2a->lockstep_blocks[0]) *b = opaque;
+    nv2a_lockstep_catch_up();
+    return blocktable[b->block].ops.read(b->d, addr, size);
+}
+
+static void nv2a_lockstep_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    typeof(g_nv2a->lockstep_blocks[0]) *b = opaque;
+    if (b->block != NV_USER || (addr & 0xFFFF) != NV_USER_DMA_PUT) {
+        nv2a_lockstep_catch_up();
+    }
+    blocktable[b->block].ops.write(b->d, addr, val, size);
+}
+
 /* Lockstep's RAM hash: the Xbox's memory is the GPU's (UMA). */
 uint64_t nv2a_lockstep_ram_hash(void)
 {
@@ -396,10 +415,22 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
     memory_region_init(&d->mmio, OBJECT(dev), "nv2a-mmio", 0x1000000);
     pci_register_bar(PCI_DEVICE(d), 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
 
+    const bool lockstep = rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU);
     for (int i=0; i < ARRAY_SIZE(blocktable); i++) {
         if (!blocktable[i].name) continue;
+        const MemoryRegionOps *ops = &blocktable[i].ops;
+        void *opaque = d;
+        if (lockstep) {
+            d->lockstep_ops[i] = blocktable[i].ops;
+            d->lockstep_ops[i].read = nv2a_lockstep_read;
+            d->lockstep_ops[i].write = nv2a_lockstep_write;
+            d->lockstep_blocks[i].d = d;
+            d->lockstep_blocks[i].block = i;
+            ops = &d->lockstep_ops[i];
+            opaque = &d->lockstep_blocks[i];
+        }
         memory_region_init_io(&d->block_mmio[i], OBJECT(dev),
-                              &blocktable[i].ops, d,
+                              ops, opaque,
                               blocktable[i].name, blocktable[i].size);
         memory_region_add_subregion(&d->mmio, blocktable[i].offset,
                                     &d->block_mmio[i]);

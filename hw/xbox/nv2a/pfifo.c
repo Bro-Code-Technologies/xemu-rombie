@@ -104,17 +104,20 @@ void pfifo_kick(NV2AState *d)
 }
 
 /*
- * Lockstep: after the guest writes a PFIFO, USER or PGRAPH register, the CPU
- * waits for a pusher pass that starts after the write and ends with nothing
- * more to do. Other threads' kicks (the display, surface downloads) never
- * run the pusher, so the guest sees the GPU's progress, its interrupts and
- * its writes to memory only at the guest times of its own writes.
+ * Lockstep: the CPU waits for a pusher pass that starts now and ends with
+ * nothing more to do. Other threads' kicks (the display, surface downloads)
+ * never run the pusher, so the guest sees the GPU's progress, its
+ * interrupts and its writes to memory only at these points of its own time:
+ * after its PFIFO, PGRAPH and USER writes (DMA_PUT's leave the work waiting
+ * instead, pfifo_lockstep_defer), and, while work waits, before any NV2A
+ * access, a vblank or a spin (nv2a_lockstep_catch_up).
  */
 void pfifo_lockstep_sync(NV2AState *d)
 {
     if (!d->pfifo.lockstep || !qemu_in_vcpu_thread()) {
         return;
     }
+    d->pfifo.guest_work = false;
     const uint64_t from = rombie_prof_now();
     qemu_mutex_lock(&d->pfifo.lock);
     const uint64_t kick = ++d->pfifo.guest_kicks;
@@ -132,6 +135,25 @@ void pfifo_lockstep_sync(NV2AState *d)
     }
     rombie_prof_add(ROMBIE_PROF_GPU_NS, rombie_prof_now() - from);
     rombie_prof_add(ROMBIE_PROF_GPU_SYNCS, 1);
+}
+
+/* Lockstep: a DMA_PUT write only adds work, which the GPU does at the next
+ * point the guest could see it, many kicks to a pass. */
+void pfifo_lockstep_defer(NV2AState *d)
+{
+    if (d->pfifo.lockstep) {
+        d->pfifo.guest_work = true;
+    }
+}
+
+bool nv2a_lockstep_catch_up(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->pfifo.guest_work) {
+        return false;
+    }
+    pfifo_lockstep_sync(d);
+    return true;
 }
 
 static bool can_fifo_access(NV2AState *d) {
@@ -511,6 +533,7 @@ void *pfifo_thread(void *arg)
         }
 
         const uint64_t reports_from = rombie_prof_now();
+        rombie_prof_add(ROMBIE_PROF_PUSHER_NS, reports_from - pusher_from);
         pgraph_process_pending_reports(d);
         if (d->pfifo.lockstep && d->pfifo.guest_done < guest_kicks) {
             const uint64_t now = rombie_prof_now();

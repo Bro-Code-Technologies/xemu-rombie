@@ -789,6 +789,8 @@ static void lockstep_vblank_callback(void *opaque)
     struct xemu_console *scon = (struct xemu_console *)opaque;
     const uint64_t from = rombie_prof_now();
 
+    /* The GPU's waiting work is done by every vblank, and hashed. */
+    rombie_lockstep_catch_up();
     if (!rombie_engine_lockstep_vblank()) {
         aio_bh_schedule_oneshot(qemu_get_aio_context(),
                                 lockstep_vblank_rearm, NULL);

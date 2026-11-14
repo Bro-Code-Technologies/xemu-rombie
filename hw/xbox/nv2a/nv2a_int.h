@@ -103,14 +103,23 @@ typedef struct NV2AState {
         QemuCond fifo_idle_cond;
         bool fifo_kick;
         bool halt;
-        /* Rombie's lockstep (ROMBIE_SYNC_GPU): the pusher runs only for
-         * the guest's register writes, each of which waits for the pass it
-         * asked for (pfifo_lockstep_sync), so the GPU's work lands at the
-         * guest time of the write. */
+        /* Rombie's lockstep (ROMBIE_SYNC_GPU): the pusher runs only while
+         * the CPU waits for it (pfifo_lockstep_sync): after a PFIFO, PGRAPH
+         * or USER write, and before any NV2A access, a vblank or a spin
+         * once a DMA_PUT write has left work waiting (guest_work), so the
+         * GPU's work lands at points of guest time. */
         bool lockstep;
+        bool guest_work;
         uint64_t guest_kicks;
         uint64_t guest_done;
     } pfifo;
+
+    /* Lockstep's MMIO: every block's accesses run the GPU first. */
+    struct {
+        struct NV2AState *d;
+        int block;
+    } lockstep_blocks[NV_NUM_BLOCKS];
+    MemoryRegionOps lockstep_ops[NV_NUM_BLOCKS];
 
     struct {
         uint32_t regs[0x1000];

@@ -680,7 +680,7 @@ static void ide_rw_error(IDEState *s) {
     ide_bus_set_irq(s->bus);
 }
 
-static void ide_buffered_readv_cb(void *opaque, int ret)
+static void ide_buffered_readv_finish(void *opaque, int ret)
 {
     IDEBufferedRequest *req = opaque;
     if (!req->orphaned) {
@@ -695,6 +695,18 @@ static void ide_buffered_readv_cb(void *opaque, int ret)
     QLIST_REMOVE(req, list);
     qemu_vfree(qemu_iovec_buf(&req->qiov));
     g_free(req);
+}
+
+static void ide_buffered_readv_cb(void *opaque, int ret)
+{
+    IDEBufferedRequest *req = opaque;
+    if (req->rombie_read) {
+        /* Lockstep: the data waits in our buffer until its deadline. */
+        rombie_lockstep_disc_arrived(req->rombie_read,
+                                     ide_buffered_readv_finish, req, ret);
+        return;
+    }
+    ide_buffered_readv_finish(req, ret);
 }
 
 #define MAX_BUFFERED_REQS 16
@@ -720,6 +732,10 @@ BlockAIOCB *ide_buffered_readv(IDEState *s, int64_t sector_num,
     req->original_opaque = opaque;
     qemu_iovec_init_buf(&req->qiov, blk_blockalign(s->blk, iov->size),
                         iov->size);
+    if (s->drive_kind == IDE_CD) {
+        req->rombie_read = rombie_lockstep_disc_read(
+            sector_num << BDRV_SECTOR_BITS, iov->size);
+    }
 
     aioreq = blk_aio_preadv(s->blk, sector_num << BDRV_SECTOR_BITS,
                             &req->qiov, 0, ide_buffered_readv_cb, req);

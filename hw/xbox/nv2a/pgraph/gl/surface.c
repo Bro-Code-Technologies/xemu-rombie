@@ -426,6 +426,8 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
                                     hwaddr len, bool write)
 {
     NV2AState *d = (NV2AState *)opaque;
+    /* Lockstep: the draws the guest left waiting come before its access. */
+    nv2a_lockstep_catch_up();
     qemu_mutex_lock(&d->pgraph.lock);
 
     PGRAPHGLState *r = d->pgraph.gl_renderer_state;

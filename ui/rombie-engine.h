@@ -110,13 +110,23 @@ const char *rombie_engine_rtc_option(void);
  * the vblank again at the same guest time. */
 bool rombie_engine_lockstep_vblank(void);
 
-/* block/block-backend.c: every BlockBackend's requests in flight. */
+/* block/block-backend.c: every BlockBackend's requests in flight; it calls
+ * rombie_lockstep_io_idle when the last one completes. */
 unsigned int blk_lockstep_in_flight(void);
+void rombie_lockstep_io_idle(void);
 
 /* hw/xbox/rombie-lockstep.c */
 /* The CPU thread waits here, after an IDE register access, until the I/O it
- * started has completed, so it completes at the guest time it started. */
+ * started has completed, so it completes at the guest time it started. The
+ * disc's reads are the exception: */
 void rombie_lockstep_io_settle(void);
+/* A disc read joins a queue (NULL when not in lockstep): its data reaches
+ * the guest at a deadline of guest time, the guest running meanwhile as on
+ * a real drive, and the CPU waits there only if the page hasn't sent it. */
+void *rombie_lockstep_disc_read(uint64_t offset, uint64_t bytes);
+/* The read's data is in (any thread); `finish` runs at its deadline. */
+void rombie_lockstep_disc_arrived(void *read, void (*finish)(void *, int),
+                                  void *opaque, int ret);
 /* The state's hashes, in the order 0x86 sends them. */
 #define ROMBIE_HASH_PARTS 6
 void rombie_lockstep_hash(uint64_t out[ROMBIE_HASH_PARTS]);
@@ -149,6 +159,8 @@ typedef enum {
     ROMBIE_PROF_GPU_WORK_NS, /* the PFIFO thread's passes the CPU waited for */
     ROMBIE_PROF_GPU_PENDING_NS, /* ... in their pending work (display, ...) */
     ROMBIE_PROF_GPU_REPORTS_NS, /* ... in their reports */
+    ROMBIE_PROF_FLIPS,       /* the game's frames (flip stalls), any mode */
+    ROMBIE_PROF_PUSHER_NS,   /* the PFIFO thread's pusher, any mode */
     ROMBIE_PROF_COUNT
 } RombieProf;
 void rombie_prof_add(RombieProf what, uint64_t amount);
@@ -161,6 +173,9 @@ void rombie_prof_sample_pc(void *cpu);
  * them the same. */
 void rombie_spin_capture(void *cpu, int slot);
 bool rombie_spin_same(void);
+/* Lockstep: the GPU does the work the guest left waiting, with the CPU
+ * waiting for it. False if there was none. */
+bool rombie_lockstep_catch_up(void);
 uint64_t rombie_prof_take(RombieProf what);
 uint64_t rombie_prof_now(void);
 uint64_t rombie_prof_insns(void);

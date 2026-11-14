@@ -253,13 +253,29 @@ the top of `ui/xui/rombie-engine.cc`; the parts:
 - **APU frames on the CPU thread** (`hw/xbox/mcpx/apu/apu.c`), one every
   2/3 ms of guest time, with the frame thread idle; four voice workers on
   every PC, their mixes added in worker order (`vp.c`).
-- **The GPU's work at the guest time of the write that asked for it**
-  (`hw/xbox/nv2a/pfifo.c`): after every PFIFO, USER or PGRAPH register
-  write the CPU waits for a pusher pass started after it, and only those
-  passes run the pusher (the display's syncs don't).
-- **I/O completes at the guest time it started** (`hw/xbox/rombie-lockstep.c`,
-  `hw/ide/core.c`, `hw/ide/pci.c`, `block/block-backend.c`): after an IDE
-  register access the CPU waits until no request is in flight.
+- **The GPU runs only while the CPU waits for it** (`hw/xbox/nv2a/pfifo.c`,
+  `nv2a.c`, `user.c`): after a PFIFO, PGRAPH or USER write; a DMA_PUT
+  write only leaves work waiting, which runs before the next NV2A access
+  (every block's MMIO goes through `nv2a_lockstep_read`/`write`), vblank,
+  spin or surface access. Only those passes run the pusher (the display's
+  syncs don't).
+- **The hard disk's I/O completes at the guest time it started**
+  (`hw/xbox/rombie-lockstep.c`, `hw/ide/core.c`, `hw/ide/pci.c`,
+  `block/block-backend.c`): after an IDE register access the CPU waits,
+  on a semaphore the block layer posts, until no request but the disc's is
+  in flight. (A g_usleep poll slept a whole Windows tick, up to 15.6 ms.)
+- **The disc's reads complete at a deadline** of guest time instead,
+  50 ms for a seek or 2 ms for a read that follows the last, plus the
+  transfer at 16 MB/s, in the order they were asked for. The guest runs on
+  meanwhile; IDE's completion, the only thing that puts the data where the
+  guest sees it, runs on the CPU thread at the deadline, which waits only
+  if the page hasn't answered. The page took 33-60 ms a read, and a CPU
+  that stood still for each ran loading at a third of real time.
+- **The engine reads the disc ahead** (`ui/xui/rombie-engine.cc`, any
+  mode): the page is asked for whole 1 MB chunks, every read also asks for
+  the two after it, and 24 stay. A read pins its chunks until it has
+  copied them: an evicted one handed a read waiting on its other chunk
+  whatever was left, and the engines diverged.
 - **The AC97 drains in guest time**: lockstep's default audio backend is
   `none` (`audio/audio.c`); the page hears the APU as before.
 - **Spins skipped** (`accel/tcg/tcg-accel-ops-rr.c`): under icount every
@@ -270,7 +286,11 @@ the top of `ui/xui/rombie-engine.cc`; the parts:
   timer interval now opens with two 840-instruction probes; when both leave
   the registers identical, guest time jumps to the next timer. Halts warp on
   the CPU thread too (`icount_warp_in_vcpu`), saving the main loop's two
-  wake-ups.
+  wake-ups. Two host-time leaks made engines skip differently (only the
+  instruction counts differed, from vblank 3840): icount's budget also
+  stopped at real-time timers (not in lockstep now, `icount_get_limit`),
+  and a kick in an interval that had found no spin let it probe again (it
+  now runs to the interval's end).
 - **Hashes** (0x86): RAM, CPU, NV2A registers, APU registers and DSP
   memories, each drive's I/O counts, and guest time. The stats carry a
   `prof` line in lockstep (where the CPU thread's time went);
@@ -284,7 +304,14 @@ Measured on Burnout 2, two engines on the 5950X, flat out, the first
 - TCG under icount runs about 230 million guest instructions a second.
   Before the spin skip the guest needed 1,000 million a second at shift 0
   (500 million at shift 1), so it ran at about 10 vblanks a second.
-- With the spin skip, shift 1: 3,600 vblanks in 76 s. Light stretches run
-  at 110-130 vblanks a second; others at about 25, where the CPU waits
-  ~450 ms a second for the GPU thread's own method processing, which normal
-  xemu runs alongside the CPU. Overlapping it deterministically is next.
+- With the spin skip, shift 1, flat out: Burnout 2 runs at 100-111 vblanks
+  a second once it is past the dashboard's boot animation. The animation
+  is the heaviest GPU work (12 ms a frame solo, where it runs at 56 frames
+  a second; 18 ms in lockstep, about 25 a second); netplay joins a running
+  game and never plays it.
+- Real time, shift 1, hashing every 60, measured from vblank 600: 7,200
+  vblanks at 98.3% and 99.1% of those due, the lowest 30 s 93% and 96%,
+  9-11 s short of sound, all in loading; the same run with the disc in
+  Windows' file cache reached 100% and 98%. Solo (no lockstep), the same
+  stretch plays at 60 frames a second.
+- Flat out, hashing every vblank: 7,200 vblanks match (seed 2).

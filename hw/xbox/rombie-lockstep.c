@@ -208,6 +208,11 @@ void rombie_spin_capture(void *opaque, int slot)
     s->mxcsr = env->mxcsr;
 }
 
+bool rombie_lockstep_catch_up(void)
+{
+    return nv2a_lockstep_catch_up();
+}
+
 bool rombie_spin_same(void)
 {
     return memcmp(&spin_states[0], &spin_states[1], sizeof(SpinState)) == 0;
@@ -322,6 +327,160 @@ void rombie_lockstep_relock(void)
     }
 }
 
+/* Posted when the block layer's last request completes, or a disc read's
+ * data arrives. A wait that polled with g_usleep slept a whole Windows
+ * timer tick (up to 15.6 ms) each time. */
+static QemuSemaphore io_idle;
+
+/*
+ * The disc's reads. The page answers each in tens of milliseconds, and a
+ * CPU that stood still for every one ran loading at a third of real time.
+ * So each read gets a deadline of guest time, as a drive's seek and
+ * transfer would take; the guest runs on meanwhile, and IDE's completion,
+ * the only thing that puts the data where the guest can see it, runs at
+ * the deadline (disc_deliver), in the order the reads were asked for.
+ */
+#define DISC_SEEK_NS 50000000LL /* a read that doesn't follow the last */
+#define DISC_NEXT_NS 2000000LL  /* one that does */
+#define DISC_BYTES_PER_S (16 * 1024 * 1024)
+
+typedef struct DiscRead {
+    QSIMPLEQ_ENTRY(DiscRead) next;
+    int64_t deadline;
+    bool arrived;
+    void (*finish)(void *, int);
+    void *opaque;
+    int ret;
+} DiscRead;
+
+static QemuMutex disc_lock;
+static QSIMPLEQ_HEAD(, DiscRead) disc_reads =
+    QSIMPLEQ_HEAD_INITIALIZER(disc_reads);
+static unsigned int disc_in_flight; /* asked for, not arrived */
+static QEMUTimer *disc_timer;
+static uint64_t disc_next_offset;
+
+static void __attribute__((constructor)) io_idle_init(void)
+{
+    qemu_sem_init(&io_idle, 0);
+    qemu_mutex_init(&disc_lock);
+}
+
+static void disc_rearm(void *opaque)
+{
+    qemu_mutex_lock(&disc_lock);
+    DiscRead *head = QSIMPLEQ_FIRST(&disc_reads);
+    const int64_t deadline = head ? head->deadline : -1;
+    qemu_mutex_unlock(&disc_lock);
+    if (deadline >= 0) {
+        timer_mod_ns(disc_timer, deadline);
+    }
+}
+
+/* On the CPU thread at the first read's deadline. */
+static void disc_deliver(void *opaque)
+{
+    const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    for (;;) {
+        qemu_mutex_lock(&disc_lock);
+        DiscRead *r = QSIMPLEQ_FIRST(&disc_reads);
+        if (!r || r->deadline > now) {
+            qemu_mutex_unlock(&disc_lock);
+            break;
+        }
+        if (!r->arrived) {
+            qemu_mutex_unlock(&disc_lock);
+            /* The page is late: guest time waits for it. */
+            const uint64_t from = get_clock();
+            bool arrived = false;
+            rombie_lockstep_unlock();
+            while (!rombie_lockstep_stopping()) {
+                qemu_mutex_lock(&disc_lock);
+                arrived = r->arrived;
+                qemu_mutex_unlock(&disc_lock);
+                if (arrived) {
+                    break;
+                }
+                qemu_sem_timedwait(&io_idle, 10);
+            }
+            rombie_lockstep_relock();
+            rombie_prof_add(ROMBIE_PROF_IO_NS, get_clock() - from);
+            if (!arrived) {
+                /* Stopping: deliver at the same guest time once it goes
+                 * on, armed after the timer list is done. */
+                aio_bh_schedule_oneshot(qemu_get_aio_context(), disc_rearm,
+                                        NULL);
+                return;
+            }
+            continue;
+        }
+        QSIMPLEQ_REMOVE_HEAD(&disc_reads, next);
+        qemu_mutex_unlock(&disc_lock);
+        r->finish(r->opaque, r->ret);
+        g_free(r);
+    }
+    disc_rearm(NULL);
+}
+
+void *rombie_lockstep_disc_read(uint64_t offset, uint64_t bytes)
+{
+    if (!rombie_engine_lockstep_sync(ROMBIE_SYNC_IO)) {
+        return NULL;
+    }
+    if (!disc_timer) {
+        disc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, disc_deliver, NULL);
+    }
+    DiscRead *r = g_new0(DiscRead, 1);
+    r->deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (offset == disc_next_offset ? DISC_NEXT_NS : DISC_SEEK_NS) +
+                  (int64_t)(bytes * 1000000000ULL / DISC_BYTES_PER_S);
+    disc_next_offset = offset + bytes;
+
+    qemu_mutex_lock(&disc_lock);
+    DiscRead *last = QSIMPLEQ_LAST(&disc_reads, DiscRead, next);
+    if (last && last->deadline > r->deadline) {
+        r->deadline = last->deadline; /* the drive serves them in order */
+    }
+    QSIMPLEQ_INSERT_TAIL(&disc_reads, r, next);
+    qatomic_inc(&disc_in_flight);
+    const bool first = QSIMPLEQ_FIRST(&disc_reads) == r;
+    qemu_mutex_unlock(&disc_lock);
+    if (first) {
+        timer_mod_ns(disc_timer, r->deadline);
+    }
+    return r;
+}
+
+void rombie_lockstep_disc_arrived(void *read, void (*finish)(void *, int),
+                                  void *opaque, int ret)
+{
+    DiscRead *r = read;
+    qemu_mutex_lock(&disc_lock);
+    r->finish = finish;
+    r->opaque = opaque;
+    r->ret = ret;
+    r->arrived = true;
+    qatomic_dec(&disc_in_flight);
+    qemu_mutex_unlock(&disc_lock);
+    qemu_sem_post(&io_idle);
+}
+
+/* What the CPU waits for after an IDE access: the block layer's requests
+ * but the disc reads still out. */
+static unsigned int io_waiting(void)
+{
+    const unsigned int all = blk_lockstep_in_flight();
+    const unsigned int disc = qatomic_read(&disc_in_flight);
+    return all > disc ? all - disc : 0;
+}
+
+void rombie_lockstep_io_idle(void)
+{
+    if (rombie_engine_lockstep_sync(ROMBIE_SYNC_IO)) {
+        qemu_sem_post(&io_idle);
+    }
+}
+
 /*
  * With the CPU waiting here, guest time stands still, so the I/O completes
  * (its data in memory, its interrupt raised) at the guest time it started,
@@ -331,13 +490,13 @@ void rombie_lockstep_relock(void)
 void rombie_lockstep_io_settle(void)
 {
     if (!rombie_engine_lockstep_sync(ROMBIE_SYNC_IO) ||
-        !qemu_in_vcpu_thread() || !blk_lockstep_in_flight()) {
+        !qemu_in_vcpu_thread() || !io_waiting()) {
         return;
     }
     const uint64_t from = get_clock();
     rombie_lockstep_unlock();
-    while (blk_lockstep_in_flight() && !rombie_lockstep_stopping()) {
-        g_usleep(20);
+    while (io_waiting() && !rombie_lockstep_stopping()) {
+        qemu_sem_timedwait(&io_idle, 10);
     }
     rombie_lockstep_relock();
     rombie_prof_add(ROMBIE_PROF_IO_NS, get_clock() - from);
