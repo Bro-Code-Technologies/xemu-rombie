@@ -45,6 +45,12 @@
  *                  on from the vblank named;
  *                  3 end, in lockstep: the vblanks wait for no input and the
  *                  guest reads 0x03's pads, at the guest speed reached
+ *                  Development: with ROMBIE_HANDOFF_DIR set, the host writes
+ *                  the handoff there (host-gamedata.bin, guests-gamedata.bin,
+ *                  state.bin) and sends 0x88 empty, and a join with no state
+ *                  reads the state and the game data from there ([2]: 1 the
+ *                  guests', 2 the host's own), so a test page's DevTools
+ *                  connection never carries them (Halo 2's disk: 700 MB)
  *   0x0F speed at  [u8 type][3 pad][u32 vblank][u32 guest speed, as 0x0B's]
  *                  (lockstep: from that vblank on; every engine needs the
  *                  same before it gets there, so the page slows or speeds
@@ -1413,14 +1419,39 @@ static void HandleNetplay(const std::vector<uint8_t> &data)
     const uint32_t every = ReadValue<uint32_t>(data, 8);
 
     if (op == NETPLAY_JOIN) {
+        std::vector<uint8_t> state(data.begin() + 12, data.end());
+        std::vector<uint8_t> files_game_data;
+        const char *dir = getenv("ROMBIE_HANDOFF_DIR");
+        if (state.empty() && dir && *dir) {
+            const std::string base = std::string(dir) + "\\";
+            gchar *bytes = nullptr;
+            gsize size = 0;
+            if (g_file_get_contents((base + "state.bin").c_str(), &bytes, &size,
+                                    nullptr)) {
+                state.assign(bytes, bytes + size);
+                g_free(bytes);
+            }
+            const char *name =
+                data[2] == 2 ? "host-gamedata.bin" : "guests-gamedata.bin";
+            if (g_file_get_contents((base + name).c_str(), &bytes, &size,
+                                    nullptr)) {
+                files_game_data.assign(bytes, bytes + size);
+                g_free(bytes);
+            }
+        }
         std::unique_lock<std::mutex> lock(s_boot_mutex);
-        if (s_boot_ready || !s_lockstep_flags || data.size() <= 12) {
+        if (s_boot_ready || !s_lockstep_flags || state.empty()) {
             lock.unlock();
             SendEvent("error", "Netplay's join needs lockstep, a state, and "
                                "no boot yet.");
             return;
         }
-        s_join_state.assign(data.begin() + 12, data.end());
+        if (!files_game_data.empty()) {
+            s_game_data = std::move(files_game_data);
+            GameDataView view;
+            s_game_data_ok = ParseGameData(s_game_data, &view);
+        }
+        s_join_state = std::move(state);
         s_join_vblank = vblank;
         if (every) {
             s_hash_every = every;
@@ -1467,6 +1498,39 @@ static void HandleNetplay(const std::vector<uint8_t> &data)
                 "rombie-engine: netplay host at vblank %u: state %zu bytes, "
                 "game data %zu bytes, in %.0f ms\n",
                 vblank, state_size, game_data_size, NowMs() - from);
+        const char *dir = getenv("ROMBIE_HANDOFF_DIR");
+        if (dir && *dir) {
+            const std::string base = std::string(dir) + "\\";
+            uint8_t *own = nullptr;
+            size_t own_size = 0;
+            char *own_error = nullptr;
+            const bool ok =
+                rombie_media_read_blob(&own, &own_size, &own_error) &&
+                g_file_set_contents((base + "host-gamedata.bin").c_str(),
+                                    (const gchar *)own, (gssize)own_size,
+                                    nullptr) &&
+                g_file_set_contents((base + "guests-gamedata.bin").c_str(),
+                                    (const gchar *)game_data,
+                                    (gssize)game_data_size, nullptr) &&
+                g_file_set_contents((base + "state.bin").c_str(),
+                                    (const gchar *)state, (gssize)state_size,
+                                    nullptr);
+            g_free(own);
+            g_free(own_error);
+            if (!ok) {
+                SendEvent("netplay-failed", "Writing the handoff's files failed.");
+            } else {
+                fprintf(stderr, "rombie-engine: netplay's files in %s: the "
+                                "host's game data %zu bytes\n",
+                        dir, own_size);
+                uint8_t header[16] = { MSG_NETPLAY_STATE };
+                memcpy(header + 4, &vblank, 4);
+                SendMessageParts(0x2, header, sizeof(header), nullptr, 0);
+            }
+            g_free(state);
+            g_free(game_data);
+            return;
+        }
         /* The host boots again with its own game data, save states and all;
          * the guests with the copy. */
         SendGameDataNow();

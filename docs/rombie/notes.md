@@ -387,3 +387,98 @@ busy 660 ms a second); Vulkan cuts it to about 550, but two Vulkan engines
 differ in RAM alone at 24 of 9,000 vblanks (transient, every other part
 equal), from something that still writes guest RAM on host time; lockstep
 stays on GL until that's found.
+
+Since then (to `091df25a9c`):
+
+- **The pusher's own writes to memory wait for the CPU** (`nv2a_lockstep_park_ram`,
+  `gl/surface.c` `download_if_dirty`, both `blit.c`): a download or blit the
+  pusher makes, ahead, could interleave with the CPU's writes once a surface
+  was gone (Halo 2's RAM differed at 1,016 of 42,200 vblanks); it parks until
+  the CPU waits, as an interrupt does. About 4% of Halo 2's speed.
+- **Lockstep boots with the short startup animation** (`skip_boot_anim`;
+  `ROMBIE_LOCKSTEP_FULL_ANIMATION=1` keeps the full one): every PC boots at a
+  handoff, and the full one's render targets, left in memory, differ between
+  GPU makers.
+- **0x10** dumps RAM's page hashes and the GPU's surfaces at a vblank, and
+  `ROMBIE_LOCKSTEP_TRACE_REPORTS=1` logs every occlusion count the guest gets,
+  to compare two PCs.
+
+Two PCs: the GTX 1060 replays the main PC's TimeSplitters 2 run at all 41,000
+vblanks, every part; Halo 2 everything but RAM, which differs at 1,016
+vblanks in a render target the two GPU generations draw differently and the
+game doesn't read. The Intel UHD 630 diverges: 11 of 1,625 occlusion counts
+differ (the first 36 pixels on NVIDIA, 40 on Intel), then the CPU. Rombie's
+call (2026-11-14): integrated graphics are below Xbox netplay's minimum.
+
+## Netplay's handoff (Rombie BRAIN-38, Phase 3)
+
+A running engine can't go into lockstep (icount is fixed when QEMU starts),
+so every PC, the host included, boots again at a handoff and loads one state
+into a machine that has never run.
+
+- **0x0D host** (`HandleNetplay`, `rombie_media_handoff`): the machine stops
+  where it is (`vm_stop(RUN_STATE_SAVE_VM)`, as `save_snapshot` does: the
+  GPU's surfaces go into memory, the APU's frame lands) and the engine
+  writes the machine's state as a stream to a file (`rombie_savevm_file`,
+  `migration/savevm.c`) and the disk as the guest sees it into a fresh qcow2
+  (`copy_disk`: only clusters that hold data, zeros left out, none of the
+  player's save states). It sends its own game data (0x85, save states and
+  all, which the host boots again with) and then 0x88: the guests' game data
+  and the state, which is u64 guest time (ns) and the stream. It stays
+  stopped; the page restarts it.
+- **No BIOS in the state**: `xbox.bios` (the flash) and `xbox.mcpx` (the
+  flash with the MCPX ROM over its end) are marked not migratable around the
+  save, so the stream leaves them out, and around the load, so a stream
+  holding them is refused. Each PC's come from its own files at boot.
+- **0x04 op 4, restart** (`RestartSelf`): the engine closes the page's
+  connection with a reset (a close from its end would leave the port in
+  TIME_WAIT, which the exclusive bind refuses for minutes), closes its
+  listener, and starts itself again with the same arguments plus
+  `--restarted`, inheriting only stdout and stderr (an inherited socket
+  would keep the port). The new process retries the port for 30 s.
+- **0x0D join**, after 0x0B and 0x08 and before boot: the engine keeps the
+  state, and once the machine is created and before it first runs
+  (`rombie_engine_before_start`, called from `qmp_x_exit_preconfig` in
+  `system/vl.c`) it plugs in the four pads (the host's machine had them;
+  their hubs are in the state), loads the stream (`rombie_loadvm_file`, as
+  `load_snapshot` does), and sets lockstep's vblank and input count to the
+  vblank named.
+- **Guest time goes on from the state's** (`system/cpu-timers.c`): the
+  timers' section loads first, and its `post_load` sets icount's bias so the
+  clock reads the handoff's guest time, whatever the source counted (no
+  icount on a solo host, another guest speed on a resync), so every timer
+  the devices restore comes due when it would have. The guest's TSC follows
+  the clock (`hw/i386/x86-cpu.c`). Lockstep's vblanks and APU frames count
+  from there (`xemu_lockstep_vblank_rebase`, `mcpx_apu_lockstep_rebase`), and
+  0x0B's guest speed applies at once. The RTC starts again from 0x0B's date
+  plus guest time (`rombie_rtc_restart_clock`): a solo host's RTC runs on
+  the host's clock, which lockstep doesn't use.
+- **Stops in lockstep.** The vblank waits for input inside a
+  QEMU_CLOCK_VIRTUAL timer's callback with the BQL let go, and a stop holds
+  the BQL while it disables that clock, which waits for the callbacks in
+  flight: every pause, save or exit there deadlocked. While the vblank waits,
+  the timer list now says it has none (`rombie_timers_waiting`,
+  `util/qemu-timer.c`), and the vblank sees the stop by the run state
+  (`rombie_lockstep_stopping`), which a stop sets first.
+- **What only the host does.** In lockstep a save, a load, the host's
+  handoff and exit run on the UI thread while the CPU holds at a vblank
+  (`QueueAtVblank`), where the GPU has done all it was given: stopped
+  anywhere else its thread may be parked on an interrupt for a CPU that no
+  longer runs. A slot save there leaves the GPU's surfaces out of memory
+  (`nv2a_save_keeps_surfaces`): copying them in showed the host's game what
+  the guests' didn't (RAM differed until the next resync). Such a state
+  holds memory as the game left it; a surface the game doesn't draw again
+  after a load shows its old pixels. A state saved in lockstep carries its
+  guest time in `cpu_clock_offset`, where an engine running alone reads it.
+- **0x0D end**: the vblanks stop waiting for input and the guest reads the
+  page's own pads again, at the guest speed reached.
+- **Development**: with `ROMBIE_HANDOFF_DIR` set the host writes the
+  handoff there and sends 0x88 empty, and a join with no state reads it from
+  there, so the test page's DevTools connection never carries Halo 2's disk.
+
+Figures (TimeSplitters 2, main PC): the state is 61-62 MB (8.1-8.5 MB
+gzipped), the guests' game data 3.1 MB (0.9 MB), the host's stop and copy
+0.3 s, a restart 0.9 s, a join 1.3-2.0 s. `lockstep-test.html`'s
+`xboxLockstep.handoff` (`lockstep-run.py --handoff`) checks it: A plays alone
+or in lockstep, hosts and restarts, B joins fresh, A saves a state on the
+way and then hosts again (a resync), hashes compared every vblank.
