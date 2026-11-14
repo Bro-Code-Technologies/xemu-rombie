@@ -333,6 +333,28 @@ static void nv2a_lockstep_write(void *opaque, hwaddr addr, uint64_t val,
     blocktable[b->block].ops.write(b->d, addr, val, size);
 }
 
+/* Development: every 4 KB page's hash and the GPU's surfaces, to find what
+ * differs when two engines' RAM hashes do. */
+void nv2a_lockstep_dump(uint32_t vblank)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        return;
+    }
+    const size_t size = memory_region_size(d->vram);
+    fprintf(stderr, "rombie-lockstep: dump at vblank %u\n", vblank);
+    for (size_t page = 0; page < size / 4096; page++) {
+        fprintf(stderr, "rombie-lockstep: page %05zx %016" PRIx64 "\n", page,
+                rombie_hash64(d->vram_ptr + page * 4096, 4096, 0));
+    }
+    if (d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_OPENGL) {
+        qemu_mutex_lock(&d->pgraph.lock);
+        pgraph_gl_lockstep_dump_surfaces(d);
+        qemu_mutex_unlock(&d->pgraph.lock);
+    }
+    fprintf(stderr, "rombie-lockstep: dump done\n");
+}
+
 /* Lockstep's RAM hash: the Xbox's memory is the GPU's (UMA). */
 uint64_t nv2a_lockstep_ram_hash(void)
 {

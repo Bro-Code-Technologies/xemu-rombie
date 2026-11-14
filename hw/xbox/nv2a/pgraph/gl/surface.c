@@ -627,10 +627,29 @@ static bool check_surface_compatibility(SurfaceBinding *s1, SurfaceBinding *s2,
     }
 }
 
+/* Development (lockstep's dump): the surfaces as they stand. */
+void pgraph_gl_lockstep_dump_surfaces(NV2AState *d)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    SurfaceBinding *s;
+    QTAILQ_FOREACH(s, &r->surfaces, entry) {
+        fprintf(stderr,
+                "rombie-lockstep: surface %08" HWADDR_PRIx " size %zu %ux%u "
+                "pitch %u color %d swizzle %d frame %d draw %d dirty %d "
+                "download %d upload %d cleared %d\n",
+                s->vram_addr, s->size, s->width, s->height, s->pitch,
+                s->color, s->swizzle, s->frame_time, s->draw_time,
+                s->draw_dirty, s->download_pending, s->upload_pending,
+                s->cleared);
+    }
+}
+
 void pgraph_gl_surface_download_if_dirty(NV2AState *d,
                                            SurfaceBinding *surface)
 {
     if (surface->draw_dirty) {
+        /* Lockstep ahead: guest memory changes only while the CPU waits. */
+        nv2a_lockstep_park_ram(d);
         surface_download(d, surface, true);
     }
 }

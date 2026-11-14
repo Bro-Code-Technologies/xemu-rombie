@@ -963,6 +963,8 @@ static bool check_surface_compatibility(SurfaceBinding const *s1,
 void pgraph_vk_surface_download_if_dirty(NV2AState *d, SurfaceBinding *surface)
 {
     if (surface->draw_dirty) {
+        /* Lockstep ahead: guest memory changes only while the CPU waits. */
+        nv2a_lockstep_park_ram(d);
         download_surface(d, surface, true);
     }
 }

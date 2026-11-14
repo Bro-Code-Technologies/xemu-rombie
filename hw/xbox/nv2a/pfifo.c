@@ -227,6 +227,19 @@ void nv2a_lockstep_gpu_write(NV2AState *d, void *dest, const void *data,
     qemu_mutex_unlock(&d->pfifo.effects_lock);
 }
 
+/* Lockstep ahead: the pusher's own writes to guest memory (a surface's
+ * download, a blit) wait until the CPU waits too, as interrupts do: written
+ * while it runs, they interleave with its writes to the same memory, which
+ * no longer trap once the surface is gone. A download the CPU asked for
+ * (pgraph_process_pending) comes while it waits already, outside the
+ * pusher. */
+void nv2a_lockstep_park_ram(NV2AState *d)
+{
+    if (d->pfifo.ahead && d->pfifo.in_pusher) {
+        nv2a_lockstep_park(d);
+    }
+}
+
 /* Lockstep ahead: the GPU thread waits here before raising an interrupt
  * until the CPU waits for it, so the guest takes it at a point of its own
  * time. The CPU's wait lasts until the pass this is in ends. */
@@ -629,7 +642,9 @@ void *pfifo_thread(void *arg)
 
         if (!d->pfifo.halt &&
             (!d->pfifo.lockstep || d->pfifo.guest_done < guest_kicks)) {
+            d->pfifo.in_pusher = true;
             pfifo_run_pusher(d);
+            d->pfifo.in_pusher = false;
         }
 
         const uint64_t reports_from = rombie_prof_now();

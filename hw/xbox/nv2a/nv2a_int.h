@@ -119,6 +119,7 @@ typedef struct NV2AState {
          * (nv2a_lockstep_park). Its other writes land in surfaces' memory,
          * whose every CPU access waits for the GPU first. */
         bool ahead;
+        bool in_pusher; /* the GPU thread's, in pfifo_run_pusher */
         bool cpu_waiting;
         QemuMutex effects_lock;
         QemuCond effects_cond;

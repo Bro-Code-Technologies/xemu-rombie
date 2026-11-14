@@ -127,7 +127,12 @@ extern "C" {
 #include "system/cpu-timers.h"
 extern uint64_t vblank_interval_ns; /* ui/xemu.c */
 void rombie_icount_set_scale(int64_t q16); /* accel/tcg/icount-common.c */
+void nv2a_lockstep_dump(uint32_t vblank);  /* hw/xbox/nv2a/nv2a.c */
 }
+
+/* Development (0x10): the vblank at which to dump RAM's page hashes and the
+ * GPU's surfaces into the log, to find what differs between two engines. */
+static std::atomic<uint32_t> s_dump_at{UINT32_MAX};
 
 #include "../rombie-engine-media.h"
 #include "../rombie-engine-version.h"
@@ -149,6 +154,7 @@ static constexpr uint8_t MSG_DELETE_STATE = 0x0E;
 static constexpr uint8_t MSG_LOCKSTEP = 0x0B;
 static constexpr uint8_t MSG_INPUTS = 0x0C;
 static constexpr uint8_t MSG_SPEED_AT = 0x0F;
+static constexpr uint8_t MSG_DUMP_AT = 0x10; /* development */
 static constexpr uint8_t MSG_DISC_READ = 0x81;
 static constexpr uint8_t MSG_FRAME = 0x82;
 static constexpr uint8_t MSG_AUDIO = 0x83;
@@ -1404,6 +1410,11 @@ static void HandleBinary(const std::vector<uint8_t> &message)
     case MSG_SPEED_AT:
         HandleSpeedAt(message);
         break;
+    case MSG_DUMP_AT:
+        if (message.size() >= 8) {
+            s_dump_at.store(ReadValue<uint32_t>(message, 4));
+        }
+        break;
     default:
         break;
     }
@@ -2552,6 +2563,9 @@ bool rombie_engine_lockstep_vblank(void)
     const uint32_t vblank = s_lockstep_vblank;
     if (s_announced_vblank != vblank) {
         s_announced_vblank = vblank;
+        if (vblank == s_dump_at.load()) {
+            nv2a_lockstep_dump(vblank);
+        }
         if (s_hash_every && vblank % s_hash_every == 0) {
             SendHashes(vblank);
         }

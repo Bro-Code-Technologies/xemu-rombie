@@ -199,6 +199,9 @@ void pgraph_gl_image_blit(NV2AState *d)
     NV2A_DPRINTF("  blit 0x%tx -> 0x%tx (Size: %llu, Clipped Height: %zu)\n",
                  source_addr, dest_addr, dest_size, adjusted_height);
 
+    /* Lockstep ahead: guest memory changes only while the CPU waits. */
+    nv2a_lockstep_park_ram(d);
+
     if (adjusted_height > 0) {
         perform_blit(image_blit->operation, source_row, dest_row, row_pixels,
                      adjusted_height, row_bytes, context_surfaces->source_pitch,
