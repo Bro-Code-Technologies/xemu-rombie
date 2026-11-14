@@ -421,11 +421,26 @@ into a machine that has never run.
   GPU's surfaces go into memory, the APU's frame lands) and the engine
   writes the machine's state as a stream to a file (`rombie_savevm_file`,
   `migration/savevm.c`) and the disk as the guest sees it into a fresh qcow2
-  (`copy_disk`: only clusters that hold data, zeros left out, none of the
-  player's save states). It sends its own game data (0x85, save states and
-  all, which the host boots again with) and then 0x88: the guests' game data
-  and the state, which is u64 guest time (ns) and the stream. It stays
-  stopped; the page restarts it.
+  (`copy_disk`: only clusters that hold data, zeros and the disc's runs left
+  out, none of the player's save states). It sends its own game data (0x85,
+  save states and all, which the host boots again with) and then 0x88: the
+  guests' game data and the state, which is u64 guest time (ns), the disc
+  runs and the stream. It stays stopped; the page restarts it.
+- **Disc runs.** A game's disk can hold much of its disc: Halo 2 copies
+  370 MB of its maps to its cache partitions in its first two minutes, 99.5%
+  of its disk then, in 4 KB blocks that are two sectors of the disc each.
+  Every guest has the disc, so `copy_disk` leaves out each block whose two
+  halves hash as two consecutive sectors of the disc, and the state names
+  them in runs (disk offset, disc sector, sectors, and a check: the sectors'
+  hashes in order). The engine knows a sector by its hash once the page has
+  sent its chunk (`rombie_media_disc_chunk`, from `HandleDiscData`), and
+  keeps the hashes in its data folder (`disc-sectors.bin`, one disc, named
+  by its size and its first megabyte), for the engines after it: a
+  restarted host's resync, or a session whose cache an earlier one filled.
+  On every PC, before the state loads, each run comes from that PC's own
+  disc (`fill_from_disc`), unless the disk already holds it (the host's own,
+  rebooted with its full disk); a check that doesn't match fails the join
+  ("This disc isn't the same as the host's").
 - **No BIOS in the state**: `xbox.bios` (the flash) and `xbox.mcpx` (the
   flash with the MCPX ROM over its end) are marked not migratable around the
   save, so the stream leaves them out, and around the load, so a stream
@@ -486,9 +501,13 @@ into a machine that has never run.
   handoff there and sends 0x88 empty, and a join with no state reads it from
   there, so the test page's DevTools connection never carries Halo 2's disk.
 
-Figures (TimeSplitters 2, main PC): the state is 61-62 MB (8.1-8.5 MB
+Figures (main PC): TimeSplitters 2's state is 61-62 MB (8.1-8.5 MB
 gzipped), the guests' game data 3.1 MB (0.9 MB), the host's stop and copy
-0.3 s, a restart 0.9 s, a join 1.3-2.0 s. `lockstep-test.html`'s
+0.3 s, a restart 0.9 s, a join 1.3-2.0 s. Halo 2's state is 48 MB (16 MB
+gzipped); its disk had 370 MB of data at vblank 7200, 367 MB of it in 234
+disc runs, so the guests' game data is 7.3 MB (391 MB without the runs,
+280 MB gzipped); the host's stop 0.4 s, a guest's join 4 s, reading the
+runs from a USB hard drive at 94 MB/s. `lockstep-test.html`'s
 `xboxLockstep.handoff` (`lockstep-run.py --handoff`) checks it: A plays alone
 or in lockstep, hosts and restarts, B joins fresh, A saves a state on the
 way and then hosts again (a resync), hashes compared every vblank.

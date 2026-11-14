@@ -71,9 +71,13 @@
  *   0x88 netplay   [u8 type][3 pad][u32 vblank][u64 game data size]
  *                  [game data][state]  (after 0x0D host: what every PC
  *                  boots with; the game data is a blob as 0x08's, its disk
- *                  as it stands without the player's save states, and the
- *                  state is u64 guest time (ns) and the machine's state,
- *                  without the BIOS, which each PC has its own of)
+ *                  as it stands without the player's save states or what
+ *                  is the disc's, and the state is u64 guest time (ns), u32
+ *                  run count, u32 0, the runs of disk that are the disc's
+ *                  sectors (u64 disk offset, u32 sector, u32 sectors, u64
+ *                  check), which each PC reads from its own disc, and the
+ *                  machine's state, without the BIOS, which each PC has its
+ *                  own of)
  * Engine to page (text, JSON): hello, event, stats (once a second: with
  * flips, the game's own frames, and lw, the ms lockstep waited for input),
  * pong, and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after
@@ -1021,6 +1025,8 @@ static void HandleDiscData(const std::vector<uint8_t> &data)
     const uint32_t id = ReadValue<uint32_t>(data, 4);
 
     std::vector<std::shared_ptr<DiscWaiter>> done, failed;
+    uint64_t arrived = UINT64_MAX;
+    size_t arrived_size = 0;
     {
         std::unique_lock<std::mutex> lock(s_disc_mutex);
         const auto idit = s_chunk_ids.find(id);
@@ -1053,6 +1059,8 @@ static void HandleDiscData(const std::vector<uint8_t> &data)
         } else {
             chunk.data.assign(data.begin() + 8, data.end());
             chunk.ready = true;
+            arrived = offset;
+            arrived_size = expect;
             const auto waiters = std::move(chunk.waiters);
             chunk.waiters.clear();
             for (auto &w : waiters) {
@@ -1064,6 +1072,10 @@ static void HandleDiscData(const std::vector<uint8_t> &data)
                 }
             }
         }
+    }
+    /* Known before any read it answers returns. */
+    if (arrived != UINT64_MAX) {
+        rombie_media_disc_chunk(arrived, data.data() + 8, arrived_size);
     }
     for (auto &w : done) {
         w->cb(w->opaque, true);
