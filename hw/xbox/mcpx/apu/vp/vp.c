@@ -1171,8 +1171,12 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
          * so use it for now.
          */
         // FIXME: Don't do 2ch resampling if this is a mono voice
-        filter->resampler = src_callback_new(&voice_resample_callback,
-                                           SRC_SINC_FASTEST, 2, &err, filter);
+        /* Lockstep runs every voice on the CPU thread's time, where the
+         * sinc's cost per voice adds up; linear, as the note above allows
+         * the hardware may be, costs a fraction. */
+        filter->resampler = src_callback_new(
+            &voice_resample_callback, d->lockstep ? SRC_LINEAR : SRC_SINC_FASTEST,
+            2, &err, filter);
         if (filter->resampler == NULL) {
             fprintf(stderr, "src error: %s\n", src_strerror(err));
             assert(0);

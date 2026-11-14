@@ -164,6 +164,8 @@ typedef enum {
     ROMBIE_PROF_PUSHER_NS,   /* the PFIFO thread's pusher, any mode */
     ROMBIE_PROF_GPU_DEFERRED, /* GPU writes held for the CPU's next wait */
     ROMBIE_PROF_GPU_PARKS,   /* GPU interrupts that waited for the CPU */
+    ROMBIE_PROF_APU_VP_NS,   /* of APU_NS: the voices */
+    ROMBIE_PROF_APU_DSP_NS,  /* of APU_NS: the GP and EP */
     ROMBIE_PROF_COUNT
 } RombieProf;
 void rombie_prof_add(RombieProf what, uint64_t amount);

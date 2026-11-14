@@ -245,8 +245,12 @@ static void se_frame(MCPXAPUState *d)
     /* Buffer for all mixbins for this frame */
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME] = { 0 };
 
+    const uint64_t vp_from = rombie_prof_now();
     mcpx_apu_vp_frame(d, mixbins);
+    const uint64_t dsp_from = rombie_prof_now();
     mcpx_apu_dsp_frame(d, mixbins);
+    rombie_prof_add(ROMBIE_PROF_APU_VP_NS, dsp_from - vp_from);
+    rombie_prof_add(ROMBIE_PROF_APU_DSP_NS, rombie_prof_now() - dsp_from);
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;

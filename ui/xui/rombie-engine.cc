@@ -1628,7 +1628,7 @@ static void SenderThread(void)
                          "\"send\":%.0f,\"spins\":%.0f,\"syncs\":%.0f,"
                          "\"gpuWork\":%.0f,\"gpuPending\":%.0f,"
                          "\"gpuReports\":%.0f,\"gpuDeferred\":%.0f,"
-                         "\"gpuParks\":%.0f}",
+                         "\"gpuParks\":%.0f,\"apuVp\":%.0f,\"apuDsp\":%.0f}",
                          (insns - last_insns) / 1e6 / seconds,
                          ms[ROMBIE_PROF_EXEC_NS],
                          ms[ROMBIE_PROF_LOOPS] * 1e6,
@@ -1646,7 +1646,8 @@ static void SenderThread(void)
                          ms[ROMBIE_PROF_GPU_PENDING_NS],
                          ms[ROMBIE_PROF_GPU_REPORTS_NS],
                          ms[ROMBIE_PROF_GPU_DEFERRED] * 1e6,
-                         ms[ROMBIE_PROF_GPU_PARKS] * 1e6);
+                         ms[ROMBIE_PROF_GPU_PARKS] * 1e6,
+                         ms[ROMBIE_PROF_APU_VP_NS], ms[ROMBIE_PROF_APU_DSP_NS]);
                 last_insns = insns;
                 SendText(prof);
             }
