@@ -3092,6 +3092,18 @@ void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter,
     stl_le_p(&report[12], done);
     nv2a_lockstep_gpu_write(d, report_data, report, sizeof(report));
 
+    /* Development (ROMBIE_LOCKSTEP_TRACE_REPORTS=1): every occlusion count
+     * the guest gets, to compare two PCs' GPUs. */
+    static int trace = -1;
+    if (trace < 0) {
+        const char *env = getenv("ROMBIE_LOCKSTEP_TRACE_REPORTS");
+        trace = env && env[0] == '1';
+    }
+    if (trace) {
+        fprintf(stderr, "rombie-lockstep: report %" HWADDR_PRIx " = %u\n",
+                offset, result);
+    }
+
     NV2A_DPRINTF("Report result %d @%" HWADDR_PRIx, result, offset);
 }
 
