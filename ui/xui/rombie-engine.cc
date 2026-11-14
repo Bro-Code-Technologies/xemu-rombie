@@ -1106,6 +1106,15 @@ static void HandleLockstep(const std::vector<uint8_t> &data)
         return;
     }
     s_lockstep_flags = (flags & LOCKSTEP_ON) ? flags : 0;
+    /* Lockstep boots every PC at a handoff, so the full startup animation
+     * would cost each one its seconds of heavy GPU work; and its render
+     * targets, copied into memory the game may later read before writing,
+     * differ between GPU makers. ROMBIE_LOCKSTEP_FULL_ANIMATION=1 keeps it
+     * (development). */
+    const char *full_anim = getenv("ROMBIE_LOCKSTEP_FULL_ANIMATION");
+    if (s_lockstep_flags && !(full_anim && full_anim[0] == '1')) {
+        g_config.general.skip_boot_anim = true;
+    }
     s_hash_every = every;
     s_rtc_option = rtc;
     s_icount_option =
