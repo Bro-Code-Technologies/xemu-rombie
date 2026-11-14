@@ -548,13 +548,18 @@ static void nv2a_reset_hold(Object *obj, ResetType type)
     nv2a_reset(s);
 }
 
+bool nv2a_save_keeps_surfaces;
+
 // Note: This is handled as a VM state change and not as a `pre_save` callback
 // because we want to halt the FIFO before any VM state is saved/restored to
 // avoid corruption.
 static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
 {
     NV2AState *d = opaque;
-    if (state == RUN_STATE_SAVE_VM) {
+    if (state == RUN_STATE_SAVE_VM && nv2a_save_keeps_surfaces) {
+        nv2a_lock_fifo(d);
+        qatomic_set(&d->pfifo.halt, true);
+    } else if (state == RUN_STATE_SAVE_VM) {
         nv2a_lock_fifo(d);
         qatomic_set(&d->pfifo.halt, true);
         pgraph_pre_savevm_trigger(d);

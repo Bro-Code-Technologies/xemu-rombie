@@ -26,13 +26,16 @@
 #include "exec/cpu-common.h"
 #include "migration/global_state.h"
 #include "migration/snapshot.h"
+#include "qemu/cutils.h"
 #include "qemu/memalign.h"
 #include "qemu/timer.h"
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
 #include "system/runstate.h"
 
+#include "rombie-engine.h"
 #include "rombie-engine-media.h"
+#include "hw/xbox/nv2a/nv2a.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
 
@@ -41,6 +44,7 @@
 #define BLOB_FORMAT 1
 #define BLOB_HEADER 20 /* magic, u32 format, u32 eeprom size, u64 hdd size */
 #define HANDOFF_HEADER 8 /* a handoff's state: u64 guest time (ns) */
+#define ZERO_GRAIN 4096 /* the disk copy leaves out zeros this finely */
 
 extern int64_t rombie_handoff_clock_ns; /* system/cpu-timers.c */
 
@@ -136,7 +140,7 @@ static void set_bios_migratable(bool on)
 /* The hard disk as the guest sees it, into a new image with no snapshots:
  * only the clusters that hold data (the player's save states stay out). The
  * machine is stopped, so nothing else touches the disk. */
-static bool copy_disk(const char *path, Error **errp)
+static bool copy_disk(const char *path, uint64_t *data_bytes, Error **errp)
 {
     BlockBackend *src = blk_by_name(HDD_DEVICE);
     if (!src) {
@@ -180,8 +184,15 @@ static bool copy_disk(const char *path, Error **errp)
         if ((ret & BDRV_BLOCK_DATA) && !(ret & BDRV_BLOCK_ZERO)) {
             for (int64_t at = offset; ok && at < offset + count; at += chunk) {
                 const int64_t n = MIN(chunk, offset + count - at);
-                ok = blk_pread(src, at, n, buf, 0) >= 0 &&
-                     blk_pwrite(dst, at, n, buf, 0) >= 0;
+                ok = blk_pread(src, at, n, buf, 0) >= 0;
+                /* A game's zero-filled files read the same unwritten. */
+                for (int64_t part = 0; ok && part < n; part += ZERO_GRAIN) {
+                    const int64_t m = MIN(ZERO_GRAIN, n - part);
+                    if (!buffer_is_zero(buf + part, m)) {
+                        ok = blk_pwrite(dst, at + part, m, buf + part, 0) >= 0;
+                        *data_bytes += m;
+                    }
+                }
             }
             if (!ok) {
                 error_setg(errp, "Copying the hard disk failed");
@@ -247,13 +258,16 @@ bool rombie_media_handoff(const char *dir, uint8_t **state, size_t *state_size,
         g_remove(state_path);
         return false;
     }
-    if (!copy_disk(disk_path, &err)) {
+    uint64_t disk_bytes = 0;
+    if (!copy_disk(disk_path, &disk_bytes, &err)) {
         set_error(error, err, "Copying the hard disk failed.");
         g_remove(state_path);
         g_remove(disk_path);
         return false;
     }
 
+    fprintf(stderr, "rombie-engine: netplay's disk: %.1f MB of data\n",
+            disk_bytes / 1048576.0);
     uint8_t *stream = NULL;
     size_t stream_size = 0;
     ok = read_file(state_path, &stream, &stream_size, error) &&
@@ -357,7 +371,13 @@ bool rombie_media_save_state(int slot, const char *engine_version,
     }
 
     char *tag = g_strdup_printf("slot%d@%s", slot, engine_version);
+    /* In lockstep the save is the host's alone: copying the GPU's surfaces
+     * into memory would show its game what the guests' doesn't see. The
+     * state then holds memory as the game left it, and a surface the game
+     * doesn't draw again after a load shows its old pixels. */
+    nv2a_save_keeps_surfaces = rombie_engine_lockstep();
     xemu_snapshots_save(tag, &err);
+    nv2a_save_keeps_surfaces = false;
     g_free(tag);
     if (err) {
         *error = g_strdup(error_get_pretty(err));

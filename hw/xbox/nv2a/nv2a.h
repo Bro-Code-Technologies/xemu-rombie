@@ -33,5 +33,7 @@ uint64_t nv2a_lockstep_hash(void);
 uint64_t nv2a_lockstep_ram_hash(void);
 void nv2a_lockstep_dump(uint32_t vblank);
 bool nv2a_lockstep_catch_up(void);
+/* A save leaves the GPU's surfaces out of memory (Rombie's lockstep). */
+extern bool nv2a_save_keeps_surfaces;
 
 #endif

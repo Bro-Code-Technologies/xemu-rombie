@@ -17,6 +17,7 @@
 #include "hw/pci/pci.h"
 #include "system/block-backend.h"
 #include "system/cpus.h"
+#include "system/runstate.h"
 #include "block/accounting.h"
 #include "cpu.h"
 #include "hw/xbox/nv2a/nv2a.h"
@@ -308,9 +309,14 @@ uint64_t rombie_prof_insns(void)
     return icount_enabled() ? icount_get_raw() : 0;
 }
 
+/* A stop (pause, save, exit) sets the run state, then disables the virtual
+ * clock, which waits for the timer callback running now (lockstep's vblank,
+ * waiting for input) to end, and only then sets the CPU's stop: the run
+ * state is what a waiting vblank sees first. */
 bool rombie_lockstep_stopping(void)
 {
-    return first_cpu && qatomic_read(&first_cpu->stop);
+    return (first_cpu && qatomic_read(&first_cpu->stop)) ||
+           !runstate_is_running();
 }
 
 static __thread bool unlocked;

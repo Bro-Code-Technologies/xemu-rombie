@@ -147,6 +147,7 @@ extern uint64_t vblank_interval_ns; /* ui/xemu.c */
 void rombie_icount_set_scale(int64_t q16); /* accel/tcg/icount-common.c */
 void nv2a_lockstep_dump(uint32_t vblank);  /* hw/xbox/nv2a/nv2a.c */
 void rombie_rtc_restart_clock(void);       /* hw/rtc/mc146818rtc.c */
+void rombie_timers_waiting(bool waiting);  /* util/qemu-timer.c */
 void xemu_lockstep_vblank_rebase(int64_t epoch_ns); /* ui/xemu.c */
 void mcpx_apu_lockstep_rebase(int64_t epoch_ns);   /* hw/xbox/mcpx/apu */
 }
@@ -296,6 +297,13 @@ static std::string s_disc_name;
 /* Control work for the UI thread, run inside the main-loop lock. */
 static std::mutex s_work_mutex;
 static std::deque<std::function<void()>> s_work;
+/* In lockstep, work that stops the machine (a save, a load, netplay's host,
+ * exit) waits until the CPU thread holds at a vblank (s_held_at), where the
+ * GPU has done all it was given: stopped anywhere else, its thread may be
+ * parked on an interrupt for a CPU that no longer runs. */
+static std::deque<std::function<void()>> s_held_work; /* s_work_mutex */
+static std::atomic<bool> s_hold{false};
+static std::atomic<int64_t> s_held_at{-1};
 
 /* Pads as the page last sent them (s_pad_mutex). */
 struct PadState {
@@ -918,10 +926,26 @@ static Response Decide(const Request &request)
     return { 101 };
 }
 
+static void QueueAtVblank(std::function<void()> work);
+
 static void QueueWork(std::function<void()> work)
 {
     std::unique_lock<std::mutex> lock(s_work_mutex);
     s_work.push_back(std::move(work));
+}
+
+static void QueueAtVblank(std::function<void()> work)
+{
+    if (!rombie_engine_lockstep() || !s_booted.load()) {
+        QueueWork(std::move(work));
+        return;
+    }
+    {
+        std::unique_lock<std::mutex> lock(s_work_mutex);
+        s_held_work.push_back(std::move(work));
+    }
+    s_hold.store(true);
+    s_input_cv.notify_all();
 }
 
 /* --------------------------------------------------------------------------
@@ -1242,15 +1266,18 @@ static void HandleControl(const std::vector<uint8_t> &data)
         } else if (op == CONTROL_RESUME && !runstate_is_running()) {
             vm_start();
             SendEvent("resumed");
-        } else if (op == CONTROL_EXIT) {
-            if (s_booted.load()) {
-                SendGameData();
-            }
-            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
         } else if (op == CONTROL_RESTART) {
             RestartSelf();
         }
     });
+    if (op == CONTROL_EXIT) {
+        QueueAtVblank([]() {
+            if (s_booted.load()) {
+                SendGameData();
+            }
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        });
+    }
 }
 
 static void HandlePing(const std::vector<uint8_t> &data)
@@ -1418,7 +1445,7 @@ static void HandleNetplay(const std::vector<uint8_t> &data)
     if (op != NETPLAY_HOST) {
         return;
     }
-    QueueWork([vblank]() {
+    QueueAtVblank([vblank]() {
         if (!s_vm_ready.load() || !s_booted.load()) {
             return;
         }
@@ -1548,7 +1575,7 @@ static void HandleState(const std::vector<uint8_t> &data)
     }
     const uint8_t op = data[0];
     const int slot = data[1];
-    QueueWork([op, slot]() {
+    auto work = [op, slot]() {
         if (!s_vm_ready.load() || !s_booted.load()) {
             return;
         }
@@ -1585,7 +1612,12 @@ static void HandleState(const std::vector<uint8_t> &data)
              * load put its disk back to the state's. */
             SendGameData();
         }
-    });
+    };
+    if (op == MSG_DELETE_STATE) {
+        QueueWork(work);
+    } else {
+        QueueAtVblank(work);
+    }
 }
 
 static void HandleBinary(const std::vector<uint8_t> &message)
@@ -2358,6 +2390,25 @@ void rombie_engine_run_pending(void)
         work();
     }
 
+    if (s_hold.load() && s_held_at.load() >= 0) {
+        std::deque<std::function<void()>> held;
+        {
+            std::unique_lock<std::mutex> lock(s_work_mutex);
+            held.swap(s_held_work);
+        }
+        for (auto &work : held) {
+            work();
+        }
+        {
+            std::unique_lock<std::mutex> lock(s_work_mutex);
+            if (s_held_work.empty()) {
+                s_hold.store(false);
+            }
+        }
+        s_held_at.store(-1);
+        s_input_cv.notify_all();
+    }
+
     if (s_booted.load()) {
         if (s_resend_media.exchange(false)) {
             SendSlots();
@@ -2824,9 +2875,15 @@ bool rombie_engine_lockstep_vblank(void)
     bool have = false;
     const double wait_from = NowMs();
     rombie_lockstep_unlock();
+    rombie_timers_waiting(true);
     {
         std::unique_lock<std::mutex> lock(s_input_mutex);
         for (;;) {
+            if (s_hold.load() && !rombie_lockstep_stopping()) {
+                s_held_at.store(vblank);
+                s_input_cv.wait_for(lock, std::chrono::milliseconds(5));
+                continue;
+            }
             if (s_netplay_ended.load()) {
                 have = true;
                 break;
@@ -2870,6 +2927,8 @@ bool rombie_engine_lockstep_vblank(void)
         }
     }
     rombie_lockstep_relock();
+    /* With the BQL again, no stop is waiting on the timer list. */
+    rombie_timers_waiting(false);
     if (!have) {
         return false;
     }

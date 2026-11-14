@@ -170,6 +170,25 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
     }
 }
 
+#ifdef XBOX
+/*
+ * Rombie's lockstep vblank waits for input inside a QEMU_CLOCK_VIRTUAL
+ * timer's callback, with the BQL let go. A stop (pause, save, exit) holds
+ * the BQL while it disables the clock, which waits for the callbacks in
+ * flight: while the vblank waits, the list says it has none, so the stop
+ * goes on, and the vblank ends once the stop lets go of the BQL.
+ */
+void rombie_timers_waiting(bool waiting)
+{
+    QEMUTimerList *tl = main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL];
+    if (waiting) {
+        qemu_event_set(&tl->timers_done_ev);
+    } else {
+        qemu_event_reset(&tl->timers_done_ev);
+    }
+}
+#endif
+
 bool timerlist_has_timers(QEMUTimerList *timer_list)
 {
     return !!qatomic_read(&timer_list->active_timers);
