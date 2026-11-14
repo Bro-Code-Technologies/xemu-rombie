@@ -427,6 +427,19 @@ void mcpx_apu_lockstep_commit(MCPXAPUState *d)
     qemu_mutex_unlock(&d->lock);
 }
 
+/* Rombie's netplay handoff: frames count again from the handed-over state's
+ * guest time, as from 0 at a boot. */
+void mcpx_apu_lockstep_rebase(int64_t epoch_ns)
+{
+    MCPXAPUState *d = g_state;
+    if (!d || !d->lockstep) {
+        return;
+    }
+    d->lockstep_epoch = epoch_ns;
+    d->lockstep_frames = 1;
+    timer_mod_ns(d->lockstep_timer, epoch_ns + LOCKSTEP_FRAME_NS(1));
+}
+
 bool mcpx_apu_lockstep_catch_up(void)
 {
     MCPXAPUState *d = g_state;
@@ -476,7 +489,8 @@ static void mcpx_apu_lockstep_tick(void *opaque)
     qemu_mutex_unlock(&d->lock);
 
     d->lockstep_frames++;
-    timer_mod_ns(d->lockstep_timer, LOCKSTEP_FRAME_NS(d->lockstep_frames));
+    timer_mod_ns(d->lockstep_timer,
+                 d->lockstep_epoch + LOCKSTEP_FRAME_NS(d->lockstep_frames));
     rombie_prof_add(ROMBIE_PROF_APU_NS, rombie_prof_now() - from);
 }
 

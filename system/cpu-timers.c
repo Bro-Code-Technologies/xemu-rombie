@@ -264,10 +264,35 @@ static const VMStateDescription icount_vmstate_timers = {
     }
 };
 
+#ifdef XBOX
+/*
+ * Rombie's netplay handoff: the guest time the handed-over state was saved
+ * at, while it loads (-1 otherwise). That state comes from an engine running
+ * alone, without icount, or at another guest speed; either way, guest time
+ * goes on from there, counted in instructions, so every timer the state
+ * holds comes due when it would have. The devices load after this.
+ */
+int64_t rombie_handoff_clock_ns = -1;
+
+static int timers_post_load(void *opaque, int version_id)
+{
+    TimersState *s = opaque;
+    if (rombie_handoff_clock_ns >= 0 && icount_enabled()) {
+        qatomic_set_i64(&s->qemu_icount_bias,
+                        rombie_handoff_clock_ns -
+                            icount_to_ns(qatomic_read_i64(&s->qemu_icount)));
+    }
+    return 0;
+}
+#endif
+
 static const VMStateDescription vmstate_timers = {
     .name = "timer",
     .version_id = 2,
     .minimum_version_id = 1,
+#ifdef XBOX
+    .post_load = timers_post_load,
+#endif
     .fields = (const VMStateField[]) {
         VMSTATE_INT64(cpu_ticks_offset, TimersState),
         VMSTATE_UNUSED(8),

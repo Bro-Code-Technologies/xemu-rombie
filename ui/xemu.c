@@ -777,11 +777,24 @@ static void vblank_timer_callback(void *opaque)
  * soon as the machine goes on.
  */
 static uint64_t lockstep_vblanks;
+/* The guest time they count from: 0 at a boot, the handed-over state's time
+ * at a netplay handoff. */
+static int64_t lockstep_vblank_epoch;
 
 static void lockstep_vblank_rearm(void *opaque)
 {
-    timer_mod_ns(vblank_timer, (int64_t)((lockstep_vblanks + 1) *
-                                         vblank_interval_ns));
+    timer_mod_ns(vblank_timer,
+                 lockstep_vblank_epoch +
+                     (int64_t)((lockstep_vblanks + 1) * vblank_interval_ns));
+}
+
+void xemu_lockstep_vblank_rebase(int64_t epoch_ns)
+{
+    lockstep_vblank_epoch = epoch_ns;
+    lockstep_vblanks = 0;
+    if (vblank_timer) {
+        lockstep_vblank_rearm(NULL);
+    }
 }
 
 static void lockstep_vblank_callback(void *opaque)

@@ -2880,6 +2880,10 @@ void qmp_x_exit_preconfig(Error **errp)
         return;
     }
 
+#ifdef XBOX
+    rombie_engine_before_start();
+#endif
+
     if (loadvm) {
         RunState state = autostart ? RUN_STATE_RUNNING : runstate_get();
         load_snapshot(loadvm, NULL, false, NULL, &error_fatal);

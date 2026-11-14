@@ -10,7 +10,9 @@
  *   0x02 disc data [u8 type][3 pad][u32 request id][bytes] (empty = failed)
  *   0x03 pad       [u8 type][u8 player][2 pad][u32 buttons][f32 lx][f32 ly]
  *                  [f32 rx][f32 ry][f32 lt][f32 rt]        (player 0-3)
- *   0x04 control   [u8 type][u8 op]          (1 pause, 2 resume, 3 exit)
+ *   0x04 control   [u8 type][u8 op]          (1 pause, 2 resume, 3 exit,
+ *                  4 restart: the engine starts itself again, with the same
+ *                  key and port, and ends; the page connects again)
  *   0x05 ping      [u8 type][7 pad][f64 page time, ms]
  *   0x06 save state   [u8 type][u8 slot]     (1-255; replaces the slot)
  *   0x07 load state   [u8 type][u8 slot]
@@ -33,6 +35,16 @@
  *   0x0C inputs    [u8 type][3 pad][u32 first vblank][u32 count]
  *                  [count x 4 pads: u16 buttons, i8 lx, ly, rx, ry,
  *                  u8 lt, rt]     (lockstep: vblank N runs once N's are in)
+ *   0x0D netplay   [u8 type][u8 op][2 pad][u32 vblank][u32 hash every]
+ *                  [join: the state]
+ *                  1 host, while the game runs (never paused): the machine
+ *                  stops where it is and the engine sends 0x85 and 0x88,
+ *                  which every PC boots with, this one too (restart);
+ *                  2 join, after 0x0B and 0x08 and before boot: the machine
+ *                  loads the state before it first runs, and lockstep goes
+ *                  on from the vblank named;
+ *                  3 end, in lockstep: the vblanks wait for no input and the
+ *                  guest reads 0x03's pads, at the guest speed reached
  *   0x0F speed at  [u8 type][3 pad][u32 vblank][u32 guest speed, as 0x0B's]
  *                  (lockstep: from that vblank on; every engine needs the
  *                  same before it gets there, so the page slows or speeds
@@ -50,6 +62,12 @@
  *                  APU, I/O, guest time)
  *   0x87 vblank    [u8 type][3 pad][u32 vblank] (lockstep: runs next, once
  *                  its input is in)
+ *   0x88 netplay   [u8 type][3 pad][u32 vblank][u64 game data size]
+ *                  [game data][state]  (after 0x0D host: what every PC
+ *                  boots with; the game data is a blob as 0x08's, its disk
+ *                  as it stands without the player's save states, and the
+ *                  state is u64 guest time (ns) and the machine's state,
+ *                  without the BIOS, which each PC has its own of)
  * Engine to page (text, JSON): hello, event, stats (once a second: with
  * flips, the game's own frames, and lw, the ms lockstep waited for input),
  * pong, and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after
@@ -128,6 +146,9 @@ extern "C" {
 extern uint64_t vblank_interval_ns; /* ui/xemu.c */
 void rombie_icount_set_scale(int64_t q16); /* accel/tcg/icount-common.c */
 void nv2a_lockstep_dump(uint32_t vblank);  /* hw/xbox/nv2a/nv2a.c */
+void rombie_rtc_restart_clock(void);       /* hw/rtc/mc146818rtc.c */
+void xemu_lockstep_vblank_rebase(int64_t epoch_ns); /* ui/xemu.c */
+void mcpx_apu_lockstep_rebase(int64_t epoch_ns);   /* hw/xbox/mcpx/apu */
 }
 
 /* Development (0x10): the vblank at which to dump RAM's page hashes and the
@@ -137,8 +158,9 @@ static std::atomic<uint32_t> s_dump_at{UINT32_MAX};
 #include "../rombie-engine-media.h"
 #include "../rombie-engine-version.h"
 
-/* 2: lockstep (0x0B, 0x0C, 0x86, 0x87, lw in the stats). */
-static constexpr int PROTOCOL_VERSION = 2;
+/* 2: lockstep (0x0B, 0x0C, 0x86, 0x87, lw in the stats). 3: netplay (0x0D,
+ * 0x88, restart). */
+static constexpr int PROTOCOL_VERSION = 3;
 static constexpr uint16_t ENGINE_PORT = 47653;
 
 static constexpr uint8_t MSG_BOOT = 0x01;
@@ -153,6 +175,7 @@ static constexpr uint8_t MSG_SPEED = 0x09;
 static constexpr uint8_t MSG_DELETE_STATE = 0x0E;
 static constexpr uint8_t MSG_LOCKSTEP = 0x0B;
 static constexpr uint8_t MSG_INPUTS = 0x0C;
+static constexpr uint8_t MSG_NETPLAY = 0x0D;
 static constexpr uint8_t MSG_SPEED_AT = 0x0F;
 static constexpr uint8_t MSG_DUMP_AT = 0x10; /* development */
 static constexpr uint8_t MSG_DISC_READ = 0x81;
@@ -161,6 +184,11 @@ static constexpr uint8_t MSG_AUDIO = 0x83;
 static constexpr uint8_t MSG_GAME_DATA_SAVED = 0x85;
 static constexpr uint8_t MSG_HASHES = 0x86;
 static constexpr uint8_t MSG_VBLANK = 0x87;
+static constexpr uint8_t MSG_NETPLAY_STATE = 0x88;
+
+static constexpr uint8_t NETPLAY_HOST = 1;
+static constexpr uint8_t NETPLAY_JOIN = 2;
+static constexpr uint8_t NETPLAY_END = 3;
 
 static constexpr uint8_t LOCKSTEP_ON = 0x01;
 static constexpr uint8_t LOCKSTEP_UNTHROTTLED = 0x02;
@@ -183,6 +211,7 @@ static constexpr double HDD_SETTLE_MS = 1000.0;
 static constexpr uint8_t CONTROL_PAUSE = 1;
 static constexpr uint8_t CONTROL_RESUME = 2;
 static constexpr uint8_t CONTROL_EXIT = 3;
+static constexpr uint8_t CONTROL_RESTART = 4;
 
 static constexpr size_t FRAME_HEADER = 24;
 static constexpr size_t AUDIO_HEADER = 8;
@@ -212,6 +241,9 @@ static constexpr double RECONNECT_GRACE_S = 10.0;
 enum class Mode { None, Setup, Unregister, Link, Dev };
 
 static Mode s_mode = Mode::None;
+/* Started by an engine's restart (0x04 op 4), whose process lets go of the
+ * port just before this one listens. */
+static bool s_restarted;
 static uint16_t s_port = ENGINE_PORT;
 static std::string s_dev_origin;
 static std::string s_data_dir;
@@ -257,6 +289,7 @@ static double s_hdd_written_ms;
  * slots and the current image. */
 static std::atomic<bool> s_resend_media{false};
 static void SendGameData(void);
+[[noreturn]] static void RestartSelf(void);
 static uint64_t s_disc_size;
 static std::string s_disc_name;
 
@@ -302,6 +335,13 @@ static uint32_t s_lockstep_vblank;
 static uint32_t s_announced_vblank = UINT32_MAX;
 static double s_pace_from_ms = -1.0;
 static uint32_t s_pace_from_vblank;
+/* Netplay's join, as 0x0D brought it before boot (s_boot_mutex): the state
+ * the machine loads before it first runs (rombie_engine_before_start). */
+static std::vector<uint8_t> s_join_state;
+static uint32_t s_join_vblank;
+/* After 0x0D's end: guest time stays counted in instructions, but the
+ * vblanks wait for no input and the guest reads the page's own pads. */
+static std::atomic<bool> s_netplay_ended{false};
 /* Its 0x86 and 0x87, for the sender thread. */
 static std::mutex s_lockstep_out_mutex;
 static std::deque<std::vector<uint8_t>> s_lockstep_out;
@@ -1207,6 +1247,8 @@ static void HandleControl(const std::vector<uint8_t> &data)
                 SendGameData();
             }
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        } else if (op == CONTROL_RESTART) {
+            RestartSelf();
         }
     });
 }
@@ -1305,15 +1347,9 @@ static void HandleGameData(const std::vector<uint8_t> &data)
 }
 
 /* UI thread: hands the page the game's blob as it is now. */
-static void SendGameData(void)
+static void SendGameDataNow(void)
 {
     s_hdd_dirty = false;
-    /* A speed test keeps nothing, and a game that fills its cache
-     * partitions (Halo 2: 700 MB) would have it read and sent again and
-     * again. */
-    if (rombie_engine_lockstep() && (s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
-        return;
-    }
     uint8_t *blob = nullptr;
     size_t size = 0;
     char *error = nullptr;
@@ -1325,6 +1361,177 @@ static void SendGameData(void)
     uint8_t header[8] = { MSG_GAME_DATA_SAVED };
     SendMessageParts(0x2, header, sizeof(header), blob, size);
     g_free(blob);
+}
+
+static void SendGameData(void)
+{
+    /* A speed test keeps nothing, and a game that fills its cache
+     * partitions (Halo 2: 700 MB) would have it read and sent again and
+     * again. */
+    if (rombie_engine_lockstep() && (s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
+        s_hdd_dirty = false;
+        return;
+    }
+    SendGameDataNow();
+}
+
+/* Netplay (0x0D). */
+static void HandleNetplay(const std::vector<uint8_t> &data)
+{
+    if (data.size() < 12) {
+        return;
+    }
+    const uint8_t op = data[1];
+    const uint32_t vblank = ReadValue<uint32_t>(data, 4);
+    const uint32_t every = ReadValue<uint32_t>(data, 8);
+
+    if (op == NETPLAY_JOIN) {
+        std::unique_lock<std::mutex> lock(s_boot_mutex);
+        if (s_boot_ready || !s_lockstep_flags || data.size() <= 12) {
+            lock.unlock();
+            SendEvent("error", "Netplay's join needs lockstep, a state, and "
+                               "no boot yet.");
+            return;
+        }
+        s_join_state.assign(data.begin() + 12, data.end());
+        s_join_vblank = vblank;
+        if (every) {
+            s_hash_every = every;
+        }
+        /* The CPU thread hasn't started: lockstep goes on from here. */
+        s_lockstep_vblank = vblank;
+        std::unique_lock<std::mutex> input_lock(s_input_mutex);
+        s_inputs.clear();
+        s_inputs_first = vblank;
+        return;
+    }
+
+    if (op == NETPLAY_END) {
+        if (rombie_engine_lockstep()) {
+            s_netplay_ended.store(true);
+            s_input_cv.notify_all();
+            SendEvent("netplay-ended", std::to_string(vblank));
+        }
+        return;
+    }
+
+    if (op != NETPLAY_HOST) {
+        return;
+    }
+    QueueWork([vblank]() {
+        if (!s_vm_ready.load() || !s_booted.load()) {
+            return;
+        }
+        if (!runstate_is_running()) {
+            SendEvent("netplay-failed", "The game is paused.");
+            return;
+        }
+        uint8_t *state = nullptr, *game_data = nullptr;
+        size_t state_size = 0, game_data_size = 0;
+        char *error = nullptr;
+        const double from = NowMs();
+        if (!rombie_media_handoff(s_data_dir.c_str(), &state, &state_size,
+                                  &game_data, &game_data_size, &error)) {
+            SendEvent("netplay-failed", error ? error : "?");
+            g_free(error);
+            return;
+        }
+        fprintf(stderr,
+                "rombie-engine: netplay host at vblank %u: state %zu bytes, "
+                "game data %zu bytes, in %.0f ms\n",
+                vblank, state_size, game_data_size, NowMs() - from);
+        /* The host boots again with its own game data, save states and all;
+         * the guests with the copy. */
+        SendGameDataNow();
+        std::vector<uint8_t> header(16 + game_data_size);
+        header[0] = MSG_NETPLAY_STATE;
+        memcpy(header.data() + 4, &vblank, 4);
+        const uint64_t size64 = game_data_size;
+        memcpy(header.data() + 8, &size64, 8);
+        memcpy(header.data() + 16, game_data, game_data_size);
+        SendMessageParts(0x2, header.data(), header.size(), state, state_size);
+        g_free(state);
+        g_free(game_data);
+    });
+}
+
+/* 0x04 op 4: a new process of this engine, with the same arguments, takes
+ * over the key and the port, and this one ends. A running machine's guest
+ * time can't change how it's counted (lockstep's icount is fixed when QEMU
+ * starts), so netplay's host boots again this way. */
+[[noreturn]] static void RestartSelf(void)
+{
+    fprintf(stderr, "rombie-engine: restarting (process %lu)\n",
+            (unsigned long)GetCurrentProcessId());
+#ifdef _WIN32
+    std::wstring command = GetCommandLineW();
+    if (command.find(L" --restarted") == std::wstring::npos) {
+        command += L" --restarted";
+    }
+    {
+        std::unique_lock<std::mutex> lock(s_send_mutex);
+        s_page_connected.store(false, std::memory_order_release);
+        if (s_client != ENGINE_INVALID_SOCKET) {
+            /* Reset, not closed: a close from this end would leave the
+             * port in TIME_WAIT, which an exclusive bind refuses for
+             * minutes. */
+            LINGER reset = { 1, 0 };
+            setsockopt(s_client, SOL_SOCKET, SO_LINGER, (const char *)&reset,
+                       sizeof(reset));
+            engine_closesocket(s_client);
+            s_client = ENGINE_INVALID_SOCKET;
+        }
+    }
+    /* Let go of the port before the new process listens on it. */
+    engine_closesocket(s_listener);
+    s_listener = ENGINE_INVALID_SOCKET;
+
+    /* The new process inherits only the log (a development engine's
+     * stdout and stderr): an inherited socket would keep the port. */
+    HANDLE inherit[2];
+    DWORD count = 0;
+    for (DWORD which : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
+        HANDLE h = GetStdHandle(which);
+        DWORD flags;
+        if (h && h != INVALID_HANDLE_VALUE && GetHandleInformation(h, &flags) &&
+            (count == 0 || inherit[0] != h)) {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            inherit[count++] = h;
+        }
+    }
+    SIZE_T list_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &list_size);
+    std::vector<uint8_t> list_bytes(list_size ? list_size : 1);
+    auto *list = (LPPROC_THREAD_ATTRIBUTE_LIST)list_bytes.data();
+    const bool have_list =
+        count > 0 && InitializeProcThreadAttributeList(list, 1, 0, &list_size) &&
+        UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                  inherit, count * sizeof(HANDLE), NULL, NULL);
+    STARTUPINFOEXW startup = {};
+    startup.StartupInfo.cb = sizeof(startup);
+    if (have_list) {
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        startup.StartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        startup.lpAttributeList = list;
+    }
+    PROCESS_INFORMATION process = {};
+    if (CreateProcessW(NULL, command.data(), NULL, NULL, have_list ? TRUE : FALSE,
+                       have_list ? EXTENDED_STARTUPINFO_PRESENT : 0, NULL, NULL,
+                       &startup.StartupInfo, &process)) {
+        fprintf(stderr, "rombie-engine: restarted as process %lu\n",
+                (unsigned long)process.dwProcessId);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    } else {
+        fprintf(stderr, "rombie-engine: restart failed (error %lu)\n",
+                (unsigned long)GetLastError());
+    }
+    if (have_list) {
+        DeleteProcThreadAttributeList(list);
+    }
+#endif
+    QuitNow(EXIT_SUCCESS);
 }
 
 static void SendSlots(void)
@@ -1418,6 +1625,9 @@ static void HandleBinary(const std::vector<uint8_t> &message)
         break;
     case MSG_SPEED_AT:
         HandleSpeedAt(message);
+        break;
+    case MSG_NETPLAY:
+        HandleNetplay(message);
         break;
     case MSG_DUMP_AT:
         if (message.size() >= 8) {
@@ -1843,6 +2053,9 @@ void rombie_engine_early_init(int argc, char **argv)
                 QuitNow(EXIT_FAILURE);
             }
             s_port = (uint16_t)port;
+        } else if (arg == "--restarted") {
+            s_restarted = true;
+            argv[i] = NULL;
         } else if (arg == "--origin" && has_value) {
             s_dev_origin = argv[i + 1];
             argv[i] = argv[i + 1] = NULL;
@@ -2024,11 +2237,32 @@ void rombie_engine_wait_for_boot(void)
     g_config.general.show_welcome = false;
 
     int listen_error = 0;
-    if (!Listen(&listen_error)) {
+    bool listening = Listen(&listen_error);
+    /* A restart: the old process lets go of the port as it starts this one. */
+    for (int tries = 0; !listening && s_restarted && tries < 300; tries++) {
+        SDL_Delay(100);
+        listening = Listen(&listen_error);
+    }
+    if (!listening && s_restarted) {
+        /* What holds the port (development). */
+        char command[96];
+        snprintf(command, sizeof(command), "netstat -ano | findstr :%u",
+                 (unsigned)s_port);
+        fprintf(stderr, "rombie-engine: process %lu can't listen\n",
+                (unsigned long)GetCurrentProcessId());
+        if (FILE *p = _popen(command, "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), p)) {
+                fprintf(stderr, "rombie-engine: port: %s", line);
+            }
+            _pclose(p);
+        }
+    }
+    if (!listening) {
         /* An engine of ours already holds the port: an idle one takes this
          * link's key and serves the page; a busy one tells the page so.
          * Either way this process is done. */
-        if (s_mode == Mode::Link && TryHandOffKey()) {
+        if (s_mode == Mode::Link && !s_restarted && TryHandOffKey()) {
             QuitNow(EXIT_SUCCESS);
         }
         fprintf(stderr, "rombie-engine: can't listen on 127.0.0.1:%u "
@@ -2384,7 +2618,7 @@ static int16_t StickFrom8(int v)
 
 void rombie_engine_read_pad(int player, uint16_t *buttons, int16_t axis[6])
 {
-    if (rombie_engine_lockstep()) {
+    if (rombie_engine_lockstep() && !s_netplay_ended.load()) {
         LockstepPad pad;
         {
             std::unique_lock<std::mutex> lock(s_pad_mutex);
@@ -2570,7 +2804,8 @@ static void ApplyIcountSchedule(uint32_t vblank)
 bool rombie_engine_lockstep_vblank(void)
 {
     const uint32_t vblank = s_lockstep_vblank;
-    if (s_announced_vblank != vblank) {
+    const bool ended = s_netplay_ended.load();
+    if (!ended && s_announced_vblank != vblank) {
         s_announced_vblank = vblank;
         if (vblank == s_dump_at.load()) {
             nv2a_lockstep_dump(vblank);
@@ -2592,6 +2827,10 @@ bool rombie_engine_lockstep_vblank(void)
     {
         std::unique_lock<std::mutex> lock(s_input_mutex);
         for (;;) {
+            if (s_netplay_ended.load()) {
+                have = true;
+                break;
+            }
             if (!s_inputs.empty()) {
                 input = s_inputs.front();
                 s_inputs.pop_front();
@@ -2635,11 +2874,59 @@ bool rombie_engine_lockstep_vblank(void)
         return false;
     }
 
-    {
+    if (!ended) {
         std::unique_lock<std::mutex> lock(s_pad_mutex);
         s_lockstep_pads = input;
     }
     ApplyIcountSchedule(vblank);
     s_lockstep_vblank = vblank + 1;
     return true;
+}
+
+void rombie_engine_before_start(void)
+{
+    if (!rombie_engine_enabled() || s_join_state.empty()) {
+        return;
+    }
+    /* The host's machine had its four pads plugged in; this one must too
+     * before it takes the state. */
+    xemu_input_init();
+    char *error = nullptr;
+    int64_t clock = 0;
+    const double from = NowMs();
+    const bool ok = rombie_media_load_handoff(
+        s_data_dir.c_str(), s_join_state.data(), s_join_state.size(), &clock,
+        &error);
+    const size_t size = s_join_state.size();
+    s_join_state = {};
+    if (!ok) {
+        fprintf(stderr, "rombie-engine: netplay join failed: %s\n",
+                error ? error : "?");
+        SendEvent("netplay-failed", error ? error : "?");
+        g_free(error);
+        /* The event goes out before the process does. */
+        SDL_Delay(500);
+        QuitNow(EXIT_FAILURE);
+    }
+    rombie_rtc_restart_clock();
+    xemu_lockstep_vblank_rebase(clock);
+    mcpx_apu_lockstep_rebase(clock);
+    /* 0x0B's guest speed holds from here, as from a boot's first vblank. */
+    {
+        std::unique_lock<std::mutex> lock(s_speed_mutex);
+        for (size_t i = 0; i < s_speed_changes.size();) {
+            if (s_speed_changes[i].first == 0) {
+                rombie_icount_set_scale(s_speed_changes[i].second);
+                s_speed_q16.store(s_speed_changes[i].second);
+                s_speed_changes.erase(s_speed_changes.begin() + i);
+            } else {
+                i++;
+            }
+        }
+    }
+    fprintf(stderr,
+            "rombie-engine: netplay state loaded (%zu bytes, %.0f ms): "
+            "lockstep from vblank %u, guest time %.3f s\n",
+            size, NowMs() - from, s_join_vblank, clock / 1e9);
+    SendEvent("netplay-joined", std::to_string(s_join_vblank));
 }

@@ -90,6 +90,7 @@ typedef struct MCPXAPUState {
     bool lockstep;
     QEMUTimer *lockstep_timer;
     uint64_t lockstep_frames;
+    int64_t lockstep_epoch; /* the guest time they count from */
     /* Lockstep's pipeline: at a frame's tick its voices start on the frame
      * thread, from a copy of the voice descriptors (vp_desc, as launched in
      * vp_desc_base), while the guest runs on. What the guest could see of

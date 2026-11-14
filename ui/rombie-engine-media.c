@@ -16,11 +16,21 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qapi/error.h"
+#include "qobject/qdict.h"
 #include "block/accounting.h"
 #include "block/block-global-state.h"
+#include "block/block-io.h"
+#include "block/graph-lock.h"
+#include "exec/cpu-common.h"
+#include "migration/global_state.h"
+#include "migration/snapshot.h"
+#include "qemu/memalign.h"
+#include "qemu/timer.h"
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
+#include "system/runstate.h"
 
 #include "rombie-engine-media.h"
 #include "xemu-settings.h"
@@ -30,6 +40,9 @@
 #define BLOB_MAGIC "RXBX"
 #define BLOB_FORMAT 1
 #define BLOB_HEADER 20 /* magic, u32 format, u32 eeprom size, u64 hdd size */
+#define HANDOFF_HEADER 8 /* a handoff's state: u64 guest time (ns) */
+
+extern int64_t rombie_handoff_clock_ns; /* system/cpu-timers.c */
 
 static uint64_t last_write_ops;
 
@@ -59,22 +72,17 @@ static void put_le64(uint8_t *p, uint64_t v)
     }
 }
 
-bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error)
+/* The blob from an image file and the EEPROM file. */
+static bool pack_blob(const char *hdd_path, uint8_t **data, size_t *size,
+                      char **error)
 {
     gchar *hdd = NULL, *eeprom = NULL;
     gsize hdd_size = 0, eeprom_size = 0;
     GError *gerr = NULL;
-
-    /* Nothing in flight and every cache on disk, so the file is the disk. */
-    bdrv_drain_all_begin();
-    bdrv_flush_all();
     const bool ok =
-        g_file_get_contents(g_config.sys.files.hdd_path, &hdd, &hdd_size,
-                            &gerr) &&
+        g_file_get_contents(hdd_path, &hdd, &hdd_size, &gerr) &&
         g_file_get_contents(g_config.sys.files.eeprom_path, &eeprom,
                             &eeprom_size, &gerr);
-    bdrv_drain_all_end();
-
     if (!ok) {
         *error = g_strdup_printf("Reading the hard disk image failed: %s",
                                  gerr ? gerr->message : "?");
@@ -95,6 +103,218 @@ bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error)
     g_free(hdd);
     g_free(eeprom);
     *data = blob;
+    return true;
+}
+
+bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error)
+{
+    /* Nothing in flight and every cache on disk, so the file is the disk. */
+    bdrv_drain_all_begin();
+    bdrv_flush_all();
+    const bool ok =
+        pack_blob(g_config.sys.files.hdd_path, data, size, error);
+    bdrv_drain_all_end();
+    return ok;
+}
+
+/* Neither BIOS goes in a handoff's state: each PC has its own (the flash,
+ * and the flash with the MCPX ROM over its end, hw/xbox/xbox.c). A load with
+ * them unmigratable refuses a state that holds them. */
+static void set_bios_migratable(bool on)
+{
+    static const char *const names[] = { "xbox.bios", "xbox.mcpx" };
+    for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        RAMBlock *rb = qemu_ram_block_by_name(names[i]);
+        if (rb && on) {
+            qemu_ram_set_migratable(rb);
+        } else if (rb) {
+            qemu_ram_unset_migratable(rb);
+        }
+    }
+}
+
+/* The hard disk as the guest sees it, into a new image with no snapshots:
+ * only the clusters that hold data (the player's save states stay out). The
+ * machine is stopped, so nothing else touches the disk. */
+static bool copy_disk(const char *path, Error **errp)
+{
+    BlockBackend *src = blk_by_name(HDD_DEVICE);
+    if (!src) {
+        error_setg(errp, "The game has no hard disk.");
+        return false;
+    }
+    BlockDriverState *bs = blk_bs(src);
+    const int64_t size = blk_getlength(src);
+    if (size < 0) {
+        error_setg_errno(errp, (int)-size, "The hard disk's size is unknown");
+        return false;
+    }
+    bdrv_img_create(path, "qcow2", NULL, NULL, NULL, size, 0, true, errp);
+    if (*errp) {
+        return false;
+    }
+    QDict *options = qdict_new();
+    qdict_put_str(options, "driver", "qcow2");
+    BlockBackend *dst = blk_new_open(path, NULL, options, BDRV_O_RDWR, errp);
+    if (!dst) {
+        return false;
+    }
+
+    const int64_t chunk = 1 << 20;
+    uint8_t *buf = qemu_blockalign(bs, chunk);
+    bool ok = true;
+    for (int64_t offset = 0; ok && offset < size;) {
+        int64_t count = 0;
+        int ret;
+        {
+            GRAPH_RDLOCK_GUARD_MAINLOOP();
+            ret = bdrv_block_status_above(bs, NULL, offset, size - offset,
+                                          &count, NULL, NULL);
+        }
+        if (ret < 0 || count <= 0) {
+            error_setg_errno(errp, ret < 0 ? -ret : EIO,
+                             "Reading the hard disk's layout failed");
+            ok = false;
+            break;
+        }
+        if ((ret & BDRV_BLOCK_DATA) && !(ret & BDRV_BLOCK_ZERO)) {
+            for (int64_t at = offset; ok && at < offset + count; at += chunk) {
+                const int64_t n = MIN(chunk, offset + count - at);
+                ok = blk_pread(src, at, n, buf, 0) >= 0 &&
+                     blk_pwrite(dst, at, n, buf, 0) >= 0;
+            }
+            if (!ok) {
+                error_setg(errp, "Copying the hard disk failed");
+            }
+        }
+        offset += count;
+    }
+    if (ok && blk_flush(dst) < 0) {
+        error_setg(errp, "Writing the hard disk's copy failed");
+        ok = false;
+    }
+    qemu_vfree(buf);
+    blk_unref(dst);
+    return ok;
+}
+
+static bool read_file(const char *path, uint8_t **data, size_t *size,
+                      char **error)
+{
+    gchar *bytes = NULL;
+    gsize length = 0;
+    GError *gerr = NULL;
+    if (!g_file_get_contents(path, &bytes, &length, &gerr)) {
+        *error = g_strdup_printf("Reading %s failed: %s", path,
+                                 gerr ? gerr->message : "?");
+        g_clear_error(&gerr);
+        return false;
+    }
+    *data = (uint8_t *)bytes;
+    *size = length;
+    return true;
+}
+
+static void set_error(char **error, Error *err, const char *fallback)
+{
+    *error = g_strdup(err ? error_get_pretty(err) : fallback);
+    error_free(err);
+}
+
+bool rombie_media_handoff(const char *dir, uint8_t **state, size_t *state_size,
+                          uint8_t **game_data, size_t *game_data_size,
+                          char **error)
+{
+    g_autofree char *state_path =
+        g_build_filename(dir, "handoff-out-state.bin", NULL);
+    g_autofree char *disk_path =
+        g_build_filename(dir, "handoff-out-hdd.qcow2", NULL);
+    Error *err = NULL;
+
+    /* As save_snapshot stops it: the GPU's surfaces go into memory and the
+     * APU's frame lands. */
+    global_state_store();
+    vm_stop(RUN_STATE_SAVE_VM);
+    const int64_t clock = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    bdrv_drain_all_begin();
+    set_bios_migratable(false);
+    bool ok = rombie_savevm_file(state_path, &err);
+    set_bios_migratable(true);
+    bdrv_drain_all_end();
+    if (!ok) {
+        set_error(error, err, "Saving the netplay state failed.");
+        g_remove(state_path);
+        return false;
+    }
+    if (!copy_disk(disk_path, &err)) {
+        set_error(error, err, "Copying the hard disk failed.");
+        g_remove(state_path);
+        g_remove(disk_path);
+        return false;
+    }
+
+    uint8_t *stream = NULL;
+    size_t stream_size = 0;
+    ok = read_file(state_path, &stream, &stream_size, error) &&
+         pack_blob(disk_path, game_data, game_data_size, error);
+    g_remove(state_path);
+    g_remove(disk_path);
+    if (!ok) {
+        g_free(stream);
+        return false;
+    }
+    *state_size = HANDOFF_HEADER + stream_size;
+    *state = g_malloc(*state_size);
+    put_le64(*state, (uint64_t)clock);
+    memcpy(*state + HANDOFF_HEADER, stream, stream_size);
+    g_free(stream);
+    return true;
+}
+
+static uint64_t get_le64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) {
+        v = (v << 8) | p[i];
+    }
+    return v;
+}
+
+bool rombie_media_load_handoff(const char *dir, const uint8_t *state,
+                               size_t size, int64_t *clock_ns, char **error)
+{
+    if (size <= HANDOFF_HEADER) {
+        *error = g_strdup("The netplay state is empty.");
+        return false;
+    }
+    const int64_t clock = (int64_t)get_le64(state);
+    if (clock < 0) {
+        *error = g_strdup("The netplay state's guest time isn't valid.");
+        return false;
+    }
+    g_autofree char *path = g_build_filename(dir, "handoff-in-state.bin", NULL);
+    GError *gerr = NULL;
+    if (!g_file_set_contents(path, (const gchar *)state + HANDOFF_HEADER,
+                             (gssize)(size - HANDOFF_HEADER), &gerr)) {
+        *error = g_strdup_printf("Writing the netplay state failed: %s",
+                                 gerr ? gerr->message : "?");
+        g_clear_error(&gerr);
+        return false;
+    }
+
+    Error *err = NULL;
+    rombie_handoff_clock_ns = clock;
+    set_bios_migratable(false);
+    const bool ok = rombie_loadvm_file(path, &err);
+    set_bios_migratable(true);
+    rombie_handoff_clock_ns = -1;
+    g_remove(path);
+    if (!ok) {
+        set_error(error, err, "Loading the netplay state failed.");
+        return false;
+    }
+    *clock_ns = clock;
     return true;
 }
 

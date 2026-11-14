@@ -263,6 +263,14 @@ static const int port_map[4] = { 3, 4, 1, 2 };
 
 void xemu_input_init(void)
 {
+    /* Rombie's netplay join plugs the pads in before the machine loads the
+     * host's state, which holds them; the UI thread's call comes later. */
+    static bool initialized;
+    if (initialized) {
+        return;
+    }
+    initialized = true;
+
     if (rombie_engine_enabled()) {
         /* Input only ever comes from the page: four pads in the console's
          * four ports, and none of this PC's keyboards or gamepads, so a pad

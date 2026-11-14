@@ -50,6 +50,10 @@ const char *rombie_engine_config_path(void);
  * boot message arrives. Exits the process when no page comes. */
 void rombie_engine_wait_for_boot(void);
 
+/* system/vl.c, once the machine is created and before it first runs:
+ * netplay's join loads the handed-over state here (0x0D). */
+void rombie_engine_before_start(void);
+
 /* UI thread, inside the main-loop lock (next to the HUD update): run
  * queued control work (pause, resume, exit) safely. */
 void rombie_engine_run_pending(void);

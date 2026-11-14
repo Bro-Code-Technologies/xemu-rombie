@@ -3717,3 +3717,57 @@ void qmp_snapshot_delete(const char *job_id,
 
     job_start(&s->common);
 }
+
+#ifdef XBOX
+/*
+ * Rombie's netplay handoff (ui/rombie-engine-media.c): the machine's state
+ * alone, as a stream in a file, apart from the disk, which travels as its
+ * own image. The caller has stopped the machine (RUN_STATE_SAVE_VM).
+ */
+bool rombie_savevm_file(const char *path, Error **errp)
+{
+    QIOChannelFile *ioc = qio_channel_file_new_path(
+        path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0660, errp);
+    if (!ioc) {
+        return false;
+    }
+    qio_channel_set_name(QIO_CHANNEL(ioc), "rombie-handoff-out");
+    QEMUFile *f = qemu_file_new_output(QIO_CHANNEL(ioc));
+    object_unref(OBJECT(ioc));
+    const int ret = qemu_savevm_state(f, errp);
+    const int ret2 = qemu_fclose(f);
+    if (ret == 0 && ret2 < 0) {
+        error_setg_errno(errp, -ret2, "Error while writing the VM state");
+    }
+    return ret == 0 && ret2 == 0;
+}
+
+/* Loads one, as load_snapshot does with a snapshot's stream, into a machine
+ * that has been created and hasn't run. */
+bool rombie_loadvm_file(const char *path, Error **errp)
+{
+    MigrationIncomingState *mis = migration_incoming_get_current();
+    QIOChannelFile *ioc =
+        qio_channel_file_new_path(path, O_RDONLY | O_BINARY, 0, errp);
+    if (!ioc) {
+        return false;
+    }
+    qio_channel_set_name(QIO_CHANNEL(ioc), "rombie-handoff-in");
+    QEMUFile *f = qemu_file_new_input(QIO_CHANNEL(ioc));
+    object_unref(OBJECT(ioc));
+
+    bdrv_drain_all_begin();
+    qemu_system_reset(SHUTDOWN_CAUSE_SNAPSHOT_LOAD);
+    mis->from_src_file = f;
+    int ret = -EINVAL;
+    if (yank_register_instance(MIGRATION_YANK_INSTANCE, errp)) {
+        ret = qemu_loadvm_state(f, errp);
+        migration_incoming_state_destroy();
+    } else {
+        mis->from_src_file = NULL;
+        qemu_fclose(f);
+    }
+    bdrv_drain_all_end();
+    return ret == 0;
+}
+#endif
