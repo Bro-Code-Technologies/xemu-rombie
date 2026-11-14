@@ -20,9 +20,10 @@
  *   0x0E delete state [u8 type][u8 slot]
  *   0x0B lockstep  [u8 type][u8 flags][2 pad][u32 hash every][u16 year]
  *                  [u8 month][u8 day][u8 hour][u8 minute][u8 second][pad]
- *                  (before boot; flags: 1 lockstep, 2 unthrottled; 0x10,
- *                  0x20 and 0x40 leave the APU, GPU and I/O syncs off, for
- *                  development tests only)
+ *                  (before boot; flags: 1 lockstep, 2 unthrottled; 0x08
+ *                  keeps the GPU from working ahead between the CPU's
+ *                  waits; 0x10, 0x20 and 0x40 leave the APU, GPU and I/O
+ *                  syncs off; 0x08 and up for development tests only)
  *   0x0C inputs    [u8 type][3 pad][u32 first vblank][u32 count]
  *                  [count x 4 pads: u16 buttons, i8 lx, ly, rx, ry,
  *                  u8 lt, rt]     (lockstep: vblank N runs once N's are in)
@@ -146,6 +147,7 @@ static constexpr uint8_t MSG_VBLANK = 0x87;
 
 static constexpr uint8_t LOCKSTEP_ON = 0x01;
 static constexpr uint8_t LOCKSTEP_UNTHROTTLED = 0x02;
+static constexpr uint8_t LOCKSTEP_GPU_SERIAL = 0x08;
 static constexpr uint8_t LOCKSTEP_NO_APU_SYNC = 0x10;
 static constexpr uint8_t LOCKSTEP_NO_GPU_SYNC = 0x20;
 static constexpr uint8_t LOCKSTEP_NO_IO_SYNC = 0x40;
@@ -1625,7 +1627,8 @@ static void SenderThread(void)
                          "\"warps\":%.0f,\"vblank\":%.0f,\"display\":%.0f,"
                          "\"send\":%.0f,\"spins\":%.0f,\"syncs\":%.0f,"
                          "\"gpuWork\":%.0f,\"gpuPending\":%.0f,"
-                         "\"gpuReports\":%.0f}",
+                         "\"gpuReports\":%.0f,\"gpuDeferred\":%.0f,"
+                         "\"gpuParks\":%.0f}",
                          (insns - last_insns) / 1e6 / seconds,
                          ms[ROMBIE_PROF_EXEC_NS],
                          ms[ROMBIE_PROF_LOOPS] * 1e6,
@@ -1641,7 +1644,9 @@ static void SenderThread(void)
                          ms[ROMBIE_PROF_GPU_SYNCS] * 1e6,
                          ms[ROMBIE_PROF_GPU_WORK_NS],
                          ms[ROMBIE_PROF_GPU_PENDING_NS],
-                         ms[ROMBIE_PROF_GPU_REPORTS_NS]);
+                         ms[ROMBIE_PROF_GPU_REPORTS_NS],
+                         ms[ROMBIE_PROF_GPU_DEFERRED] * 1e6,
+                         ms[ROMBIE_PROF_GPU_PARKS] * 1e6);
                 last_insns = insns;
                 SendText(prof);
             }
@@ -2361,6 +2366,8 @@ bool rombie_engine_lockstep_sync(RombieSync part)
         return !(s_lockstep_flags & LOCKSTEP_NO_GPU_SYNC);
     case ROMBIE_SYNC_IO:
         return !(s_lockstep_flags & LOCKSTEP_NO_IO_SYNC);
+    case ROMBIE_SYNC_GPU_AHEAD:
+        return !(s_lockstep_flags & (LOCKSTEP_NO_GPU_SYNC | LOCKSTEP_GPU_SERIAL));
     }
     return true;
 }

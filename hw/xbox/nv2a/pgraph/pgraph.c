@@ -202,6 +202,7 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
 
         pg->waiting_for_context_switch = true;
         qemu_mutex_unlock(&pg->lock);
+        nv2a_lockstep_park(d);
         bql_lock();
         pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
         nv2a_update_irq(d);
@@ -873,6 +874,7 @@ DEF_METHOD(NV097, NO_OPERATION)
     pg->waiting_for_nop = true;
 
     qemu_mutex_unlock(&pg->lock);
+    nv2a_lockstep_park(d);
     bql_lock();
     nv2a_update_irq(d);
     bql_unlock();
@@ -2784,7 +2786,9 @@ DEF_METHOD(NV097, BACK_END_WRITE_SEMAPHORE_RELEASE)
     assert(semaphore_offset < semaphore_dma_len);
     semaphore_data += semaphore_offset;
 
-    stl_le_p((uint32_t*)semaphore_data, parameter);
+    uint8_t value[4];
+    stl_le_p(value, parameter);
+    nv2a_lockstep_gpu_write(d, semaphore_data, value, sizeof(value));
 
     //qemu_mutex_lock(&d->pgraph.lock);
     //bql_unlock();
@@ -3082,9 +3086,11 @@ void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter,
     assert(offset < report_dma_len);
     report_data += offset;
 
-    stq_le_p((uint64_t *)&report_data[0], timestamp);
-    stl_le_p((uint32_t *)&report_data[8], result);
-    stl_le_p((uint32_t *)&report_data[12], done);
+    uint8_t report[16];
+    stq_le_p(&report[0], timestamp);
+    stl_le_p(&report[8], result);
+    stl_le_p(&report[12], done);
+    nv2a_lockstep_gpu_write(d, report_data, report, sizeof(report));
 
     NV2A_DPRINTF("Report result %d @%" HWADDR_PRIx, result, offset);
 }

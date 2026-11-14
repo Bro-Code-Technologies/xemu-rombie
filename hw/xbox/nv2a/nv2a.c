@@ -242,11 +242,49 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
 
     pgraph_init(d);
 
-    d->pfifo.lockstep = rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU);
+    pfifo_lockstep_init(d, rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU),
+                        rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU_AHEAD));
 
     /* fire up pfifo */
     qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo_thread",
                        pfifo_thread, d, QEMU_THREAD_JOINABLE);
+}
+
+/* Development (ROMBIE_LOCKSTEP_PROFILE=1): the register accesses that make
+ * the CPU wait for the GPU, every 4000 of them. */
+static void note_mmio_wait(NV2AState *d, int block, hwaddr addr, bool write)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *env = getenv("ROMBIE_LOCKSTEP_PROFILE");
+        on = env && env[0] == '1';
+    }
+    if (!on || !d->pfifo.guest_work) {
+        return;
+    }
+    static struct { uint32_t key; uint32_t count; } slots[64];
+    static uint32_t total;
+    const uint32_t key = (block << 24) | ((uint32_t)addr & 0xFFFFFF) |
+                         (write ? 0x80000000u : 0);
+    for (int i = 0; i < 64; i++) {
+        if (slots[i].count == 0 || slots[i].key == key) {
+            slots[i].key = key;
+            slots[i].count++;
+            break;
+        }
+    }
+    if (++total < 4000) {
+        return;
+    }
+    fprintf(stderr, "rombie-lockstep: gpu waits by register:");
+    for (int i = 0; i < 64 && slots[i].count; i++) {
+        fprintf(stderr, " %c%s+%06x:%u", (slots[i].key >> 31) ? 'w' : 'r',
+                blocktable[(slots[i].key >> 24) & 0x7f].name,
+                slots[i].key & 0xFFFFFF, slots[i].count);
+    }
+    fprintf(stderr, "\n");
+    memset(slots, 0, sizeof(slots));
+    total = 0;
 }
 
 /* Lockstep's MMIO: work the guest left waiting (DMA_PUT) runs before it
@@ -254,6 +292,29 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
 static uint64_t nv2a_lockstep_read(void *opaque, hwaddr addr, unsigned size)
 {
     typeof(g_nv2a->lockstep_blocks[0]) *b = opaque;
+    NV2AState *d = b->d;
+    if (b->block == NV_PFB) {
+        /* PFB's registers don't follow the GPU's work (its WBC flush, which
+         * the guest polls after kicks, reads as done). */
+        return blocktable[b->block].ops.read(d, addr, size);
+    }
+    /* Ahead: the guest reads DMA_GET or REF after kicks to see how far the
+     * GPU got. Its first read since the CPU last waited gets the value that
+     * wait left, which the GPU has passed; a second, with no wait between,
+     * is a poll, and waits. Both follow only the guest's own steps. */
+    const hwaddr reg = addr & 0xFFFF;
+    if (b->block == NV_USER && d->pfifo.ahead &&
+        (reg == NV_USER_DMA_GET || reg == NV_USER_REF)) {
+        if (d->pfifo.user_read_syncs != d->pfifo.syncs) {
+            d->pfifo.user_read_syncs = d->pfifo.syncs;
+            return reg == NV_USER_DMA_GET ? d->pfifo.synced_dma_get
+                                          : d->pfifo.synced_ref;
+        }
+        nv2a_lockstep_catch_up();
+        d->pfifo.user_read_syncs = d->pfifo.syncs;
+        return blocktable[b->block].ops.read(d, addr, size);
+    }
+    note_mmio_wait(b->d, b->block, addr, false);
     nv2a_lockstep_catch_up();
     return blocktable[b->block].ops.read(b->d, addr, size);
 }
@@ -262,7 +323,11 @@ static void nv2a_lockstep_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
     typeof(g_nv2a->lockstep_blocks[0]) *b = opaque;
-    if (b->block != NV_USER || (addr & 0xFFFF) != NV_USER_DMA_PUT) {
+    /* Nor does the WBC flush the guest asks for after kicks (the GPU reads
+     * only PFB's tiles). */
+    const bool flush = b->block == NV_PFB && addr == NV_PFB_WBC;
+    if (!flush && (b->block != NV_USER || (addr & 0xFFFF) != NV_USER_DMA_PUT)) {
+        note_mmio_wait(b->d, b->block, addr, true);
         nv2a_lockstep_catch_up();
     }
     blocktable[b->block].ops.write(b->d, addr, val, size);
@@ -448,6 +513,7 @@ static void nv2a_exitfn(PCIDevice *dev)
 
     d->exiting = true;
 
+    pfifo_lockstep_exit(d);
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
     qemu_thread_join(&d->pfifo.thread);
 

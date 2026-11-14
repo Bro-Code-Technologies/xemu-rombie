@@ -97,6 +97,7 @@ typedef enum {
     ROMBIE_SYNC_APU = 1, /* APU frames run on the CPU thread, on guest time */
     ROMBIE_SYNC_GPU = 2, /* the CPU waits for PFIFO after every kick */
     ROMBIE_SYNC_IO = 4,  /* the CPU waits for disc and disk I/O it started */
+    ROMBIE_SYNC_GPU_AHEAD = 8, /* with GPU: PFIFO works ahead between waits */
 } RombieSync;
 bool rombie_engine_lockstep_sync(RombieSync part);
 
@@ -161,6 +162,8 @@ typedef enum {
     ROMBIE_PROF_GPU_REPORTS_NS, /* ... in their reports */
     ROMBIE_PROF_FLIPS,       /* the game's frames (flip stalls), any mode */
     ROMBIE_PROF_PUSHER_NS,   /* the PFIFO thread's pusher, any mode */
+    ROMBIE_PROF_GPU_DEFERRED, /* GPU writes held for the CPU's next wait */
+    ROMBIE_PROF_GPU_PARKS,   /* GPU interrupts that waited for the CPU */
     ROMBIE_PROF_COUNT
 } RombieProf;
 void rombie_prof_add(RombieProf what, uint64_t amount);
