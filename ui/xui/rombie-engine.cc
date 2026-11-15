@@ -1350,28 +1350,42 @@ static void HandleSpeed(const std::vector<uint8_t> &data)
 struct GameDataView {
     const uint8_t *eeprom;
     size_t eeprom_size;
+    const uint8_t *runs; /* format 2's disc runs, 24 bytes each */
+    uint32_t run_count;
     const uint8_t *hdd;
     size_t hdd_size;
 };
 
+/* rombie-engine-media.h has both formats. */
 static bool ParseGameData(const std::vector<uint8_t> &blob, GameDataView *view)
 {
-    if (blob.size() < 20 || memcmp(blob.data(), "RXBX", 4) != 0 ||
-        ReadValue<uint32_t>(blob, 4) != 1) {
+    if (blob.size() < 20 || memcmp(blob.data(), "RXBX", 4) != 0) {
+        return false;
+    }
+    const uint32_t format = ReadValue<uint32_t>(blob, 4);
+    const size_t header = format == 2 ? 28 : 20;
+    if ((format != 1 && format != 2) || blob.size() < header) {
         return false;
     }
     const uint32_t eeprom_size = ReadValue<uint32_t>(blob, 8);
     const uint64_t hdd_size = ReadValue<uint64_t>(blob, 12);
+    const uint32_t run_count = format == 2 ? ReadValue<uint32_t>(blob, 20) : 0;
+    const uint64_t runs_size = (uint64_t)run_count * 24;
     if (eeprom_size > 4096 || hdd_size < 4 ||
-        20 + (uint64_t)eeprom_size + hdd_size != blob.size()) {
+        header + (uint64_t)eeprom_size + runs_size + hdd_size != blob.size()) {
         return false;
     }
-    view->eeprom = blob.data() + 20;
+    view->eeprom = blob.data() + header;
     view->eeprom_size = eeprom_size;
-    view->hdd = blob.data() + 20 + eeprom_size;
+    view->runs = view->eeprom + eeprom_size;
+    view->run_count = run_count;
+    view->hdd = view->runs + runs_size;
     view->hdd_size = (size_t)hdd_size;
     return memcmp(view->hdd, "QFI\xfb", 4) == 0; /* a qcow2 image */
 }
+
+/* A format 2 blob's runs, for rombie_engine_before_start. */
+static std::vector<uint8_t> s_save_runs;
 
 /* Main thread, before QEMU starts: the stored disk and EEPROM become the
  * files xemu opens. */
@@ -1381,6 +1395,7 @@ static bool WriteGameData(const std::vector<uint8_t> &blob)
     if (!ParseGameData(blob, &view)) {
         return false;
     }
+    s_save_runs.assign(view.runs, view.runs + (size_t)view.run_count * 24);
     if (view.eeprom_size == 0) {
         g_remove(g_config.sys.files.eeprom_path);
     } else if (!g_file_set_contents(g_config.sys.files.eeprom_path,
@@ -1411,7 +1426,10 @@ static void SendGameDataNow(void)
     uint8_t *blob = nullptr;
     size_t size = 0;
     char *error = nullptr;
-    if (!rombie_media_read_blob(&blob, &size, &error)) {
+    const uint64_t held_from = rombie_prof_now();
+    const bool read = rombie_media_read_blob(&blob, &size, &error);
+    rombie_prof_add(ROMBIE_PROF_HELD_NS, rombie_prof_now() - held_from);
+    if (!read) {
         SendEvent("error", error ? error : "Reading the game's data failed.");
         g_free(error);
         return;
@@ -1711,6 +1729,7 @@ static void HandleState(const std::vector<uint8_t> &data)
         char *error = nullptr;
         bool ok;
         const char *done;
+        const uint64_t held_from = rombie_prof_now();
         if (op == MSG_SAVE_STATE) {
             ok = rombie_media_save_state(slot, ROMBIE_XBOX_ENGINE_VERSION,
                                          &error);
@@ -1723,6 +1742,7 @@ static void HandleState(const std::vector<uint8_t> &data)
             ok = rombie_media_delete_state(slot, &error);
             done = "state-deleted";
         }
+        rombie_prof_add(ROMBIE_PROF_HELD_NS, rombie_prof_now() - held_from);
 
         if (ok) {
             SendEvent(done, std::to_string(slot));
@@ -2058,6 +2078,8 @@ static void SenderThread(void)
              * lockstep. */
             const uint64_t flips = rombie_prof_take(ROMBIE_PROF_FLIPS);
             const uint64_t pusher_ns = rombie_prof_take(ROMBIE_PROF_PUSHER_NS);
+            const uint64_t shader_ns = rombie_prof_take(ROMBIE_PROF_SHADER_NS);
+            const uint64_t held_ns = rombie_prof_take(ROMBIE_PROF_HELD_NS);
             if (rombie_engine_lockstep()) {
                 /* Where lockstep's time went this second, in ms (counts
                  * for loops), and the guest instructions run. */
@@ -2105,7 +2127,7 @@ static void SenderThread(void)
             char stats[640];
             snprintf(stats, sizeof(stats),
                      "{\"t\":\"stats\",\"ms\":%.0f,\"lw\":%.0f,"
-                     "\"pace\":%.0f,\"ns\":%.4g,"
+                     "\"pace\":%.0f,\"ns\":%.4g,\"shader\":%.0f,\"held\":%.0f,"
                      "\"flips\":%.1f,\"pusher\":%.0f,"
                      "\"vbl\":%.1f,\"speed\":%.1f,"
                      "\"padMsgs\":%u,"
@@ -2116,7 +2138,7 @@ static void SenderThread(void)
                      "\"drMs\":%.2f,\"w\":%u,\"h\":%u}",
                      seconds * 1000.0, lockstep_wait_us / 1000.0,
                      s_stats.lockstep_pace_us.exchange(0) / 1000.0,
-                     s_speed_q16.load() / 16.0,
+                     s_speed_q16.load() / 16.0, shader_ns / 1e6, held_ns / 1e6,
                      flips / seconds, pusher_ns / 1e6 / seconds,
                      vblanks / seconds, s_speed.load(),
                      pad_messages,
@@ -3072,7 +3094,27 @@ bool rombie_engine_lockstep_vblank(void)
 
 void rombie_engine_before_start(void)
 {
-    if (!rombie_engine_enabled() || s_join_state.empty()) {
+    if (!rombie_engine_enabled()) {
+        return;
+    }
+    if (!s_save_runs.empty()) {
+        /* The stored disk's own copies of the disc, from the disc. */
+        char *error = nullptr;
+        const bool ok = rombie_media_fill_save_runs(
+            s_save_runs.data(), (uint32_t)(s_save_runs.size() / 24), &error);
+        s_save_runs = {};
+        if (!ok) {
+            fprintf(stderr, "rombie-engine: the saved disk failed: %s\n",
+                    error ? error : "?");
+            SendEvent("error", std::string("Boot failed: ") +
+                                   (error ? error : "the game's saved data "
+                                                    "couldn't be read."));
+            g_free(error);
+            SDL_Delay(500);
+            QuitNow(EXIT_FAILURE);
+        }
+    }
+    if (s_join_state.empty()) {
         return;
     }
     /* The host's machine had its four pads plugged in; this one must too

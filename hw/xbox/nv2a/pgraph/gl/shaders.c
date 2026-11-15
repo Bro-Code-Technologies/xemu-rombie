@@ -24,6 +24,7 @@
 #include "qemu/mstring.h"
 
 #include "xemu-version.h"
+#include "ui/rombie-engine.h"
 #include "ui/xemu-settings.h"
 #include "hw/xbox/nv2a/debug_gl.h"
 #include "hw/xbox/nv2a/pgraph/util.h"
@@ -815,12 +816,18 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
     LruNode *node = lru_lookup(&r->shader_cache, shader_state_hash, &state);
     ShaderBinding *binding = container_of(node, ShaderBinding, node);
 
-    if (!binding->initialized && !pgraph_gl_shader_load_from_memory(binding)) {
-        nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
-        generate_shaders(r, binding);
-        if (g_config.perf.cache_shaders) {
-            pgraph_gl_shader_cache_to_disk(binding);
+    if (!binding->initialized) {
+        /* Rombie: a scene new to this PC holds its game (and in lockstep
+         * every PC's) while this runs; netplay's speed rules leave it out. */
+        const uint64_t shader_from = rombie_prof_now();
+        if (!pgraph_gl_shader_load_from_memory(binding)) {
+            nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
+            generate_shaders(r, binding);
+            if (g_config.perf.cache_shaders) {
+                pgraph_gl_shader_cache_to_disk(binding);
+            }
         }
+        rombie_prof_add(ROMBIE_PROF_SHADER_NS, rombie_prof_now() - shader_from);
     }
     assert(binding->initialized);
     r->shader_binding = binding;

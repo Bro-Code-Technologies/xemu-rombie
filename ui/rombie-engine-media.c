@@ -46,6 +46,10 @@
 #define BLOB_MAGIC "RXBX"
 #define BLOB_FORMAT 1
 #define BLOB_HEADER 20 /* magic, u32 format, u32 eeprom size, u64 hdd size */
+/* Format 2 adds u32 disc runs and u32 0 to the header, and the runs after the
+ * EEPROM: an image whose disc sectors each boot reads from the disc. */
+#define BLOB_FORMAT_RUNS 2
+#define BLOB_HEADER_RUNS 28
 /* A handoff's state: u64 guest time (ns), u32 disc runs, u32 0. */
 #define HANDOFF_HEADER 16
 #define ZERO_GRAIN 4096 /* the disk copy leaves out zeros this finely */
@@ -97,9 +101,29 @@ static void put_le64(uint8_t *p, uint64_t v)
     }
 }
 
-/* The blob from an image file and the EEPROM file. */
-static bool pack_blob(const char *hdd_path, uint8_t **data, size_t *size,
-                      char **error)
+typedef struct {
+    uint64_t disk;
+    uint64_t sector;
+    uint64_t sectors;
+    uint64_t check;
+} DiscRun;
+
+static void put_runs(uint8_t *out, const GArray *runs)
+{
+    for (guint i = 0; i < runs->len; i++) {
+        const DiscRun *run = &g_array_index(runs, DiscRun, i);
+        uint8_t *p = out + (size_t)i * RUN_BYTES;
+        stq_le_p(p, run->disk);
+        stl_le_p(p + 8, (uint32_t)run->sector);
+        stl_le_p(p + 12, (uint32_t)run->sectors);
+        stq_le_p(p + 16, run->check);
+    }
+}
+
+/* The blob from an image file and the EEPROM file: format 2 with `runs`,
+ * format 1 without. */
+static bool pack_blob(const char *hdd_path, const GArray *runs, uint8_t **data,
+                      size_t *size, char **error)
 {
     gchar *hdd = NULL, *eeprom = NULL;
     gsize hdd_size = 0, eeprom_size = 0;
@@ -117,29 +141,27 @@ static bool pack_blob(const char *hdd_path, uint8_t **data, size_t *size,
         return false;
     }
 
-    *size = BLOB_HEADER + eeprom_size + hdd_size;
+    const size_t header = runs ? BLOB_HEADER_RUNS : BLOB_HEADER;
+    const size_t runs_size = runs ? (size_t)runs->len * RUN_BYTES : 0;
+    *size = header + eeprom_size + runs_size + hdd_size;
     uint8_t *blob = g_malloc(*size);
     memcpy(blob, BLOB_MAGIC, 4);
-    put_le32(blob + 4, BLOB_FORMAT);
+    put_le32(blob + 4, runs ? BLOB_FORMAT_RUNS : BLOB_FORMAT);
     put_le32(blob + 8, (uint32_t)eeprom_size);
     put_le64(blob + 12, hdd_size);
-    memcpy(blob + BLOB_HEADER, eeprom, eeprom_size);
-    memcpy(blob + BLOB_HEADER + eeprom_size, hdd, hdd_size);
+    if (runs) {
+        put_le32(blob + 20, runs->len);
+        put_le32(blob + 24, 0);
+    }
+    memcpy(blob + header, eeprom, eeprom_size);
+    if (runs) {
+        put_runs(blob + header + eeprom_size, runs);
+    }
+    memcpy(blob + header + eeprom_size + runs_size, hdd, hdd_size);
     g_free(hdd);
     g_free(eeprom);
     *data = blob;
     return true;
-}
-
-bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error)
-{
-    /* Nothing in flight and every cache on disk, so the file is the disk. */
-    bdrv_drain_all_begin();
-    bdrv_flush_all();
-    const bool ok =
-        pack_blob(g_config.sys.files.hdd_path, data, size, error);
-    bdrv_drain_all_end();
-    return ok;
 }
 
 /* Neither BIOS goes in a handoff's state: each PC has its own (the flash,
@@ -189,13 +211,6 @@ typedef struct {
     SectorKey *keys; /* the known sectors, by hash */
     size_t nkeys;
 } DiscIndex;
-
-typedef struct {
-    uint64_t disk;
-    uint64_t sector;
-    uint64_t sectors;
-    uint64_t check;
-} DiscRun;
 
 static inline uint64_t hash_round(uint64_t acc, uint64_t in)
 {
@@ -452,9 +467,11 @@ static bool add_disc_run(const DiscIndex *index, GArray *runs, uint64_t disk,
     return true;
 }
 
-/* On every PC before the state loads: each run's disk comes from this PC's
- * own disc, unless the disk already holds it (the host's own). */
-static bool fill_from_disc(const uint8_t *runs, uint32_t count, char **error)
+/* Before the machine runs (a save's runs) or the state loads (netplay's, on
+ * every PC): each run's disk comes from this PC's own disc, unless the disk
+ * already holds it (the host's own). */
+static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
+                           char **error)
 {
     if (count == 0) {
         return true;
@@ -462,7 +479,7 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, char **error)
     BlockBackend *hdd = blk_by_name(HDD_DEVICE);
     const int64_t hdd_size = hdd ? blk_getlength(hdd) : -1;
     if (hdd_size < 0) {
-        *error = g_strdup("The game has no hard disk for netplay.");
+        *error = g_strdup("The game has no hard disk.");
         return false;
     }
     const uint64_t disc_sectors = rombie_engine_disc_size() / DISC_SECTOR;
@@ -479,7 +496,10 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, char **error)
         const uint64_t bytes = sectors * DISC_SECTOR;
         if (sectors == 0 || sector + sectors > disc_sectors ||
             disk % DISC_SECTOR || disk + bytes > (uint64_t)hdd_size) {
-            *error = g_strdup("The netplay state's disc runs aren't valid.");
+            *error = g_strdup(save ? "The game's saved data names parts of "
+                                     "the disc that this disc doesn't have."
+                                   : "The netplay state's disc runs aren't "
+                                     "valid.");
             ok = false;
             break;
         }
@@ -501,36 +521,46 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, char **error)
             got = check_sectors(got, buf, n);
         }
         if (!ok) {
-            *error = g_strdup("Reading the disc for netplay's disk failed.");
+            *error = g_strdup("Reading the disc for the game's hard disk "
+                              "failed.");
         } else if (got != check) {
-            *error = g_strdup("This disc isn't the same as the host's.");
+            *error = g_strdup(save ? "This disc isn't the one the game's data "
+                                     "was saved with."
+                                   : "This disc isn't the same as the host's.");
             ok = false;
         }
         filled += bytes;
     }
     qemu_vfree(buf);
     if (ok && blk_flush(hdd) < 0) {
-        *error = g_strdup("Writing netplay's disk failed.");
+        *error = g_strdup("Writing the game's hard disk failed.");
         ok = false;
     }
     if (ok) {
         fprintf(stderr,
-                "rombie-engine: netplay's disk: %.1f MB from the disc, "
+                "rombie-engine: %s: %.1f MB from the disc, "
                 "%.1f MB already there (%u runs), in %" PRId64 " ms\n",
-                filled / 1048576.0, kept / 1048576.0, count,
+                save ? "the saved disk" : "netplay's disk", filled / 1048576.0,
+                kept / 1048576.0, count,
                 qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - from);
     }
     return ok;
 }
 
-/* The hard disk as the guest sees it, into a new image with no snapshots:
- * only the clusters that hold data (the player's save states stay out), and
- * of those only what isn't the disc's (`runs` names that). The machine is
- * stopped, so nothing else touches the disk. */
-static bool copy_disk(const char *path, const DiscIndex *index, GArray *runs,
+bool rombie_media_fill_save_runs(const uint8_t *runs, uint32_t count,
+                                 char **error)
+{
+    return fill_from_disc(runs, count, true, error);
+}
+
+/* A hard disk as the guest sees it (`src`: the machine's, stopped, or a copy
+ * of its file), into a new image with no snapshots: only the clusters that
+ * hold data (the player's save states stay out), and of those only what isn't
+ * the disc's (`runs` names that). */
+static bool copy_disk(BlockBackend *src, const char *path,
+                      const DiscIndex *index, GArray *runs,
                       uint64_t *data_bytes, uint64_t *disc_bytes, Error **errp)
 {
-    BlockBackend *src = blk_by_name(HDD_DEVICE);
     if (!src) {
         error_setg(errp, "The game has no hard disk.");
         return false;
@@ -628,6 +658,113 @@ static void set_error(char **error, Error *err, const char *fallback)
     error_free(err);
 }
 
+static bool copy_file(const char *from, const char *to, char **error)
+{
+    FILE *in = g_fopen(from, "rb");
+    FILE *out = in ? g_fopen(to, "wb") : NULL;
+    bool ok = in && out;
+    const size_t piece = 8 << 20;
+    uint8_t *buf = ok ? g_malloc(piece) : NULL;
+    while (ok) {
+        const size_t n = fread(buf, 1, piece, in);
+        if (n == 0) {
+            ok = !ferror(in);
+            break;
+        }
+        ok = fwrite(buf, 1, n, out) == n;
+    }
+    g_free(buf);
+    if (out && fclose(out) != 0) {
+        ok = false;
+    }
+    if (in) {
+        fclose(in);
+    }
+    if (!ok) {
+        *error = g_strdup("Copying the hard disk image failed.");
+        g_remove(to);
+    }
+    return ok;
+}
+
+/* With no save states in the image, what a save keeps is the disk as the
+ * guest sees it in a fresh image, the disc's own sectors left out as runs:
+ * a game's cache partitions (Halo 2's 700 MB) are nearly all copies of its
+ * disc (the user's call, Rombie BRAIN-38). The image file is copied with the
+ * game's disk I/O drained, as format 1 reads it, and the blob is made from
+ * the copy while the game runs on: stopping the machine for it, the first
+ * way, once left a game that never ran again. */
+static bool read_compact_blob(uint8_t **data, size_t *size, char **error)
+{
+    g_autofree char *dir = g_path_get_dirname(g_config.sys.files.hdd_path);
+    g_autofree char *copy_path =
+        g_build_filename(dir, "save-in-hdd.qcow2", NULL);
+    g_autofree char *disk_path =
+        g_build_filename(dir, "save-out-hdd.qcow2", NULL);
+    const int64_t from = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+    bdrv_drain_all_begin();
+    bdrv_flush_all();
+    bool ok = copy_file(g_config.sys.files.hdd_path, copy_path, error);
+    bdrv_drain_all_end();
+    if (!ok) {
+        return false;
+    }
+
+    Error *err = NULL;
+    QDict *options = qdict_new();
+    qdict_put_str(options, "driver", "qcow2");
+    BlockBackend *src = blk_new_open(copy_path, NULL, options, 0, &err);
+    if (!src) {
+        set_error(error, err, "Opening the hard disk's copy failed.");
+        g_remove(copy_path);
+        return false;
+    }
+    DiscIndex index;
+    disc_index_open(dir, &index);
+    GArray *runs = g_array_new(false, false, sizeof(DiscRun));
+    uint64_t disk_bytes = 0, disc_bytes = 0;
+    ok = copy_disk(src, disk_path, &index, runs, &disk_bytes, &disc_bytes,
+                   &err);
+    disc_index_close(&index);
+    blk_unref(src);
+    g_remove(copy_path);
+    if (!ok) {
+        set_error(error, err, "Copying the hard disk failed.");
+    } else {
+        ok = pack_blob(disk_path, runs, data, size, error);
+        fprintf(stderr,
+                "rombie-engine: game data: %.1f MB of disk, %.1f MB of it "
+                "the disc's (%u runs), %zu bytes, in %" PRId64 " ms\n",
+                disk_bytes / 1048576.0, disc_bytes / 1048576.0, runs->len,
+                ok ? *size : (size_t)0,
+                qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - from);
+    }
+    g_remove(disk_path);
+    g_array_free(runs, true);
+    return ok;
+}
+
+bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error)
+{
+    Error *err = NULL;
+    QEMUSnapshotInfo *info = NULL;
+    const int states = xemu_snapshots_list(&info, NULL, &err);
+    if (!err && states == 0) {
+        return read_compact_blob(data, size, error);
+    }
+    error_free(err);
+    /* A save state holds the caches as they were, and an image can't be
+     * copied with its snapshots: it goes as it is. Nothing in flight and
+     * every cache on disk, so the file is the disk. */
+    bdrv_drain_all_begin();
+    bdrv_flush_all();
+    const bool ok =
+        pack_blob(g_config.sys.files.hdd_path, NULL, data, size, error);
+    bdrv_drain_all_end();
+    return ok;
+}
+
 bool rombie_media_handoff(const char *dir, uint8_t **state, size_t *state_size,
                           uint8_t **game_data, size_t *game_data_size,
                           char **error)
@@ -660,7 +797,8 @@ bool rombie_media_handoff(const char *dir, uint8_t **state, size_t *state_size,
     const int64_t index_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - index_from;
     GArray *runs = g_array_new(false, false, sizeof(DiscRun));
     uint64_t disk_bytes = 0, disc_bytes = 0;
-    ok = copy_disk(disk_path, &index, runs, &disk_bytes, &disc_bytes, &err);
+    ok = copy_disk(blk_by_name(HDD_DEVICE), disk_path, &index, runs,
+                   &disk_bytes, &disc_bytes, &err);
     fprintf(stderr,
             "rombie-engine: netplay's disk: %.1f MB of data, %.1f MB of it "
             "the disc's (%u runs; %zu of %" PRIu64 " disc sectors known, "
@@ -679,7 +817,7 @@ bool rombie_media_handoff(const char *dir, uint8_t **state, size_t *state_size,
     uint8_t *stream = NULL;
     size_t stream_size = 0;
     ok = read_file(state_path, &stream, &stream_size, error) &&
-         pack_blob(disk_path, game_data, game_data_size, error);
+         pack_blob(disk_path, NULL, game_data, game_data_size, error);
     g_remove(state_path);
     g_remove(disk_path);
     if (!ok) {
@@ -693,14 +831,7 @@ bool rombie_media_handoff(const char *dir, uint8_t **state, size_t *state_size,
     stq_le_p(*state, (uint64_t)clock);
     stl_le_p(*state + 8, runs->len);
     stl_le_p(*state + 12, 0);
-    for (guint i = 0; i < runs->len; i++) {
-        const DiscRun *run = &g_array_index(runs, DiscRun, i);
-        uint8_t *p = *state + HANDOFF_HEADER + (size_t)i * RUN_BYTES;
-        stq_le_p(p, run->disk);
-        stl_le_p(p + 8, (uint32_t)run->sector);
-        stl_le_p(p + 12, (uint32_t)run->sectors);
-        stq_le_p(p + 16, run->check);
-    }
+    put_runs(*state + HANDOFF_HEADER, runs);
     memcpy(*state + HANDOFF_HEADER + runs_size, stream, stream_size);
     g_free(stream);
     g_array_free(runs, true);
@@ -734,7 +865,7 @@ bool rombie_media_load_handoff(const char *dir, const uint8_t *state,
         *error = g_strdup("The netplay state is cut short.");
         return false;
     }
-    if (!fill_from_disc(state + HANDOFF_HEADER, run_count, error)) {
+    if (!fill_from_disc(state + HANDOFF_HEADER, run_count, false, error)) {
         return false;
     }
     g_autofree char *path = g_build_filename(dir, "handoff-in-state.bin", NULL);

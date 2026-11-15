@@ -176,6 +176,10 @@ typedef enum {
     ROMBIE_PROF_APU_DSP_NS,  /* of APU_NS: the GP and EP */
     ROMBIE_PROF_VP_SAMPLES_NS, /* of the voices' (all workers): samples */
     ROMBIE_PROF_VP_FX_NS,    /* ... their filter and HRTF */
+    ROMBIE_PROF_SHADER_NS,   /* shaders not yet loaded: compiled or loaded
+                              * from xemu's cache, any mode */
+    ROMBIE_PROF_HELD_NS,     /* the machine held for a state or the game
+                              * data's copy, any mode */
     ROMBIE_PROF_COUNT
 } RombieProf;
 void rombie_prof_add(RombieProf what, uint64_t amount);

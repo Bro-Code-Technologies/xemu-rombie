@@ -23,10 +23,19 @@ extern "C" {
  * last call. */
 bool rombie_media_hdd_written(void);
 
-/* The game's stored object: "RXBX", u32 format (1), u32 EEPROM size,
- * u64 image size, the EEPROM, then the qcow2 image (with its save states).
- * Little-endian. g_free() the data. */
+/* The game's stored object, little-endian. g_free() the data.
+ *   Format 1, an image with save states: "RXBX", u32 1, u32 EEPROM size,
+ *     u64 image size, the EEPROM, then the qcow2 image as it is.
+ *   Format 2, one without: "RXBX", u32 2, u32 EEPROM size, u64 image size,
+ *     u32 disc runs, u32 0, the EEPROM, the runs (as the handoff's state's),
+ *     then a fresh qcow2 image without them, made from a copy of the image
+ *     file taken with the disk's I/O drained while the game runs on. */
 bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error);
+
+/* Before the machine runs: a format 2 blob's runs read from the disc into
+ * the disk, checked. */
+bool rombie_media_fill_save_runs(const uint8_t *runs, uint32_t count,
+                                 char **error);
 
 /* Page session thread: a chunk of the disc came, so its sectors are known
  * (netplay's disc runs). */

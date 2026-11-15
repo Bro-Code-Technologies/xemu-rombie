@@ -37,6 +37,7 @@
 
 #include "ui/console.h"
 #include "ui/input.h"
+#include "ui/rombie-engine.h"
 
 static QEMUSnapshotInfo *xemu_snapshots_metadata = NULL;
 static XemuSnapshotData *xemu_snapshots_extra_data = NULL;
@@ -264,7 +265,11 @@ void xemu_snapshots_save_extra_data(QEMUFile *f)
 
     size_t xbe_title_name_size = 0;
     char *xbe_title_name = NULL;
-    struct xbe *xbe_data = xemu_get_xbe_info();
+    /* Rombie's engine never shows the title. Reading it here, with the machine
+     * stopped for the save, goes through the GPU's surface access check, whose
+     * lock the stopped GPU's save holds: with a surface over the XBE header's
+     * page, as Halo 2 had at times in its opening, the save never ended. */
+    struct xbe *xbe_data = rombie_engine_enabled() ? NULL : xemu_get_xbe_info();
     if (xbe_data && xbe_data->cert) {
         glong items_written = 0;
         xbe_title_name = g_utf16_to_utf8(xbe_data->cert->m_title_name, 40, NULL, &items_written, NULL);

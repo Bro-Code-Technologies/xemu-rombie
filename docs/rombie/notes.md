@@ -114,6 +114,15 @@ Consequences for the engine:
   for Rombie's slots UI is load-bearing.
 - Snapshot shortcuts F5-F8 exist upstream (`general.snapshots.*`) but
   are irrelevant to the windowless engine.
+- **The XBE title in the extra data.** It is read from guest memory with
+  the machine stopped for the save, while the GPU's own save step holds
+  `pgraph.lock` (`nv2a_vm_state_change` takes it, `nv2a_post_save` lets
+  go). The read goes through the GPU's surface access check
+  (`surface_access_callback`), which takes the same lock, so with a
+  surface over the XBE header's page (Halo 2 had one at times in its
+  opening) the save never ended: netplay's handoff hung with its state
+  file empty, about one run in two. The engine leaves the title out
+  (`rombie_engine_enabled`); it never shows it.
 
 ## Phase 2 spike: windowless frames and sound into a canvas
 
@@ -215,16 +224,30 @@ its page leaves, and ends after 60 s when no page comes.
 `ui/rombie-engine-media.c` (+ `.h`) runs on the UI thread with the BQL
 held, as xemu's own snapshot actions do.
 
-- One blob per game, which the page stores: `RXBX`, u32 format (1), u32
-  EEPROM size, u64 image size, the EEPROM, the qcow2 image. The page sends
-  it before boot (0x08; empty means a new game: the bundled blank disk and
-  a freshly generated EEPROM); the engine validates it (header sizes, qcow2
-  magic) and refuses to boot on a bad one rather than hand back a blank
-  disk as the game's data.
+- One blob per game, which the page stores. The page sends it before boot
+  (0x08; empty means a new game: the bundled blank disk and a freshly
+  generated EEPROM); the engine validates it (header sizes, qcow2 magic)
+  and refuses to boot on a bad one rather than hand back a blank disk as
+  the game's data. Two formats (`rombie-engine-media.h`):
+  - **Format 1**, an image with save states: `RXBX`, u32 1, u32 EEPROM size,
+    u64 image size, the EEPROM, the qcow2 image as it is. Reading it: drain
+    all I/O, flush, read the qcow2 file and the EEPROM, end the drain.
+  - **Format 2**, an image without (the user's call, Rombie BRAIN-38 Phase
+    6.1): `RXBX`, u32 2, u32 EEPROM size, u64 image size, u32 disc runs,
+    u32 0, the EEPROM, the runs, then a fresh image of the disk as the guest
+    sees it without them, made as the handoff's guests' copy is (Netplay's
+    handoff, below), from a copy of the image file taken with the disk's
+    I/O drained while the game runs on. (Stopping the machine for the copy,
+    the first way, once left a game that never ran again.) A boot reads the runs
+    from the player's disc before the machine runs
+    (`rombie_engine_before_start`), checked; another disc refuses to boot.
+    Halo 2's disk, 650-900 MB once its caches fill, was over Rombie's 500 MB
+    storage cap; nearly all of it is the disc's.
+  - A state holds the caches as they were, and an image can't be copied
+    with its snapshots, so a game with states keeps format 1.
 - The engine returns the blob (0x85) a second after the game's last disk
   write outside its cache partitions, after every state change, before a
-  pause and on exit. Reading it: drain all I/O, flush, read the qcow2 file
-  and the EEPROM, end the drain.
+  pause and on exit.
   - The writes are seen at the IDE controller (`hw/ide/core.c`'s DMA and PIO
     writes call `rombie_media_hdd_write`). One inside the cache partitions
     X, Y and Z (`0x80000` to `0x8CA80000`) alone sends nothing.
@@ -350,6 +373,13 @@ boot into their matches, flat out, hashed every vblank):
   page's adaptive mode slows it by 15% when an engine falls behind and
   speeds it by 5% when every engine has more than 15% to spare (stats'
   `pace`, the time the CPU thread slept ahead of real time).
+  - The stats' `shader` is the ms spent on shaders xemu hadn't loaded yet
+    (compiled, or loaded from its cache: `pgraph_gl_bind_shaders`), in any
+    mode. A scene new to a PC holds its game while they compile, and in
+    lockstep every PC's: Halo 2's mission start compiled about 90 in 25 s
+    on each PC, and Rombie's speed rules leave that time out (Rombie
+    BRAIN-38 Phase 6.1). The stats' `held` is the same for the machine held
+    by a state saved, loaded or deleted, or by the game data's read.
 - **The GPU works ahead** (`hw/xbox/nv2a/pfifo.c`, `pgraph.c`, `nv2a.c`): a
   DMA_PUT starts the pusher at once; the CPU waits only at its old points.
   While the CPU runs, the GPU's semaphore and report writes are held
