@@ -133,6 +133,9 @@ void *rombie_lockstep_disc_read(uint64_t offset, uint64_t bytes);
 /* The read's data is in (any thread); `finish` runs at its deadline. */
 void rombie_lockstep_disc_arrived(void *read, void (*finish)(void *, int),
                                   void *opaque, int ret);
+
+/* ui/rombie-engine-media.c: the guest writes its hard disk there (hw/ide). */
+void rombie_media_hdd_write(uint64_t offset, uint64_t bytes);
 /* The state's hashes, in the order 0x86 sends them. */
 #define ROMBIE_HASH_PARTS 6
 void rombie_lockstep_hash(uint64_t out[ROMBIE_HASH_PARTS]);

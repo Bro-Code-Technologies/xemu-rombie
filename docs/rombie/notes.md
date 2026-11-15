@@ -222,9 +222,24 @@ held, as xemu's own snapshot actions do.
   magic) and refuses to boot on a bad one rather than hand back a blank
   disk as the game's data.
 - The engine returns the blob (0x85) a second after the game's last disk
-  write (the HDD BlockBackend's write counter, `ide0-hd0`), after every
-  state change, before a pause and on exit. Reading it: drain all I/O,
-  flush, read the qcow2 file and the EEPROM, end the drain.
+  write outside its cache partitions, after every state change, before a
+  pause and on exit. Reading it: drain all I/O, flush, read the qcow2 file
+  and the EEPROM, end the drain.
+  - The writes are seen at the IDE controller (`hw/ide/core.c`'s DMA and PIO
+    writes call `rombie_media_hdd_write`). One inside the cache partitions
+    X, Y and Z (`0x80000` to `0x8CA80000`) alone sends nothing.
+  - The caches are scratch space a game fills from its disc and rebuilds
+    when it must: Halo 2 streams its maps through them while it plays.
+  - Its disk is about 700 MB once they fill, and reading that back holds
+    the game a second or two. Halo 2 also writes its data partition E (at
+    about `0xABFD3000`, 1.3 MB in) every 7 s or so under random input, so
+    the cache filter alone didn't stop the reads.
+  - In netplay the blob waits (marked changed) for the session's end, the
+    next handoff (which sends it anyway), a state change or the exit: every
+    read held every PC, and the speed control took the host for behind and
+    slowed the game to its cap (Rombie BRAIN-38, Phase 6). With the hold,
+    Halo 2's netplay check stays between 6 and 12 ns. A crash mid-session
+    loses what the game saved since the last handoff.
 - Save states are xemu snapshots inside that image, one per slot, tagged
   `slot<N>@<engine version>`. A load of a state made on another version is
   refused with a `state-version` event. Thumbnails stay xemu's (inside the

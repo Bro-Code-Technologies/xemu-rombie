@@ -60,18 +60,27 @@
 
 extern int64_t rombie_handoff_clock_ns; /* system/cpu-timers.c */
 
-static uint64_t last_write_ops;
+/* The hard disk's cache partitions, X, Y and Z: scratch space a game fills
+ * from its disc and rebuilds when it must, as Halo 2 streams its maps through
+ * them while it plays. A write there alone doesn't have the game's data sent
+ * (it goes with the next send: a write elsewhere, a state change, a pause, the
+ * exit), since a send reads the whole disk back, about 700 MB for Halo 2, and
+ * in lockstep holds every PC's game while it does. */
+#define HDD_CACHE_START 0x80000ULL
+#define HDD_CACHE_END 0x8ca80000ULL
+
+static bool hdd_written;
+
+void rombie_media_hdd_write(uint64_t offset, uint64_t bytes)
+{
+    if (offset < HDD_CACHE_START || offset + bytes > HDD_CACHE_END) {
+        qatomic_set(&hdd_written, true);
+    }
+}
 
 bool rombie_media_hdd_written(void)
 {
-    BlockBackend *blk = blk_by_name(HDD_DEVICE);
-    if (!blk) {
-        return false;
-    }
-    const uint64_t ops = blk_get_stats(blk)->nr_ops[BLOCK_ACCT_WRITE];
-    const bool written = ops != last_write_ops;
-    last_write_ops = ops;
-    return written;
+    return qatomic_xchg(&hdd_written, false);
 }
 
 static void put_le32(uint8_t *p, uint32_t v)

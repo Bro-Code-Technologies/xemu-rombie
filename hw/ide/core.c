@@ -989,6 +989,7 @@ static void ide_dma_cb(void *opaque, int ret)
                                           BDRV_SECTOR_SIZE, ide_dma_cb, s);
         break;
     case IDE_DMA_WRITE:
+        rombie_media_hdd_write(offset, (uint64_t)n << BDRV_SECTOR_BITS);
         s->bus->dma->aiocb = dma_blk_write(s->blk, &s->sg, offset,
                                            BDRV_SECTOR_SIZE, ide_dma_cb, s);
         break;
@@ -1122,6 +1123,8 @@ static void ide_sector_write(IDEState *s)
 
     block_acct_start(blk_get_stats(s->blk), &s->acct,
                      n * BDRV_SECTOR_SIZE, BLOCK_ACCT_WRITE);
+    rombie_media_hdd_write(sector_num << BDRV_SECTOR_BITS,
+                           (uint64_t)n << BDRV_SECTOR_BITS);
     s->pio_aiocb = blk_aio_pwritev(s->blk, sector_num << BDRV_SECTOR_BITS,
                                    &s->qiov, 0, ide_sector_write_cb, s);
 }

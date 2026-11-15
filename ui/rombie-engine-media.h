@@ -19,7 +19,8 @@
 extern "C" {
 #endif
 
-/* True if the guest wrote its hard disk since the last call. */
+/* True if the guest wrote its hard disk outside its cache partitions since the
+ * last call. */
 bool rombie_media_hdd_written(void);
 
 /* The game's stored object: "RXBX", u32 format (1), u32 EEPROM size,

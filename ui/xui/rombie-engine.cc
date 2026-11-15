@@ -63,8 +63,10 @@
  *                  [u16 w][u16 h][u32 vblank no][RGBA]
  *   0x83 audio     [u8 type][3 pad][u32 frames][f32 stereo, 48 kHz]
  *   0x85 game data [u8 type][7 pad][blob]    (a second after the game last
- *                  wrote its hard disk, after every state change, before a
- *                  pause and on exit)
+ *                  wrote its hard disk outside its cache partitions, after
+ *                  every state change, before a pause and on exit; in
+ *                  netplay a write waits for the session's end or the exit,
+ *                  and a handoff sends it)
  *   0x86 hashes    [u8 type][3 pad][u32 vblank][u32 count][count x u64]
  *                  (lockstep, at the start of the vblank: RAM, CPU, NV2A,
  *                  APU, I/O, guest time)
@@ -301,6 +303,7 @@ static double s_hdd_written_ms;
  * slots and the current image. */
 static std::atomic<bool> s_resend_media{false};
 static void SendGameData(void);
+static void SendGameDataNow(void);
 [[noreturn]] static void RestartSelf(void);
 static uint64_t s_disc_size;
 static std::string s_disc_name;
@@ -1299,8 +1302,9 @@ static void HandleControl(const std::vector<uint8_t> &data)
     });
     if (op == CONTROL_EXIT) {
         QueueAtVblank([]() {
-            if (s_booted.load()) {
-                SendGameData();
+            /* Netplay's held game data goes now too. */
+            if (s_booted.load() && !(s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
+                SendGameDataNow();
             }
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
         });
@@ -1457,6 +1461,13 @@ static void SendGameData(void)
      * again. */
     if (rombie_engine_lockstep() && (s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
         s_hdd_dirty = false;
+        return;
+    }
+    /* Netplay: the read stalls every PC (Halo 2's 700 MB, a second or two)
+     * and a game may save every few seconds (Halo 2 does), so it waits for
+     * the session's end, a handoff, a state change or the exit. */
+    if (rombie_engine_lockstep() && !s_netplay_ended.load()) {
+        s_hdd_dirty = true;
         return;
     }
     SendGameDataNow();
@@ -1725,10 +1736,11 @@ static void HandleState(const std::vector<uint8_t> &data)
         g_free(error);
 
         SendSlots();
-        if (ok) {
+        if (ok && !(s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
             /* The image changed: a save or delete rewrote its snapshots, a
-             * load put its disk back to the state's. */
-            SendGameData();
+             * load put its disk back to the state's. The page waits for it,
+             * in netplay too (the state already held the game). */
+            SendGameDataNow();
         }
     };
     if (op == MSG_DELETE_STATE) {
