@@ -2,7 +2,7 @@
 
 How a new engine version gets from this fork to a download on GitHub. The engine
 is built and released from `github.com/Bro-Code-Technologies/xemu-rombie`
-(branch `rombie`, checked out at `C:\Users\Michael\Projects\xemu-rombie`); the
+(branch `rombie`, checked out at `C:\Users\Michael\Projects\rombie-premium-engines\xemu-rombie`); the
 build itself is in [docs/rombie/notes.md](../docs/rombie/notes.md#building-windows-target).
 This file covers what comes after the code works: the version, the zip, the
 tag, the GitHub release and promoting it.
@@ -35,7 +35,7 @@ GitHub's "latest" skips pre-releases. So:
 - A **pre-release** is invisible to players. Staging testers get its direct link.
 - An **official release** (the "latest release") is what every Rombie player is
   sent to. Promote one only after it has been checked on staging, and before the
-  `apps.rombie.sys-xbox` flag is switched on in production.
+  `apps.rombie.system.xbox` flag is switched on in production.
 
 A bug found after a release has gone out is fixed in a new version (2026.0.1),
 never by changing the files of the old one.
@@ -54,7 +54,7 @@ never by changing the files of the old one.
    step cannot replace it. Check Task Manager.
 4. **Build** (from the directory that contains the clone, Docker running):
    ```powershell
-   docker run --rm -v C:\Users\Michael\Projects\xemu-rombie:/xemu -w /xemu `
+   docker run --rm -v C:\Users\Michael\Projects\rombie-premium-engines\xemu-rombie:/xemu -w /xemu `
      -e CCACHE_DIR=/xemu/ccache ghcr.io/xemu-project/xemu-win64-toolchain:latest `
      ./build.sh -p win64-cross
    .\dist\xemu.exe --version | Out-String   # must print the new version
@@ -146,16 +146,16 @@ Setup details are in Rombie's Docs page.
 The Xbox engine is free software under the GNU GPL v2 or later, as xemu is. The source for this release is the commit tagged `rombie-xbox-engine-<version>` in this repository.
 ```
 
-### Ready to paste for 2026.0.1
+### Ready to paste for 2026.0.2
 
 ```markdown
-## Rombie Xbox Engine 2026.0.1
+## Rombie Xbox Engine 2026.0.2
 
 The Xbox engine is the small Windows program that runs original Xbox games for [Rombie](https://rombie.app). You install it once. After that, Rombie starts it whenever you play an Xbox game, and the game plays on Rombie's page like any other console.
 
 ### Install
 
-1. Download `rombie-xbox-engine-2026.0.1-windows-x64.zip` below and unzip it into a folder you'll keep.
+1. Download `rombie-xbox-engine-2026.0.2-windows-x64.zip` below and unzip it into a folder you'll keep.
 2. Run `rombie-xbox-engine.exe` once. It isn't code-signed, so if Windows says it protected your PC, choose **More info**, then **Run anyway**. The engine tells you when it's set up.
 3. Play an Xbox game in Rombie. The first time, your browser asks to open Rombie Xbox Engine: tick **Always allow** and open it. It may also ask whether the site can access other apps and services on your device: allow that too.
 
@@ -172,7 +172,7 @@ Setup details are in Rombie's Docs page.
 
 ### About this release
 
-- New in 2026.0.1: the engine no longer asks GitHub for xemu updates when it starts, so it makes no internet connection at all. Save states made on 2026.0.0 can't be loaded by this version (Rombie shows which version made each one); in-game saves carry over.
+- New in 2026.0.2: the engine also accepts Rombie running on your own computer for development (ports 10020 to 10029), in place of the old port 5173. Nothing changes for play on rombie.app. Save states made on 2026.0.1 can't be loaded by this version (Rombie shows which version made each one); in-game saves carry over.
 - Built from xemu, with Rombie's engine mode and a few small hooks, all on the `rombie` branch of this repository.
 - Runs without a window and talks to Rombie only over your own computer.
 - Includes xemu-dashboard's blank hard disk image, which every game's own disk starts from. It contains no Microsoft code.
@@ -180,5 +180,5 @@ Setup details are in Rombie's Docs page.
 
 ### License and source
 
-The Xbox engine is free software under the GNU GPL v2 or later, as xemu is. The source for this release is the commit tagged `rombie-xbox-engine-2026.0.1` in this repository.
+The Xbox engine is free software under the GNU GPL v2 or later, as xemu is. The source for this release is the commit tagged `rombie-xbox-engine-2026.0.2` in this repository.
 ```
