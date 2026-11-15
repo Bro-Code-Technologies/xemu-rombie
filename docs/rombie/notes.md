@@ -379,7 +379,11 @@ boot into their matches, flat out, hashed every vblank):
     lockstep every PC's: Halo 2's mission start compiled about 90 in 25 s
     on each PC, and Rombie's speed rules leave that time out (Rombie
     BRAIN-38 Phase 6.1). The stats' `held` is the same for the machine held
-    by a state saved, loaded or deleted, or by the game data's read.
+    by a state saved, loaded or deleted, or by the game data's read. Their
+    `lw` counts a wait for input still going up to the moment they're
+    taken: counted only at its end, another PC's handoff (seconds) read as
+    seconds with nothing run and nothing waited for, which Rombie's slow
+    rule took for the PC's own slowness (Phase 7's second two-PC run).
 - **The GPU works ahead** (`hw/xbox/nv2a/pfifo.c`, `pgraph.c`, `nv2a.c`): a
   DMA_PUT starts the pusher at once; the CPU waits only at its old points.
   While the CPU runs, the GPU's semaphore and report writes are held

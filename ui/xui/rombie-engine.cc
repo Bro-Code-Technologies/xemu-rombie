@@ -501,6 +501,9 @@ struct Stats {
     std::atomic<uint64_t> disc_bytes{0};
     std::atomic<uint64_t> disc_wait_us{0};
     std::atomic<uint64_t> lockstep_wait_us{0}; /* waiting for input */
+    /* A wait for input still going: the monotonic us it was last counted
+     * from (0 for none), so a long one shows in each second it lasts. */
+    std::atomic<int64_t> lockstep_wait_mark_us{0};
     std::atomic<uint64_t> lockstep_pace_us{0}; /* ahead of real time */
     std::atomic<uint32_t> width{0}, height{0};
 };
@@ -2072,8 +2075,20 @@ static void SenderThread(void)
             const uint32_t reads = s_stats.disc_reads.exchange(0);
             const uint64_t read_bytes = s_stats.disc_bytes.exchange(0);
             const uint64_t read_us = s_stats.disc_wait_us.exchange(0);
-            const uint64_t lockstep_wait_us =
-                s_stats.lockstep_wait_us.exchange(0);
+            uint64_t lockstep_wait_us = s_stats.lockstep_wait_us.exchange(0);
+            /* A wait still going counts up to now: another PC's handoff
+             * holds this one for seconds, and counted only at its end it
+             * read as seconds with nothing run and nothing waited for, which
+             * the page's slow rule took for this PC's own slowness. */
+            {
+                const int64_t stats_now = g_get_monotonic_time();
+                int64_t mark = s_stats.lockstep_wait_mark_us.load();
+                if (mark && stats_now > mark &&
+                    s_stats.lockstep_wait_mark_us.compare_exchange_strong(
+                        mark, stats_now)) {
+                    lockstep_wait_us += (uint64_t)(stats_now - mark);
+                }
+            }
             /* The game's own frame rate, and the GPU's work, solo or
              * lockstep. */
             const uint64_t flips = rombie_prof_take(ROMBIE_PROF_FLIPS);
@@ -3026,7 +3041,7 @@ bool rombie_engine_lockstep_vblank(void)
      * the UI thread, disc reads, a stop. */
     LockstepInput input;
     bool have = false;
-    const double wait_from = NowMs();
+    s_stats.lockstep_wait_mark_us.store(g_get_monotonic_time());
     rombie_lockstep_unlock();
     {
         std::unique_lock<std::mutex> lock(s_input_mutex);
@@ -3054,8 +3069,13 @@ bool rombie_engine_lockstep_vblank(void)
         }
     }
     double now = NowMs();
-    s_stats.lockstep_wait_us.fetch_add((uint64_t)((now - wait_from) * 1000.0),
-                                       std::memory_order_relaxed);
+    /* What the stats haven't counted of the wait yet. */
+    const int64_t wait_mark = s_stats.lockstep_wait_mark_us.exchange(0);
+    const int64_t wait_left = (int64_t)(now * 1000.0) - wait_mark;
+    if (wait_mark && wait_left > 0) {
+        s_stats.lockstep_wait_us.fetch_add((uint64_t)wait_left,
+                                           std::memory_order_relaxed);
+    }
 
     /* Real time at fixed deadlines from an anchor, so a late vblank's time
      * is made back over the ones after it. */
