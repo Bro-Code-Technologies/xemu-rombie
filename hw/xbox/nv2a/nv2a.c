@@ -627,6 +627,66 @@ const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
     }
 };
 
+/*
+ * The vertex attributes' formats, offsets and inline values, which the state
+ * above leaves out: after a load every attribute read as unset until the game
+ * set it again, and Halo 2 drew an inline array first after a netplay
+ * resync, which divided by its vertex size of 0 (Rombie BRAIN-38). A
+ * subsection, so a state without it loads as before.
+ */
+static int nv2a_vertex_attributes_pre_save(void *opaque)
+{
+    NV2AState *d = opaque;
+    for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        const VertexAttribute *attr = &d->pgraph.vertex_attributes[i];
+        uint32_t *saved = d->pgraph.vertex_attributes_saved[i];
+        saved[0] = attr->dma_select;
+        saved[1] = (uint32_t)attr->offset;
+        saved[2] = attr->format;
+        saved[3] = attr->size;
+        saved[4] = attr->count;
+        saved[5] = attr->stride;
+        memcpy(&saved[6], attr->inline_value, sizeof(attr->inline_value));
+    }
+    return 0;
+}
+
+static int nv2a_vertex_attributes_post_load(void *opaque, int version_id)
+{
+    NV2AState *d = opaque;
+    PGRAPHState *pg = &d->pgraph;
+    pg->compressed_attrs = 0;
+    for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        VertexAttribute *attr = &pg->vertex_attributes[i];
+        const uint32_t *saved = pg->vertex_attributes_saved[i];
+        attr->dma_select = saved[0];
+        attr->offset = saved[1];
+        attr->format = saved[2];
+        attr->size = saved[3];
+        attr->count = saved[4];
+        attr->stride = saved[5];
+        memcpy(attr->inline_value, &saved[6], sizeof(attr->inline_value));
+        attr->inline_buffer_populated = false;
+        if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP) {
+            pg->compressed_attrs |= 1 << i;
+        }
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_nv2a_vertex_attributes_saved = {
+    .name = "nv2a/pgraph/vertex-attributes",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = nv2a_vertex_attributes_pre_save,
+    .post_load = nv2a_vertex_attributes_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_2DARRAY(pgraph.vertex_attributes_saved, NV2AState,
+                               NV2A_VERTEXSHADER_ATTRIBUTES, 10),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_nv2a = {
     .name = "nv2a",
     .version_id = 5,
@@ -755,6 +815,10 @@ static const VMStateDescription vmstate_nv2a = {
         VMSTATE_BUFFER_UNSAFE(pgraph.vsh_carry_fog, NV2AState, 5,
                               sizeof(((PGRAPHState *)0)->vsh_carry_fog)),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_nv2a_vertex_attributes_saved,
+        NULL
     },
 };
 

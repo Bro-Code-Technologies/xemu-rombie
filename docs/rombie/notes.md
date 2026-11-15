@@ -534,6 +534,24 @@ into a machine that has never run.
   and a GPU running ahead first does all it was given, as if the CPU waited
   for it (`pfifo_lockstep_reset`), so its held writes land before the
   registers go.
+- **A save leaves the DSPs as they were.** A host's state save put it out
+  of step a second or three later in two runs of about fifteen (Rombie
+  BRAIN-38 Phase 7). The stop for it
+  copies both DSPs into their saved form (`dsp_sync_to_vm`), and every
+  resume put that copy back into the JIT (`dsp_sync_from_vm`), which isn't
+  exact: the power state set to running, interrupts beyond four lost, and
+  the old snapshots' fix-ups applied to live registers (an M of `$00FFFF`
+  made `$FFFFFF`, an N with bit 15 set sign-extended). The resume puts it
+  back only at the first start and after a load (`dsp_from_vm`). The copy
+  also read the DMA's control register, which counts as the guest polling
+  it (a third poll stops the DMA); it takes the register as it is.
+- **A state carries the vertex attributes.** xemu's state leaves them out
+  (`vmstate_nv2a_pgraph_vertex_attributes` has no fields), so after a load
+  every attribute read as unset until the game set it again, and after a
+  netplay resync Halo 2 drew an inline array first and divided by its vertex
+  size of 0 (`pgraph_gl_bind_inline_array`). An nv2a subsection carries each
+  one's format, size, count, stride, offset and inline value; a state
+  without it loads as before.
 - **What only the host does.** In lockstep a save, a load, a pause, the
   host's handoff and exit run on the UI thread while the CPU holds at a vblank
   (`QueueAtVblank`), where the GPU has done all it was given: stopped

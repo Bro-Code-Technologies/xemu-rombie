@@ -84,6 +84,9 @@ typedef struct MCPXAPUState {
     QemuCond idle_cond;
     bool pause_requested;
     bool is_idle;
+    /* The DSPs' saved copy (DspCoreState) is newer than the JIT's own state:
+     * at the first start, and after a load, the resume puts it in the JIT. */
+    bool dsp_from_vm;
 
     /* Rombie's lockstep (ROMBIE_SYNC_APU): frames run on the CPU thread
      * from a guest-time timer, and the frame thread stays idle. */

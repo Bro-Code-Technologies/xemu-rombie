@@ -607,11 +607,19 @@ static void mcpx_apu_vm_state_change(void *opaque, bool running, RunState state)
         bql_lock();
     } else {
         qemu_mutex_lock(&d->lock);
-        if (d->gp.dsp) {
-            dsp_sync_from_vm(d->gp.dsp);
-        }
-        if (d->ep.dsp) {
-            dsp_sync_from_vm(d->ep.dsp);
+        /* Only a load changes the saved copy. Put back after a save or a
+         * pause, the round trip isn't exact (the power state, interrupts
+         * beyond four, the old snapshots' M and N register fix-ups applied
+         * to live registers), and a netplay host's DSPs, after it saved a
+         * state, ran on differently from every guest's (Rombie BRAIN-38). */
+        if (d->dsp_from_vm) {
+            if (d->gp.dsp) {
+                dsp_sync_from_vm(d->gp.dsp);
+            }
+            if (d->ep.dsp) {
+                dsp_sync_from_vm(d->ep.dsp);
+            }
+            d->dsp_from_vm = false;
         }
         mcpx_apu_resume(d);
         qemu_mutex_unlock(&d->lock);
@@ -623,6 +631,7 @@ static int mcpx_apu_pre_load(void *opaque)
     MCPXAPUState *d = opaque;
     qemu_mutex_lock(&d->lock);
     mcpx_apu_reset_locked(d);
+    d->dsp_from_vm = true;
     qemu_mutex_unlock(&d->lock);
     return 0;
 }
@@ -685,6 +694,8 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
         timer_mod_ns(d->lockstep_timer, LOCKSTEP_FRAME_NS(1));
     }
 
+    /* The first start puts the saved copy in, as every resume did. */
+    d->dsp_from_vm = true;
     qemu_add_vm_change_state_handler(mcpx_apu_vm_state_change, d);
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread", mcpx_apu_frame_thread,
                        d, QEMU_THREAD_JOINABLE);

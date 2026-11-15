@@ -219,6 +219,9 @@ typedef struct PGRAPHState {
     float point_params[8];
 
     VertexAttribute vertex_attributes[NV2A_VERTEXSHADER_ATTRIBUTES];
+    /* The attributes as a state carries them (nv2a.c's subsection): packed
+     * at the save, put back at the load. */
+    uint32_t vertex_attributes_saved[NV2A_VERTEXSHADER_ATTRIBUTES][10];
     uint16_t compressed_attrs;
     uint16_t uniform_attrs;
     uint16_t swizzle_attrs;
