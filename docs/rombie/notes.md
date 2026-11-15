@@ -600,3 +600,60 @@ runs from a USB hard drive at 94 MB/s. `lockstep-test.html`'s
 `xboxLockstep.handoff` (`lockstep-run.py --handoff`) checks it: A plays alone
 or in lockstep, hosts and restarts, B joins fresh, A saves a state on the
 way and then hosts again (a resync), hashes compared every vblank.
+
+## System Link (Rombie BRAIN-38, Phase 8)
+
+In engine mode the network card (nvnet, on hub 0 as the machine's default
+NIC) gets one more port on that hub: `hw/xbox/rombie-link.c`'s client, whose
+frames go to the page and come back from it. Nothing else is ever connected:
+`system/vl.c` makes no xemu netdev (NAT, UDP, pcap) in engine mode, whatever
+the engine's own `xemu.toml` says.
+
+- **Messages** (protocol 4): 0x11 page to engine and 0x89 engine to page,
+  each `[u8 type][3 pad][Ethernet frame]`, numbers none of Rombie's engines
+  used, so the PS2 engine can take the same (BRAIN-43). 0x04's ops 5 and 6
+  put the cable in and out, before boot or while the game runs, and the
+  engine answers with the `link-cable` event, `in` or `out`. Every engine
+  starts with it out, and lockstep never links (op 5 counts as out).
+- **The cable** is QEMU's link state on `nvnet.0` (`qmp_set_link`), which
+  nvnet reports to the game as a PHY link change. Halo 2 showed "Connection
+  lost ... make sure your cable is not disconnected" the moment it came out
+  mid-match, and with it back in the console was at its main menu, ready to
+  find games again. System Link turns on and off with no reboot.
+- **Threads.** A frame from the page arrives on the socket's thread and
+  queues (512 at most; a burst past that is dropped, as a switch would) for a
+  bottom half on QEMU's main loop, which hands it to the card under the BQL.
+  The card's frames come out on the CPU thread under the BQL and join the
+  sender thread's queue, ahead of pictures and sound, as lockstep's do.
+- **Addresses.** A console's MAC is its EEPROM's (`00:50:f2` and three
+  random bytes, `eeprom_generation.c`), made with the game's data, so two
+  players' consoles differ; every test console had its own. No DHCP server is
+  needed: an Xbox asks for an address (a 342-byte DHCP discover every second
+  or two for its first ~30 s), gets no answer, and Halo 2 and TimeSplitters 2
+  find each other anyway.
+- **Stats.** The stats line's `link` is the second's frames from the page and
+  their bytes, then those to it.
+
+Checked on the main PC with Rombie's `engine/xbox/system-link-test.html`
+(two to four engines, each with new game data, the page a learning switch
+with an added delay; a driver over DevTools' `Runtime.evaluate` alone, since
+an attached Playwright records every frame of video and Chrome grew to
+9.6 GB):
+- **Halo 2, two consoles:** the second listed the first's game ("Pregame
+  (open)"), joined its lobby and played a Slayer match on Ivory Tower, both
+  clocks in step, with 0, 50 and 100 ms added each way. About 30 frames a
+  second each way in the match (the host 2.6-2.7 KB/s, the other 2.4 KB/s),
+  1-4 in the lobby.
+- **TimeSplitters 2, two consoles** (Arcade, System Link): the second found
+  the first's Deathmatch ("1/16 Players"), joined, and both played Mexican
+  Mission, each on the other's radar, at 0, 50 and 100 ms. 10-12 frames a
+  second each way, 0.7-1.0 KB/s.
+- **Halo 2, four consoles:** all four in one lobby ("4 player(s) in party")
+  and then in one match, every console at 60 vblanks a second. The host sent
+  87-90 frames a second (9.4-9.7 KB/s) and took 90 (7.4 KB/s); each other
+  console 30 each way (2.4-3.3 KB/s).
+- While linked, `Get-NetTCPConnection` showed each engine with its
+  127.0.0.1 listener and the page's loopback connection alone, and
+  `Get-NetUDPEndpoint` nothing.
+- With the backend present and the cable out, `lockstep-run.py` matched
+  every vblank of 7,200 in TimeSplitters 2 and in Halo 2.

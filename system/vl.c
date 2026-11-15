@@ -2869,7 +2869,11 @@ void qmp_x_exit_preconfig(Error **errp)
     qemu_create_cli_devices();
 
 #ifdef XBOX
-    if (g_config.net.enable) {
+    if (rombie_engine_enabled()) {
+        /* The page is the only network (System Link); the engine makes no
+         * connection of its own. */
+        rombie_link_init();
+    } else if (g_config.net.enable) {
         xemu_net_enable();
     } else {
         xemu_net_disable();

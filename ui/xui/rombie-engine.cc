@@ -12,7 +12,10 @@
  *                  [f32 rx][f32 ry][f32 lt][f32 rt]        (player 0-3)
  *   0x04 control   [u8 type][u8 op]          (1 pause, 2 resume, 3 exit,
  *                  4 restart: the engine starts itself again, with the same
- *                  key and port, and ends; the page connects again)
+ *                  key and port, and ends; the page connects again;
+ *                  5 System Link's cable in, 6 out, before boot or while the
+ *                  game runs, never in lockstep; the engine answers with the
+ *                  link-cable event, "in" or "out")
  *   0x05 ping      [u8 type][7 pad][f64 page time, ms]
  *   0x06 save state   [u8 type][u8 slot]     (1-255; replaces the slot)
  *   0x07 load state   [u8 type][u8 slot]
@@ -57,6 +60,8 @@
  *                  (lockstep: from that vblank on; every engine needs the
  *                  same before it gets there, so the page slows or speeds
  *                  the guest's CPU for all to what the slowest keeps up with)
+ *   0x11 link frame [u8 type][3 pad][Ethernet frame, 14-1518 bytes]
+ *                  (System Link: for the network card, with the cable in)
  * Engine to page (binary):
  *   0x81 disc read [u8 type][3 pad][u32 request id][u64 offset][u32 length]
  *   0x82 frame     [u8 type][3 pad][u32 frame no][f64 engine time, ms]
@@ -82,8 +87,12 @@
  *                  check), which each PC reads from its own disc, and the
  *                  machine's state, without the BIOS, which each PC has its
  *                  own of)
+ *   0x89 link frame [u8 type][3 pad][Ethernet frame] (System Link: what the
+ *                  network card sent, with the cable in; the page is the
+ *                  switch that takes it to the other consoles)
  * Engine to page (text, JSON): hello, event, stats (once a second: with
- * flips, the game's own frames, and lw, the ms lockstep waited for input),
+ * flips, the game's own frames, lw, the ms lockstep waited for input, and
+ * link, System Link's frames and bytes from the page and to it),
  * pong, and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after
  * boot and after every state change. In lockstep, prof (once a second,
  * before stats) says where the CPU thread's time went.
@@ -173,8 +182,8 @@ static std::atomic<uint32_t> s_dump_at{UINT32_MAX};
 #include "../rombie-engine-version.h"
 
 /* 2: lockstep (0x0B, 0x0C, 0x86, 0x87, lw in the stats). 3: netplay (0x0D,
- * 0x88, restart). */
-static constexpr int PROTOCOL_VERSION = 3;
+ * 0x88, restart). 4: System Link (0x11, 0x89, the cable's 0x04 ops). */
+static constexpr int PROTOCOL_VERSION = 4;
 static constexpr uint16_t ENGINE_PORT = 47653;
 
 static constexpr uint8_t MSG_BOOT = 0x01;
@@ -192,6 +201,7 @@ static constexpr uint8_t MSG_INPUTS = 0x0C;
 static constexpr uint8_t MSG_NETPLAY = 0x0D;
 static constexpr uint8_t MSG_SPEED_AT = 0x0F;
 static constexpr uint8_t MSG_DUMP_AT = 0x10; /* development */
+static constexpr uint8_t MSG_LINK_FRAME = 0x11;
 static constexpr uint8_t MSG_DISC_READ = 0x81;
 static constexpr uint8_t MSG_FRAME = 0x82;
 static constexpr uint8_t MSG_AUDIO = 0x83;
@@ -199,6 +209,7 @@ static constexpr uint8_t MSG_GAME_DATA_SAVED = 0x85;
 static constexpr uint8_t MSG_HASHES = 0x86;
 static constexpr uint8_t MSG_VBLANK = 0x87;
 static constexpr uint8_t MSG_NETPLAY_STATE = 0x88;
+static constexpr uint8_t MSG_LINK_FRAME_OUT = 0x89;
 
 static constexpr uint8_t NETPLAY_HOST = 1;
 static constexpr uint8_t NETPLAY_JOIN = 2;
@@ -226,6 +237,8 @@ static constexpr uint8_t CONTROL_PAUSE = 1;
 static constexpr uint8_t CONTROL_RESUME = 2;
 static constexpr uint8_t CONTROL_EXIT = 3;
 static constexpr uint8_t CONTROL_RESTART = 4;
+static constexpr uint8_t CONTROL_LINK_IN = 5;
+static constexpr uint8_t CONTROL_LINK_OUT = 6;
 
 static constexpr size_t FRAME_HEADER = 24;
 static constexpr size_t AUDIO_HEADER = 8;
@@ -506,8 +519,13 @@ struct Stats {
     std::atomic<int64_t> lockstep_wait_mark_us{0};
     std::atomic<uint64_t> lockstep_pace_us{0}; /* ahead of real time */
     std::atomic<uint32_t> width{0}, height{0};
+    /* System Link's frames from the page and to it, and their bytes. */
+    std::atomic<uint32_t> link_in{0}, link_out{0};
+    std::atomic<uint64_t> link_in_bytes{0}, link_out_bytes{0};
 };
 static Stats s_stats;
+/* System Link's cable, as the page last set it (0x04): out until then. */
+static std::atomic<bool> s_link_cable{false};
 
 static double NowMs(void)
 {
@@ -1292,6 +1310,19 @@ static void HandleControl(const std::vector<uint8_t> &data)
         });
         return;
     }
+    if (op == CONTROL_LINK_IN || op == CONTROL_LINK_OUT) {
+        /* Lockstep's machines must see the same, so it never links. */
+        const bool in = op == CONTROL_LINK_IN && !rombie_engine_lockstep();
+        s_link_cable.store(in);
+        /* Before boot the machine takes it as it's made (rombie_link_init). */
+        QueueWork([in]() {
+            if (s_link_cable.load() == in) {
+                rombie_link_set_cable(in);
+            }
+        });
+        SendEvent("link-cable", in ? "in" : "out");
+        return;
+    }
     QueueWork([op]() {
         if (!s_vm_ready.load()) {
             return;
@@ -1819,6 +1850,14 @@ static void HandleBinary(const std::vector<uint8_t> &message)
             s_dump_at.store(ReadValue<uint32_t>(message, 4));
         }
         break;
+    case MSG_LINK_FRAME:
+        if (message.size() > 4 && s_link_cable.load()) {
+            s_stats.link_in.fetch_add(1, std::memory_order_relaxed);
+            s_stats.link_in_bytes.fetch_add(message.size() - 4,
+                                            std::memory_order_relaxed);
+            rombie_link_from_page(message.data() + 4, message.size() - 4);
+        }
+        break;
     default:
         break;
     }
@@ -2139,7 +2178,11 @@ static void SenderThread(void)
                 last_insns = insns;
                 SendText(prof);
             }
-            char stats[640];
+            const uint32_t link_in = s_stats.link_in.exchange(0);
+            const uint32_t link_out = s_stats.link_out.exchange(0);
+            const uint64_t link_in_bytes = s_stats.link_in_bytes.exchange(0);
+            const uint64_t link_out_bytes = s_stats.link_out_bytes.exchange(0);
+            char stats[768];
             snprintf(stats, sizeof(stats),
                      "{\"t\":\"stats\",\"ms\":%.0f,\"lw\":%.0f,"
                      "\"pace\":%.0f,\"ns\":%.4g,\"shader\":%.0f,\"held\":%.0f,"
@@ -2150,7 +2193,8 @@ static void SenderThread(void)
                      "\"fps\":%.1f,\"mbps\":%.1f,"
                      "\"readback_us\":%u,\"drop\":%u,\"audio\":%u,"
                      "\"overflow\":%u,\"dr\":%u,\"drBytes\":%llu,"
-                     "\"drMs\":%.2f,\"w\":%u,\"h\":%u}",
+                     "\"drMs\":%.2f,\"w\":%u,\"h\":%u,"
+                     "\"link\":[%u,%llu,%u,%llu]}",
                      seconds * 1000.0, lockstep_wait_us / 1000.0,
                      s_stats.lockstep_pace_us.exchange(0) / 1000.0,
                      s_speed_q16.load() / 16.0, shader_ns / 1e6, held_ns / 1e6,
@@ -2163,7 +2207,9 @@ static void SenderThread(void)
                      dropped, audio_frames, overflow, reads,
                      (unsigned long long)read_bytes,
                      reads ? read_us / 1000.0 / reads : 0.0,
-                     s_stats.width.load(), s_stats.height.load());
+                     s_stats.width.load(), s_stats.height.load(), link_in,
+                     (unsigned long long)link_in_bytes, link_out,
+                     (unsigned long long)link_out_bytes);
             SendText(stats);
         }
     }
@@ -2966,6 +3012,31 @@ static void SendVblank(uint32_t vblank)
     uint8_t msg[8] = { MSG_VBLANK };
     memcpy(msg + 4, &vblank, 4);
     QueueLockstepMessage(msg, sizeof(msg));
+}
+
+/* hw/xbox/rombie-link.c, BQL held: the card's frame goes out ahead of
+ * pictures and sound, as lockstep's messages do. */
+void rombie_engine_link_to_page(const uint8_t *frame, size_t size)
+{
+    if (!s_page_connected.load(std::memory_order_acquire) ||
+        !s_link_cable.load()) {
+        return;
+    }
+    std::vector<uint8_t> msg(4 + size);
+    msg[0] = MSG_LINK_FRAME_OUT;
+    memcpy(msg.data() + 4, frame, size);
+    {
+        std::unique_lock<std::mutex> lock(s_lockstep_out_mutex);
+        s_lockstep_out.push_back(std::move(msg));
+    }
+    s_wake.notify_one();
+    s_stats.link_out.fetch_add(1, std::memory_order_relaxed);
+    s_stats.link_out_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+bool rombie_engine_link_cable(void)
+{
+    return s_link_cable.load();
 }
 
 /* Development: ROMBIE_ICOUNT_NS="vblank:ns,..." sets the guest time an

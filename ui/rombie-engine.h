@@ -58,6 +58,19 @@ void rombie_engine_before_start(void);
  * queued control work (pause, resume, exit) safely. */
 void rombie_engine_run_pending(void);
 
+/* System Link (hw/xbox/rombie-link.c): the network card's frames go to the
+ * page and the page's come back; nothing else is connected. */
+/* system/vl.c, engine mode, once the machine exists: join the card's hub. */
+void rombie_link_init(void);
+/* Main-loop lock held: the cable in or out, while a game runs too. */
+void rombie_link_set_cable(bool in);
+/* Any thread: a frame from the page (0x11), for the card. */
+void rombie_link_from_page(const uint8_t *frame, size_t size);
+/* ui/xui/rombie-engine.cc: a frame the card sent, for the page (0x89), and
+ * whether the page has the cable in (0x04). */
+void rombie_engine_link_to_page(const uint8_t *frame, size_t size);
+bool rombie_engine_link_cable(void);
+
 /* UI thread, GL context current: capture the framebuffer texture. */
 void rombie_engine_capture(uint32_t tex, bool flip);
 
