@@ -552,6 +552,18 @@ into a machine that has never run.
   size of 0 (`pgraph_gl_bind_inline_array`). An nv2a subsection carries each
   one's format, size, count, stride, offset and inline value; a state
   without it loads as before.
+- **No warp while the CPU is stopped.** The DSP fix didn't cure the save's
+  fault: two-sided runs with a save every 200 vblanks still went out of
+  step, about one save in 25, at the first checkpoint after one, with RAM,
+  CPU, APU and time all differing. A trace of every vblank caught a host
+  hung inside a save's `vm_start`. The rr loop turns QEMU_CLOCK_VIRTUAL back
+  on each time round, and a stopped CPU counts as idle. So between
+  `vm_start`'s run state and its `resume_all_vcpus`, when NV2A's resume
+  handler let go of the BQL, the CPU thread warped guest time to its next
+  deadline and ran the timers there (APU frames, even a vblank) with no
+  instruction run. Usually it lost the race and nothing happened. The idle
+  warp (`icount_warp_in_vcpu`) and the main loop's (`icount_start_warp_timer`)
+  now wait while any CPU is stopped.
 - **What only the host does.** In lockstep a save, a load, a pause, the
   host's handoff and exit run on the UI thread while the CPU holds at a vblank
   (`QueueAtVblank`), where the GPU has done all it was given: stopped
@@ -573,7 +585,10 @@ into a machine that has never run.
   there, so the test page's DevTools connection never carries Halo 2's disk.
   With `ROMBIE_LOCKSTEP_READBACK_MS` set, a speed test (which sends no game
   data) still reads its game data back that often while it runs, and drops
-  it.
+  it. With `ROMBIE_LOCKSTEP_TRACE=1` on every engine, each vblank's
+  instruction count, guest time, EIP and CPU, GPU, APU and I/O hashes (RAM
+  every fifth) go into the log, with how a held vblank ended at a stop, and
+  the save's own times.
 
 Figures (main PC): TimeSplitters 2's state is 61-62 MB (8.1-8.5 MB
 gzipped), the guests' game data 3.1 MB (0.9 MB), the host's stop and copy

@@ -3032,9 +3032,12 @@ bool rombie_engine_lockstep_vblank(void)
         if (s_hash_every && vblank % s_hash_every == 0) {
             SendHashes(vblank);
         }
+        rombie_lockstep_trace(vblank);
         const uint64_t send_from = rombie_prof_now();
         SendVblank(vblank);
         rombie_prof_add(ROMBIE_PROF_SEND_NS, rombie_prof_now() - send_from);
+    } else if (!ended) {
+        rombie_lockstep_trace_time(vblank, "again");
     }
 
     /* The rest of the machine runs on while this waits: the page's work on
@@ -3067,6 +3070,10 @@ bool rombie_engine_lockstep_vblank(void)
             }
             s_input_cv.wait_for(lock, std::chrono::milliseconds(5));
         }
+    }
+    if (rombie_lockstep_tracing() && rombie_lockstep_stopping()) {
+        fprintf(stderr, "rombie-trace %u stopping: %s\n", vblank,
+                have ? "input there, the vblank ends" : "no input, again later");
     }
     double now = NowMs();
     /* What the stats haven't counted of the wait yet. */

@@ -169,6 +169,42 @@ void rombie_lockstep_hash(uint64_t out[ROMBIE_HASH_PARTS])
     rombie_prof_add(ROMBIE_PROF_HASH_NS, get_clock() - from);
 }
 
+bool rombie_lockstep_tracing(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *value = getenv("ROMBIE_LOCKSTEP_TRACE");
+        on = value && value[0] == '1';
+    }
+    return on;
+}
+
+/* Development (ROMBIE_LOCKSTEP_TRACE=1, on every PC): each vblank's parts in
+ * the log, RAM every fifth, to find the vblank two PCs part at. */
+void rombie_lockstep_trace(uint32_t vblank)
+{
+    if (!rombie_lockstep_tracing()) {
+        return;
+    }
+    const uint32_t eip = first_cpu ? (uint32_t)X86_CPU(first_cpu)->env.eip : 0;
+    fprintf(stderr,
+            "rombie-trace %u raw %" PRId64 " vns %" PRId64 " eip %08x cpu %016"
+            PRIx64 " gpu %016" PRIx64 " apu %016" PRIx64 " io %016" PRIx64
+            " ram %016" PRIx64 "\n",
+            vblank, icount_get_raw(), qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+            eip, hash_cpu(), nv2a_lockstep_hash(), mcpx_apu_lockstep_hash(),
+            hash_io(), vblank % 5 == 0 ? nv2a_lockstep_ram_hash() : 0);
+}
+
+void rombie_lockstep_trace_time(uint32_t vblank, const char *what)
+{
+    if (rombie_lockstep_tracing()) {
+        fprintf(stderr, "rombie-trace %u %s at raw %" PRId64 " vns %" PRId64
+                "\n", vblank, what, icount_get_raw(),
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+}
+
 static uint64_t prof[ROMBIE_PROF_COUNT];
 
 void rombie_prof_add(RombieProf what, uint64_t amount)

@@ -939,7 +939,9 @@ bool rombie_media_save_state(int slot, const char *engine_version,
      * state then holds memory as the game left it, and a surface the game
      * doesn't draw again after a load shows its old pixels. */
     nv2a_save_keeps_surfaces = rombie_engine_lockstep();
+    rombie_lockstep_trace_time(0, "save begins");
     xemu_snapshots_save(tag, &err);
+    rombie_lockstep_trace_time(0, "save ends");
     nv2a_save_keeps_surfaces = false;
     g_free(tag);
     if (err) {

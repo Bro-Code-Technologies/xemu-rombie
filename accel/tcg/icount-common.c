@@ -332,9 +332,30 @@ static void icount_timer_cb(void *opaque)
  * cost two thread wake-ups, and on Windows that ran the guest at a sixth of
  * its speed. Returns whether it warped.
  */
+/*
+ * A stopped CPU counts as idle, and the rr loop turns QEMU_CLOCK_VIRTUAL back
+ * on each time round, but no warp may go on then: between vm_start's run
+ * state and its resume_all_vcpus the devices' handlers run, NV2A's lets go
+ * of the BQL, and a warp there moved guest time on with no instruction run.
+ * Only the netplay host saved, so only it ran on differently, now and then
+ * (Rombie BRAIN-38).
+ */
+static bool icount_cpus_stopped(void)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (cpu->stop || cpu->stopped) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool icount_warp_in_vcpu(void)
 {
-    if (!all_cpu_threads_idle() || !icount_warp_to_deadline()) {
+    if (!all_cpu_threads_idle() || icount_cpus_stopped() ||
+        !icount_warp_to_deadline()) {
         return false;
     }
     qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
@@ -381,7 +402,7 @@ void icount_start_warp_timer(void)
      * Nothing to do if the VM is stopped: QEMU_CLOCK_VIRTUAL timers
      * do not fire, so computing the deadline does not make sense.
      */
-    if (!runstate_is_running()) {
+    if (!runstate_is_running() || icount_cpus_stopped()) {
         return;
     }
 

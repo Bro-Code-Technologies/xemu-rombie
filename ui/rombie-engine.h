@@ -139,6 +139,9 @@ void rombie_media_hdd_write(uint64_t offset, uint64_t bytes);
 /* The state's hashes, in the order 0x86 sends them. */
 #define ROMBIE_HASH_PARTS 6
 void rombie_lockstep_hash(uint64_t out[ROMBIE_HASH_PARTS]);
+bool rombie_lockstep_tracing(void);
+void rombie_lockstep_trace(uint32_t vblank);
+void rombie_lockstep_trace_time(uint32_t vblank, const char *what);
 uint64_t rombie_hash64(const void *data, size_t size, uint64_t seed);
 /* For the CPU thread's waits: whether the machine is being stopped, and the
  * main-loop lock let go and taken again. */

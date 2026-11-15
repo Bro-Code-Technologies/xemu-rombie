@@ -593,6 +593,11 @@ static void mcpx_apu_vm_state_change(void *opaque, bool running, RunState state)
 
     if (!running) {
         /* A pipelined frame lands before the machine stops (a save). */
+        if (d->pipeline && rombie_lockstep_tracing()) {
+            fprintf(stderr, "rombie-trace apu stop: frame %s, frames %" PRId64
+                    "\n", d->vp_pending ? "pending" : "none",
+                    (int64_t)d->lockstep_frames);
+        }
         mcpx_apu_lockstep_commit(d);
         bql_unlock();
         qemu_mutex_lock(&d->lock);
