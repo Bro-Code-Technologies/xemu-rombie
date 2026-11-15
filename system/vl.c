@@ -2869,7 +2869,11 @@ void qmp_x_exit_preconfig(Error **errp)
     qemu_create_cli_devices();
 
 #ifdef XBOX
-    if (g_config.net.enable) {
+    if (rombie_engine_enabled()) {
+        /* The page is the only network (System Link); the engine makes no
+         * connection of its own. */
+        rombie_link_init();
+    } else if (g_config.net.enable) {
         xemu_net_enable();
     } else {
         xemu_net_disable();
@@ -2879,6 +2883,10 @@ void qmp_x_exit_preconfig(Error **errp)
     if (!qemu_machine_creation_done(errp)) {
         return;
     }
+
+#ifdef XBOX
+    rombie_engine_before_start();
+#endif
 
     if (loadvm) {
         RunState state = autostart ? RUN_STATE_RUNNING : runstate_get();
@@ -2972,7 +2980,7 @@ void qemu_init(int argc, char **argv)
     // now.
     //
 
-    int fake_argc = 32 + argc;
+    int fake_argc = 40 + argc;
     char **fake_argv = malloc(sizeof(char*)*fake_argc);
     memset(fake_argv, 0, sizeof(char*)*fake_argc);
 
@@ -3108,6 +3116,15 @@ void qemu_init(int argc, char **argv)
     // Create USB Daughterboard for 1.0 Xbox. This is connected to Port 1 of the Root hub.
     fake_argv[fake_argc++] = strdup("-device");
     fake_argv[fake_argc++] = strdup("usb-hub,port=1,ports=4");
+
+    if (rombie_engine_lockstep()) {
+        // Lockstep: guest time counted in instructions, and the console's
+        // clock set from the page and kept in guest time.
+        fake_argv[fake_argc++] = strdup("-icount");
+        fake_argv[fake_argc++] = strdup(rombie_engine_icount_option());
+        fake_argv[fake_argc++] = strdup("-rtc");
+        fake_argv[fake_argc++] = strdup(rombie_engine_rtc_option());
+    }
 
     for (int i = 1; i < argc; i++) {
         if (argv[i] != NULL) {

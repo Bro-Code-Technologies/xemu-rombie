@@ -114,6 +114,15 @@ Consequences for the engine:
   for Rombie's slots UI is load-bearing.
 - Snapshot shortcuts F5-F8 exist upstream (`general.snapshots.*`) but
   are irrelevant to the windowless engine.
+- **The XBE title in the extra data.** It is read from guest memory with
+  the machine stopped for the save, while the GPU's own save step holds
+  `pgraph.lock` (`nv2a_vm_state_change` takes it, `nv2a_post_save` lets
+  go). The read goes through the GPU's surface access check
+  (`surface_access_callback`), which takes the same lock, so with a
+  surface over the XBE header's page (Halo 2 had one at times in its
+  opening) the save never ended: netplay's handoff hung with its state
+  file empty, about one run in two. The engine leaves the title out
+  (`rombie_engine_enabled`); it never shows it.
 
 ## Phase 2 spike: windowless frames and sound into a canvas
 
@@ -215,16 +224,45 @@ its page leaves, and ends after 60 s when no page comes.
 `ui/rombie-engine-media.c` (+ `.h`) runs on the UI thread with the BQL
 held, as xemu's own snapshot actions do.
 
-- One blob per game, which the page stores: `RXBX`, u32 format (1), u32
-  EEPROM size, u64 image size, the EEPROM, the qcow2 image. The page sends
-  it before boot (0x08; empty means a new game: the bundled blank disk and
-  a freshly generated EEPROM); the engine validates it (header sizes, qcow2
-  magic) and refuses to boot on a bad one rather than hand back a blank
-  disk as the game's data.
+- One blob per game, which the page stores. The page sends it before boot
+  (0x08; empty means a new game: the bundled blank disk and a freshly
+  generated EEPROM); the engine validates it (header sizes, qcow2 magic)
+  and refuses to boot on a bad one rather than hand back a blank disk as
+  the game's data. Two formats (`rombie-engine-media.h`):
+  - **Format 1**, an image with save states: `RXBX`, u32 1, u32 EEPROM size,
+    u64 image size, the EEPROM, the qcow2 image as it is. Reading it: drain
+    all I/O, flush, read the qcow2 file and the EEPROM, end the drain.
+  - **Format 2**, an image without (the user's call, Rombie BRAIN-38 Phase
+    6.1): `RXBX`, u32 2, u32 EEPROM size, u64 image size, u32 disc runs,
+    u32 0, the EEPROM, the runs, then a fresh image of the disk as the guest
+    sees it without them, made as the handoff's guests' copy is (Netplay's
+    handoff, below), from a copy of the image file taken with the disk's
+    I/O drained while the game runs on. (Stopping the machine for the copy,
+    the first way, once left a game that never ran again.) A boot reads the runs
+    from the player's disc before the machine runs
+    (`rombie_engine_before_start`), checked; another disc refuses to boot.
+    Halo 2's disk, 650-900 MB once its caches fill, was over Rombie's 500 MB
+    storage cap; nearly all of it is the disc's.
+  - A state holds the caches as they were, and an image can't be copied
+    with its snapshots, so a game with states keeps format 1.
 - The engine returns the blob (0x85) a second after the game's last disk
-  write (the HDD BlockBackend's write counter, `ide0-hd0`), after every
-  state change, before a pause and on exit. Reading it: drain all I/O,
-  flush, read the qcow2 file and the EEPROM, end the drain.
+  write outside its cache partitions, after every state change, before a
+  pause and on exit.
+  - The writes are seen at the IDE controller (`hw/ide/core.c`'s DMA and PIO
+    writes call `rombie_media_hdd_write`). One inside the cache partitions
+    X, Y and Z (`0x80000` to `0x8CA80000`) alone sends nothing.
+  - The caches are scratch space a game fills from its disc and rebuilds
+    when it must: Halo 2 streams its maps through them while it plays.
+  - Its disk is about 700 MB once they fill, and reading that back holds
+    the game a second or two. Halo 2 also writes its data partition E (at
+    about `0xABFD3000`, 1.3 MB in) every 7 s or so under random input, so
+    the cache filter alone didn't stop the reads.
+  - In netplay the blob waits (marked changed) for the session's end, the
+    next handoff (which sends it anyway), a state change or the exit: every
+    read held every PC, and the speed control took the host for behind and
+    slowed the game to its cap (Rombie BRAIN-38, Phase 6). With the hold,
+    Halo 2's netplay check stays between 6 and 12 ns. A crash mid-session
+    loses what the game saved since the last handoff.
 - Save states are xemu snapshots inside that image, one per slot, tagged
   `slot<N>@<engine version>`. A load of a state made on another version is
   refused with a `state-version` event. Thumbnails stay xemu's (inside the
@@ -232,3 +270,390 @@ held, as xemu's own snapshot actions do.
 - Sizes on Burnout 2: blank disk 1.6 MB, 2.1 MB with one profile saved,
   52.4 MB with one state. Deleting a state frees its space inside the file
   but does not shrink the file.
+
+## Lockstep (Rombie BRAIN-38, `.docs/plans/xbox-online.md` Phase 2)
+
+Two engines given the same game data, clock and input stay identical at
+every vblank. The protocol (0x0B, 0x0C, 0x86, 0x87, `lw`; protocol 2) is at
+the top of `ui/xui/rombie-engine.cc`; the parts:
+
+- **Guest time is the instruction count**: `-icount shift=N,sleep=off,
+  align=off` and `-rtc base=<0x0B's clock>,clock=vm` (`system/vl.c`).
+  `ROMBIE_ICOUNT_SHIFT` (development) sets N, 2^N ns an instruction; 0 by
+  default for now, 1 is about a real Xbox's rate.
+- **Vblanks on guest time** (`ui/xemu.c`): a `QEMU_CLOCK_VIRTUAL` timer on
+  the CPU thread instead of the real-time vblank thread. It hashes, sends
+  0x87, waits for that vblank's 0x0C input, keeps real time at fixed
+  deadlines (unless unthrottled) and latches the pads; the guest's pad polls
+  read only the latched pads (`ui/xemu-input.c`). Its messages go out on the
+  sender thread: sent from the CPU thread, they waited on the socket behind
+  1.2 MB frames and cost half of every second.
+- **APU frames on the CPU thread** (`hw/xbox/mcpx/apu/apu.c`), one every
+  2/3 ms of guest time, with the frame thread idle; four voice workers on
+  every PC, their mixes added in worker order (`vp.c`).
+- **The GPU runs only while the CPU waits for it** (`hw/xbox/nv2a/pfifo.c`,
+  `nv2a.c`, `user.c`): after a PFIFO, PGRAPH or USER write; a DMA_PUT
+  write only leaves work waiting, which runs before the next NV2A access
+  (every block's MMIO goes through `nv2a_lockstep_read`/`write`), vblank,
+  spin or surface access. Only those passes run the pusher (the display's
+  syncs don't).
+- **The hard disk's I/O completes at the guest time it started**
+  (`hw/xbox/rombie-lockstep.c`, `hw/ide/core.c`, `hw/ide/pci.c`,
+  `block/block-backend.c`): after an IDE register access the CPU waits,
+  on a semaphore the block layer posts, until no request but the disc's is
+  in flight. (A g_usleep poll slept a whole Windows tick, up to 15.6 ms.)
+- **The disc's reads complete at a deadline** of guest time instead,
+  50 ms for a seek or 2 ms for a read that follows the last, plus the
+  transfer at 16 MB/s, in the order they were asked for. The guest runs on
+  meanwhile; IDE's completion, the only thing that puts the data where the
+  guest sees it, runs on the CPU thread at the deadline, which waits only
+  if the page hasn't answered. The page took 33-60 ms a read, and a CPU
+  that stood still for each ran loading at a third of real time.
+- **The engine reads the disc ahead** (`ui/xui/rombie-engine.cc`, any
+  mode): the page is asked for whole 1 MB chunks, every read also asks for
+  the two after it, and 24 stay. A read pins its chunks until it has
+  copied them: an evicted one handed a read waiting on its other chunk
+  whatever was left, and the engines diverged.
+- **The AC97 drains in guest time**: lockstep's default audio backend is
+  `none` (`audio/audio.c`); the page hears the APU as before.
+- **Spins skipped** (`accel/tcg/tcg-accel-ops-rr.c`): under icount every
+  instruction costs host time, and the Xbox spins rather than halts. The
+  kernel's idle loop is `sti; nop; nop; cli` and two compares (`8001b02e`
+  on the 4627 BIOS); Burnout 2 waits on the GPU by reading a word in RAM
+  (`0021b180`). Together they were 98% of the guest's instructions. Each
+  timer interval now opens with two 840-instruction probes; when both leave
+  the registers identical, guest time jumps to the next timer. Halts warp on
+  the CPU thread too (`icount_warp_in_vcpu`), saving the main loop's two
+  wake-ups. Two host-time leaks made engines skip differently (only the
+  instruction counts differed, from vblank 3840): icount's budget also
+  stopped at real-time timers (not in lockstep now, `icount_get_limit`),
+  and a kick in an interval that had found no spin let it probe again (it
+  now runs to the interval's end).
+- **Hashes** (0x86): RAM, CPU, NV2A registers, APU registers and DSP
+  memories, each drive's I/O counts, and guest time. The stats carry a
+  `prof` line in lockstep (where the CPU thread's time went);
+  `ROMBIE_LOCKSTEP_PROFILE=1` also prints the guest's hot places.
+
+Measured on Burnout 2, two engines on the 5950X, flat out, the first
+40-60 s from boot:
+
+- Each sync off alone (0x10, 0x20, 0x40) diverges by vblank 60; all on,
+  every hash matches.
+- TCG under icount runs about 230 million guest instructions a second.
+  Before the spin skip the guest needed 1,000 million a second at shift 0
+  (500 million at shift 1), so it ran at about 10 vblanks a second.
+- With the spin skip, shift 1, flat out: Burnout 2 runs at 100-111 vblanks
+  a second once it is past the dashboard's boot animation. The animation
+  is the heaviest GPU work (12 ms a frame solo, where it runs at 56 frames
+  a second; 18 ms in lockstep, about 25 a second); netplay joins a running
+  game and never plays it.
+- Real time, shift 1, hashing every 60, measured from vblank 600: 7,200
+  vblanks at 98.3% and 99.1% of those due, the lowest 30 s 93% and 96%,
+  9-11 s short of sound, all in loading; the same run with the disc in
+  Windows' file cache reached 100% and 98%. Solo (no lockstep), the same
+  stretch plays at 60 frames a second.
+- Flat out, hashing every vblank: 7,200 vblanks match (seed 2).
+
+### Lockstep speed: four-player TimeSplitters 2 and Halo 2 (2026-11-14)
+
+Burnout 2 idles; four-player split-screen games don't. Their first runs
+held 57% of real time on one engine on the 5950X (TimeSplitters 2) and 18%
+on the guest laptop (i7-8750H, GTX 1060). What fixed it, in order, each step
+in step at every vblank on the main PC (TimeSplitters 2 and Halo 2 from
+boot into their matches, flat out, hashed every vblank):
+
+- **The guest's CPU speed** (`accel/tcg/icount-common.c`): guest time an
+  instruction in sixteenths of a ns (`rombie_icount_set_scale`), finer than
+  the shift, changed on the CPU thread at a vblank with the clock kept
+  continuous (the bias takes up the change). The page sets it: 0x0B's start
+  and 0x0F changes at a named vblank, which every engine gets before it gets
+  there; `ROMBIE_ICOUNT_NS="vblank:ns,..."` schedules it for development.
+  In lockstep a CPU-bound game slows as a whole where solo it drops frames,
+  so the guest must be no faster than the slowest PC runs it. The test
+  page's adaptive mode slows it by 15% when an engine falls behind and
+  speeds it by 5% when every engine has more than 15% to spare (stats'
+  `pace`, the time the CPU thread slept ahead of real time).
+  - The stats' `shader` is the ms spent on shaders xemu hadn't loaded yet
+    (compiled, or loaded from its cache: `pgraph_gl_bind_shaders`), in any
+    mode. A scene new to a PC holds its game while they compile, and in
+    lockstep every PC's: Halo 2's mission start compiled about 90 in 25 s
+    on each PC, and Rombie's speed rules leave that time out (Rombie
+    BRAIN-38 Phase 6.1). The stats' `held` is the same for the machine held
+    by a state saved, loaded or deleted, or by the game data's read. Their
+    `lw` counts a wait for input still going up to the moment they're
+    taken: counted only at its end, another PC's handoff (seconds) read as
+    seconds with nothing run and nothing waited for, which Rombie's slow
+    rule took for the PC's own slowness (Phase 7's second two-PC run).
+- **The GPU works ahead** (`hw/xbox/nv2a/pfifo.c`, `pgraph.c`, `nv2a.c`): a
+  DMA_PUT starts the pusher at once; the CPU waits only at its old points.
+  While the CPU runs, the GPU's semaphore and report writes are held
+  (`nv2a_lockstep_gpu_write`) and land as the CPU starts waiting, and an
+  interrupt parks the GPU thread until then (`nv2a_lockstep_park`). Its
+  other writes (downloads, blits) land in surfaces' memory, whose every CPU
+  access waits for the GPU first. The SDK polls USER's DMA_GET after kicks:
+  a first read since the CPU last waited gets that wait's value, which the
+  GPU has passed, and a second read with no wait between is a poll and
+  waits. The PFB flush (WBC, `0x410`) it writes and polls doesn't wait; PFB
+  reads never follow the GPU, though its tiles do, so other PFB writes
+  still wait. Flag 0x08 keeps the serial GPU.
+- **The display doesn't touch a surface's age** (`gl/display.c`,
+  `vk/renderer.c`): the age decides eviction, which downloads into guest
+  memory, so only the GPU's work sets it.
+- **Voices read guest RAM straight from its block** (`vp.c` `vp_ldl` and
+  kin): dozens of memory-API lookups a voice every frame, and a sample's
+  each, halved the APU's time. Writes still go through the API, for its
+  dirty tracking.
+- **Voices resample linearly in lockstep** (xemu's note allows the hardware
+  may be linear) instead of the sinc; **HRTF** walks its ring buffer without
+  divisions (the same sums); the APU's threads **flush denormals** alike on
+  every PC (the guest's floats are softfloat, unaffected).
+- **An APU frame's voices run ahead** (`apu.c` `lockstep_launch`,
+  `lockstep_commit_locked`): at a frame's tick its voices start on the frame
+  thread from a copy of the voice descriptors, and the guest runs on. Their
+  changes (only the words they changed), notifications, the DSPs' frame, the
+  sound and interrupts land at the next APU access, vblank, spin or tick.
+  Flag 0x80 keeps the serial APU.
+- **Flag 0x04, a speed test**: one frame in ten and no game data.
+  Playwright's DevTools connection carries every WebSocket frame (1.2 MB,
+  60 a second); on the laptop that cost three threads beside the engine,
+  and Halo 2's game data (700 MB, its cache partitions) crashed the driver.
+
+Figures, one engine in real time in the match, flag 0x04:
+
+| | main PC (5950X, RTX 5070 Ti) | laptop (i7-8750H, GTX 1060) |
+|---|---|---|
+| TimeSplitters 2, 6 ns | 100.6% (lowest 30 s 100.6%) | 49% |
+| TimeSplitters 2, adaptive | | 100.7%, at 13.3 ns, 18 frames a second |
+| Halo 2, 6 ns | 90.5% (GL), 100.4% (Vulkan) | |
+| Halo 2, adaptive | | 100.4%, at 20.3 ns, 8 frames a second |
+
+Two engines on the main PC, adaptive, TimeSplitters 2: 100% each, 5.4-6.9
+ns, 41 frames a second, 150 hashes matching across nine speed changes. On
+the laptop TCG runs 50-73 million instructions a second against the main
+PC's 125-165, and with the APU and the GPU off the CPU thread that is its
+limit. On the main PC Halo 2's limit is the GL renderer (the GPU thread
+busy 660 ms a second); Vulkan cuts it to about 550, but two Vulkan engines
+differ in RAM alone at 24 of 9,000 vblanks (transient, every other part
+equal), from something that still writes guest RAM on host time; lockstep
+stays on GL until that's found.
+
+Since then (to `091df25a9c`):
+
+- **The pusher's own writes to memory wait for the CPU** (`nv2a_lockstep_park_ram`,
+  `gl/surface.c` `download_if_dirty`, both `blit.c`): a download or blit the
+  pusher makes, ahead, could interleave with the CPU's writes once a surface
+  was gone (Halo 2's RAM differed at 1,016 of 42,200 vblanks); it parks until
+  the CPU waits, as an interrupt does. About 4% of Halo 2's speed.
+- **Lockstep boots with the short startup animation** (`skip_boot_anim`;
+  `ROMBIE_LOCKSTEP_FULL_ANIMATION=1` keeps the full one): every PC boots at a
+  handoff, and the full one's render targets, left in memory, differ between
+  GPU makers.
+- **0x10** dumps RAM's page hashes and the GPU's surfaces at a vblank, and
+  `ROMBIE_LOCKSTEP_TRACE_REPORTS=1` logs every occlusion count the guest gets,
+  to compare two PCs.
+
+Two PCs: the GTX 1060 replays the main PC's TimeSplitters 2 run at all 41,000
+vblanks, every part; Halo 2 everything but RAM, which differs at 1,016
+vblanks in a render target the two GPU generations draw differently and the
+game doesn't read. The Intel UHD 630 diverges: 11 of 1,625 occlusion counts
+differ (the first 36 pixels on NVIDIA, 40 on Intel), then the CPU. Rombie's
+call (2026-11-14): integrated graphics are below Xbox netplay's minimum.
+
+## Netplay's handoff (Rombie BRAIN-38, Phase 3)
+
+A running engine can't go into lockstep (icount is fixed when QEMU starts),
+so every PC, the host included, boots again at a handoff and loads one state
+into a machine that has never run.
+
+- **0x0D host** (`HandleNetplay`, `rombie_media_handoff`): the machine stops
+  where it is (`vm_stop(RUN_STATE_SAVE_VM)`, as `save_snapshot` does: the
+  GPU's surfaces go into memory, the APU's frame lands) and the engine
+  writes the machine's state as a stream to a file (`rombie_savevm_file`,
+  `migration/savevm.c`) and the disk as the guest sees it into a fresh qcow2
+  (`copy_disk`: only clusters that hold data, zeros and the disc's runs left
+  out, none of the player's save states). It sends its own game data (0x85,
+  save states and all, which the host boots again with) and then 0x88: the
+  guests' game data and the state, which is u64 guest time (ns), the disc
+  runs and the stream. It stays stopped; the page restarts it.
+- **Disc runs.** A game's disk can hold much of its disc: Halo 2 copies
+  370 MB of its maps to its cache partitions in its first two minutes, 99.5%
+  of its disk then, in 4 KB blocks that are two sectors of the disc each.
+  Every guest has the disc, so `copy_disk` leaves out each block whose two
+  halves hash as two consecutive sectors of the disc, and the state names
+  them in runs (disk offset, disc sector, sectors, and a check: the sectors'
+  hashes in order). The engine knows a sector by its hash once the page has
+  sent its chunk (`rombie_media_disc_chunk`, from `HandleDiscData`), and
+  keeps the hashes in its data folder (`disc-sectors.bin`, one disc, named
+  by its size and its first megabyte), for the engines after it: a
+  restarted host's resync, or a session whose cache an earlier one filled.
+  On every PC, before the state loads, each run comes from that PC's own
+  disc (`fill_from_disc`), unless the disk already holds it (the host's own,
+  rebooted with its full disk); a check that doesn't match fails the join
+  ("This disc isn't the same as the host's").
+- **No BIOS in the state**: `xbox.bios` (the flash) and `xbox.mcpx` (the
+  flash with the MCPX ROM over its end) are marked not migratable around the
+  save, so the stream leaves them out, and around the load, so a stream
+  holding them is refused. Each PC's come from its own files at boot.
+- **0x04 op 4, restart** (`RestartSelf`): the engine closes the page's
+  connection with a reset (a close from its end would leave the port in
+  TIME_WAIT, which the exclusive bind refuses for minutes), closes its
+  listener, and starts itself again with the same arguments plus
+  `--restarted`, inheriting only stdout and stderr (an inherited socket
+  would keep the port). The new process retries the port for 30 s.
+- **0x0D join**, after 0x0B and 0x08 and before boot: the engine keeps the
+  state, and once the machine is created and before it first runs
+  (`rombie_engine_before_start`, called from `qmp_x_exit_preconfig` in
+  `system/vl.c`) it plugs in the four pads (the host's machine had them;
+  their hubs are in the state), loads the stream (`rombie_loadvm_file`, as
+  `load_snapshot` does), and sets lockstep's vblank and input count to the
+  vblank named.
+- **Guest time goes on from the state's** (`system/cpu-timers.c`): the
+  timers' section loads first, and its `post_load` sets icount's bias so the
+  clock reads the handoff's guest time, whatever the source counted (no
+  icount on a solo host, another guest speed on a resync), so every timer
+  the devices restore comes due when it would have. The guest's TSC follows
+  the clock (`hw/i386/x86-cpu.c`). Lockstep's vblanks and APU frames count
+  from there (`xemu_lockstep_vblank_rebase`, `mcpx_apu_lockstep_rebase`), and
+  0x0B's guest speed applies at once. The RTC starts again from 0x0B's date
+  plus guest time (`rombie_rtc_restart_clock`): a solo host's RTC runs on
+  the host's clock, which lockstep doesn't use.
+- **Stops in lockstep.** Lockstep waits inside QEMU_CLOCK_VIRTUAL timers'
+  callbacks with the BQL let go (the vblank for input, its GPU sync, a disc
+  read), and a stop or a reset (`pause_all_vcpus`) holds the BQL while it
+  disables that clock, which waits for the callbacks in flight: every pause,
+  save, exit or guest reboot there deadlocked. While a virtual-clock
+  callback has let go of the BQL its list now says it has none in flight
+  (`bql_unlock` and `bql_lock` call `rombie_timers_bql_released` and
+  `rombie_timers_bql_taken`, `util/qemu-timer.c`), and the vblank sees the
+  stop by the run state (`rombie_lockstep_stopping`), which a stop sets
+  first.
+- **The guest's own reset** (Halo 2 reboots in its opening) comes at the
+  same guest point on every PC. Lockstep's APU frame in flight belongs to
+  the machine before it, so the reset waits for it and drops it (its voice
+  writes would land on the reset's registers and run the DSP on garbage),
+  and a GPU running ahead first does all it was given, as if the CPU waited
+  for it (`pfifo_lockstep_reset`), so its held writes land before the
+  registers go.
+- **A save leaves the DSPs as they were.** A host's state save put it out
+  of step a second or three later in two runs of about fifteen (Rombie
+  BRAIN-38 Phase 7). The stop for it
+  copies both DSPs into their saved form (`dsp_sync_to_vm`), and every
+  resume put that copy back into the JIT (`dsp_sync_from_vm`), which isn't
+  exact: the power state set to running, interrupts beyond four lost, and
+  the old snapshots' fix-ups applied to live registers (an M of `$00FFFF`
+  made `$FFFFFF`, an N with bit 15 set sign-extended). The resume puts it
+  back only at the first start and after a load (`dsp_from_vm`). The copy
+  also read the DMA's control register, which counts as the guest polling
+  it (a third poll stops the DMA); it takes the register as it is.
+- **A state carries the vertex attributes.** xemu's state leaves them out
+  (`vmstate_nv2a_pgraph_vertex_attributes` has no fields), so after a load
+  every attribute read as unset until the game set it again, and after a
+  netplay resync Halo 2 drew an inline array first and divided by its vertex
+  size of 0 (`pgraph_gl_bind_inline_array`). An nv2a subsection carries each
+  one's format, size, count, stride, offset and inline value; a state
+  without it loads as before.
+- **No warp while the CPU is stopped.** The DSP fix didn't cure the save's
+  fault: two-sided runs with a save every 200 vblanks still went out of
+  step, about one save in 25, at the first checkpoint after one, with RAM,
+  CPU, APU and time all differing. A trace of every vblank caught a host
+  hung inside a save's `vm_start`. The rr loop turns QEMU_CLOCK_VIRTUAL back
+  on each time round, and a stopped CPU counts as idle. So between
+  `vm_start`'s run state and its `resume_all_vcpus`, when NV2A's resume
+  handler let go of the BQL, the CPU thread warped guest time to its next
+  deadline and ran the timers there (APU frames, even a vblank) with no
+  instruction run. Usually it lost the race and nothing happened. The idle
+  warp (`icount_warp_in_vcpu`) and the main loop's (`icount_start_warp_timer`)
+  now wait while any CPU is stopped.
+- **What only the host does.** In lockstep a save, a load, a pause, the
+  host's handoff and exit run on the UI thread while the CPU holds at a vblank
+  (`QueueAtVblank`), where the GPU has done all it was given: stopped
+  anywhere else its thread may be parked on an interrupt for a CPU that no
+  longer runs. A slot save there leaves the GPU's surfaces out of memory
+  (`nv2a_save_keeps_surfaces`): copying them in showed the host's game what
+  the guests' didn't (RAM differed until the next resync). Such a state
+  holds memory as the game left it; a surface the game doesn't draw again
+  after a load shows its old pixels. A state saved in lockstep carries its
+  guest time in `cpu_clock_offset`, where an engine running alone reads it.
+  The game data read-back (0x85: a drain, a flush and the files read, at
+  the engine's own moments) changes nothing the game sees: both engines of a
+  check read theirs back every 0.7-2 s (`ROMBIE_LOCKSTEP_READBACK_MS`) and
+  stay identical.
+- **0x0D end**: the vblanks stop waiting for input and the guest reads the
+  page's own pads again, at the guest speed reached.
+- **Development**: with `ROMBIE_HANDOFF_DIR` set the host writes the
+  handoff there and sends 0x88 empty, and a join with no state reads it from
+  there, so the test page's DevTools connection never carries Halo 2's disk.
+  With `ROMBIE_LOCKSTEP_READBACK_MS` set, a speed test (which sends no game
+  data) still reads its game data back that often while it runs, and drops
+  it. With `ROMBIE_LOCKSTEP_TRACE=1` on every engine, each vblank's
+  instruction count, guest time, EIP and CPU, GPU, APU and I/O hashes (RAM
+  every fifth) go into the log, with how a held vblank ended at a stop, and
+  the save's own times.
+
+Figures (main PC): TimeSplitters 2's state is 61-62 MB (8.1-8.5 MB
+gzipped), the guests' game data 3.1 MB (0.9 MB), the host's stop and copy
+0.3 s, a restart 0.9 s, a join 1.3-2.0 s. Halo 2's state is 48 MB (16 MB
+gzipped); its disk had 370 MB of data at vblank 7200, 367 MB of it in 234
+disc runs, so the guests' game data is 7.3 MB (391 MB without the runs,
+280 MB gzipped); the host's stop 0.4 s, a guest's join 4 s, reading the
+runs from a USB hard drive at 94 MB/s. `lockstep-test.html`'s
+`xboxLockstep.handoff` (`lockstep-run.py --handoff`) checks it: A plays alone
+or in lockstep, hosts and restarts, B joins fresh, A saves a state on the
+way and then hosts again (a resync), hashes compared every vblank.
+
+## System Link (Rombie BRAIN-38, Phase 8)
+
+In engine mode the network card (nvnet, on hub 0 as the machine's default
+NIC) gets one more port on that hub: `hw/xbox/rombie-link.c`'s client, whose
+frames go to the page and come back from it. Nothing else is ever connected:
+`system/vl.c` makes no xemu netdev (NAT, UDP, pcap) in engine mode, whatever
+the engine's own `xemu.toml` says.
+
+- **Messages** (protocol 4): 0x11 page to engine and 0x89 engine to page,
+  each `[u8 type][3 pad][Ethernet frame]`, numbers none of Rombie's engines
+  used, so the PS2 engine can take the same (BRAIN-43). 0x04's ops 5 and 6
+  put the cable in and out, before boot or while the game runs, and the
+  engine answers with the `link-cable` event, `in` or `out`. Every engine
+  starts with it out, and lockstep never links (op 5 counts as out).
+- **The cable** is QEMU's link state on `nvnet.0` (`qmp_set_link`), which
+  nvnet reports to the game as a PHY link change. Halo 2 showed "Connection
+  lost ... make sure your cable is not disconnected" the moment it came out
+  mid-match, and with it back in the console was at its main menu, ready to
+  find games again. System Link turns on and off with no reboot.
+- **Threads.** A frame from the page arrives on the socket's thread and
+  queues (512 at most; a burst past that is dropped, as a switch would) for a
+  bottom half on QEMU's main loop, which hands it to the card under the BQL.
+  The card's frames come out on the CPU thread under the BQL and join the
+  sender thread's queue, ahead of pictures and sound, as lockstep's do.
+- **Addresses.** A console's MAC is its EEPROM's (`00:50:f2` and three
+  random bytes, `eeprom_generation.c`), made with the game's data, so two
+  players' consoles differ; every test console had its own. No DHCP server is
+  needed: an Xbox asks for an address (a 342-byte DHCP discover every second
+  or two for its first ~30 s), gets no answer, and Halo 2 and TimeSplitters 2
+  find each other anyway.
+- **Stats.** The stats line's `link` is the second's frames from the page and
+  their bytes, then those to it.
+
+Checked on the main PC with Rombie's `engine/xbox/system-link-test.html`
+(two to four engines, each with new game data, the page a learning switch
+with an added delay; a driver over DevTools' `Runtime.evaluate` alone, since
+an attached Playwright records every frame of video and Chrome grew to
+9.6 GB):
+- **Halo 2, two consoles:** the second listed the first's game ("Pregame
+  (open)"), joined its lobby and played a Slayer match on Ivory Tower, both
+  clocks in step, with 0, 50 and 100 ms added each way. About 30 frames a
+  second each way in the match (the host 2.6-2.7 KB/s, the other 2.4 KB/s),
+  1-4 in the lobby.
+- **TimeSplitters 2, two consoles** (Arcade, System Link): the second found
+  the first's Deathmatch ("1/16 Players"), joined, and both played Mexican
+  Mission, each on the other's radar, at 0, 50 and 100 ms. 10-12 frames a
+  second each way, 0.7-1.0 KB/s.
+- **Halo 2, four consoles:** all four in one lobby ("4 player(s) in party")
+  and then in one match, every console at 60 vblanks a second. The host sent
+  87-90 frames a second (9.4-9.7 KB/s) and took 90 (7.4 KB/s); each other
+  console 30 each way (2.4-3.3 KB/s).
+- While linked, `Get-NetTCPConnection` showed each engine with its
+  127.0.0.1 listener and the page's loopback connection alone, and
+  `Get-NetUDPEndpoint` nothing.
+- With the backend present and the cable out, `lockstep-run.py` matched
+  every vblank of 7,200 in TimeSplitters 2 and in Halo 2.

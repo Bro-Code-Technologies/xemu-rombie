@@ -59,6 +59,7 @@ typedef struct VoiceWorker {
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     VoiceWorkItem queue[MCPX_HW_MAX_VOICES];
     int queue_len;
+    bool mixed; /* this frame's mixbins are ready to add */
 } VoiceWorker;
 
 typedef struct VoiceWorkDispatch {

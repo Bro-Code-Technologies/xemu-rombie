@@ -329,6 +329,9 @@ typedef struct IDEBufferedRequest {
     BlockCompletionFunc *original_cb;
     void *original_opaque;
     bool orphaned;
+    /* Rombie's lockstep: a disc read's place in the queue whose data reaches
+     * the guest at a deadline of guest time (rombie_lockstep_disc_read). */
+    void *rombie_read;
 } IDEBufferedRequest;
 
 /* These are used for the error_status field of IDEBus */

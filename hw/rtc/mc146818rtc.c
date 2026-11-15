@@ -769,6 +769,26 @@ static void rtc_set_date_from_host(ISADevice *dev)
     rtc_set_cmos(s, &tm);
 }
 
+#ifdef XBOX
+/*
+ * Rombie's netplay handoff: a state saved by an engine running alone keeps
+ * the clock on the host's time, which lockstep doesn't use (-rtc clock=vm).
+ * Every PC starts the clock again from the date the page gave, as a
+ * lockstep boot does, plus the guest time so far.
+ */
+void rombie_rtc_restart_clock(void)
+{
+    Object *obj = object_resolve_path_type("", TYPE_MC146818_RTC, NULL);
+    if (!obj) {
+        return;
+    }
+    MC146818RtcState *s = MC146818_RTC(obj);
+    rtc_set_date_from_host(ISA_DEVICE(s));
+    periodic_timer_update(s, qemu_clock_get_ns(rtc_clock), s->period, false);
+    check_update_timer(s);
+}
+#endif
+
 static int rtc_pre_save(void *opaque)
 {
     MC146818RtcState *s = opaque;

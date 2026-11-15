@@ -188,7 +188,12 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
 
     assert(surface->color);
 
-    surface->frame_time = pg->frame_time;
+    /* Lockstep: a surface's age decides when it's evicted, downloading into
+     * guest memory, so only the GPU's own work may set it, not this thread
+     * whenever the display asks. A shown frame is drawn every flip anyway. */
+    if (!d->pfifo.lockstep) {
+        surface->frame_time = pg->frame_time;
+    }
 
 #if HAVE_EXTERNAL_MEMORY
     qemu_event_reset(&d->pgraph.sync_complete);

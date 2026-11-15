@@ -56,6 +56,10 @@ int64_t icount_get(void);
  */
 int64_t icount_to_ns(int64_t icount);
 
+/* Rombie lockstep: guest ns per instruction, in sixteenths (0: the shift). */
+void rombie_icount_set_scale(int64_t q16);
+int64_t rombie_icount_scale(void);
+
 /**
  * icount_configure: configure the icount options, including "shift"
  * @opts: Options to parse
@@ -70,6 +74,8 @@ int64_t icount_round(int64_t count);
 
 /* if the CPUs are idle, start accounting real time to virtual clock. */
 void icount_start_warp_timer(void);
+bool icount_warp_in_vcpu(void);
+bool icount_warp_to_deadline(void);
 void icount_account_warp_timer(void);
 void icount_notify_exit(void);
 

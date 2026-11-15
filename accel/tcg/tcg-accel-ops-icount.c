@@ -33,6 +33,7 @@
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-icount.h"
 #include "tcg-accel-ops-rr.h"
+#include "ui/rombie-engine.h"
 
 static int64_t icount_get_limit(void)
 {
@@ -45,10 +46,16 @@ static int64_t icount_get_limit(void)
          */
         deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
                                               QEMU_TIMER_ATTR_ALL);
-        /* Check realtime timers, because they help with input processing */
-        deadline = qemu_soonest_timeout(deadline,
-                qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
-                                           QEMU_TIMER_ATTR_ALL));
+        /*
+         * Check realtime timers, because they help with input processing.
+         * Not in Rombie's lockstep: its input comes with the vblanks, and a
+         * budget cut by host time made the spin probes host-timed.
+         */
+        if (!rombie_engine_lockstep()) {
+            deadline = qemu_soonest_timeout(deadline,
+                    qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
+                                               QEMU_TIMER_ATTR_ALL));
+        }
 
         /*
          * Maintain prior (possibly buggy) behaviour where if no deadline

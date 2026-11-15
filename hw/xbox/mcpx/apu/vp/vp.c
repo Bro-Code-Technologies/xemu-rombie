@@ -20,7 +20,11 @@
  */
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
+#include "ui/rombie-engine.h"
 #include "adpcm.h"
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 
 static const struct {
     hwaddr top, current, next;
@@ -40,11 +44,19 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     // FIXME: Check notify enable
     // FIXME: Set NV1BA0_NOTIFICATION_STATUS_IN_PROGRESS when appropriate
-    stb_phys(&address_space_memory, notify_offset, status);
-
     // FIXME: Refactor this out of here
     // FIXME: Actually provied current envelope state
-    stb_phys(&address_space_memory, notify_offset - 1, 1);
+    if (d->vp_running) {
+        /* Lockstep's pipeline: the guest sees it at the frame's commit. */
+        MCPXAPUHeldByte held[2] = { { notify_offset, status },
+                                    { notify_offset - 1, 1 } };
+        qemu_mutex_lock(&d->vp_notify_lock);
+        g_array_append_vals(d->vp_notify, held, 2);
+        qemu_mutex_unlock(&d->vp_notify_lock);
+    } else {
+        stb_phys(&address_space_memory, notify_offset, status);
+        stb_phys(&address_space_memory, notify_offset - 1, 1);
+    }
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
               NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -97,20 +109,59 @@ static float attenuate(uint16_t vol)
     return (vol == 0xFFF) ? 0.0 : powf(10.0f, vol/(64.0 * -20.0f));
 }
 
+/*
+ * The voices' reads of guest memory, dozens a voice every frame: straight
+ * from the RAM block when inside it, as the stream path's ADPCM memcpy
+ * already reads, rather than a lookup through the memory API each time.
+ * Writes still go through it, for its dirty tracking.
+ */
+static inline uint32_t vp_ldl(MCPXAPUState *d, hwaddr addr)
+{
+    if (likely(addr + 4 <= d->ram_size)) {
+        return ldl_le_p(d->ram_ptr + addr);
+    }
+    return ldl_le_phys(&address_space_memory, addr);
+}
+
+static inline uint32_t vp_lduw(MCPXAPUState *d, hwaddr addr)
+{
+    if (likely(addr + 2 <= d->ram_size)) {
+        return lduw_le_p(d->ram_ptr + addr);
+    }
+    return lduw_le_phys(&address_space_memory, addr);
+}
+
+static inline uint32_t vp_ldub(MCPXAPUState *d, hwaddr addr)
+{
+    if (likely(addr < d->ram_size)) {
+        return d->ram_ptr[addr];
+    }
+    return ldub_phys(&address_space_memory, addr);
+}
+
 static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
                                hwaddr offset, uint32_t mask)
 {
+    if (d->vp_running) {
+        /* Lockstep's pipeline: the frame's copy of the descriptors. */
+        uint32_t v = ldl_le_p(d->vp_desc + voice_handle * NV_PAVS_SIZE + offset);
+        return (v & mask) >> ctz32(mask);
+    }
     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    return (ldl_le_phys(&address_space_memory, voice + offset) & mask) >>
-           ctz32(mask);
+    return (vp_ldl(d, voice + offset) & mask) >> ctz32(mask);
 }
 
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
+    if (d->vp_running) {
+        uint8_t *p = d->vp_desc + voice_handle * NV_PAVS_SIZE + offset;
+        stl_le_p(p, (ldl_le_p(p) & ~mask) | ((val << ctz32(mask)) & mask));
+        return;
+    }
     hwaddr voice = d->regs[NV_PAPU_VPVADDR]
                     + voice_handle * NV_PAVS_SIZE;
-    uint32_t v = ldl_le_phys(&address_space_memory, voice + offset) & ~mask;
+    uint32_t v = vp_ldl(d, voice + offset) & ~mask;
     stl_le_phys(&address_space_memory, voice + offset,
                 v | ((val << ctz32(mask)) & mask));
 }
@@ -577,6 +628,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
 static uint64_t vp_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    mcpx_apu_lockstep_commit(opaque);
     DPRINTF("mcpx apu VP: read [0x%" HWADDR_PRIx "] (%s)\n", addr,
             get_method_str(addr));
 
@@ -595,6 +647,7 @@ static uint64_t vp_read(void *opaque, hwaddr addr, unsigned int size)
 static void vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    mcpx_apu_lockstep_commit(d);
 
     DPRINTF("mcpx apu VP: [0x%" HWADDR_PRIx "] %s = 0x%lx\n", addr,
             get_method_str(addr), val);
@@ -664,12 +717,12 @@ const MemoryRegionOps vp_ops = {
     .write = vp_write,
 };
 
-static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
+static hwaddr get_data_ptr(MCPXAPUState *d, hwaddr sge_base,
+                           unsigned int max_sge, uint32_t addr)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
     assert(entry <= max_sge);
-    uint32_t prd_address =
-        ldl_le_phys(&address_space_memory, sge_base + entry * 4 * 2);
+    uint32_t prd_address = vp_ldl(d, sge_base + entry * 4 * 2);
     // uint32_t prd_control =
     //     ldl_le_phys(&address_space_memory, sge_base + entry * 4 * 2 + 4);
     DPRINTF("Addr: 0x%08X, control: 0x%08X\n", prd_address, prd_control);
@@ -955,8 +1008,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
 
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
-        segment_offset = ldl_le_phys(&address_space_memory, addr);
-        segment_length = ldl_le_phys(&address_space_memory, addr + 4);
+        segment_offset = vp_ldl(d, addr);
+        segment_length = vp_ldl(d, addr + 4);
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;
@@ -1026,10 +1079,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
                          word_index < (9 * samples_per_block); word_index++) {
-                        hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                        hwaddr addr = get_data_ptr(d, d->regs[NV_PAPU_VPSGEADDR],
                                                    0xFFFFFFFF, linear_addr);
-                        adpcm_block[word_index] =
-                            ldl_le_phys(&address_space_memory, addr);
+                        adpcm_block[word_index] = vp_ldl(d, addr);
                         linear_addr += 4;
                     }
                 }
@@ -1052,7 +1104,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 addr = segment_offset + cbo * block_size;
             } else {
                 uint32_t linear_addr = ba + cbo * block_size;
-                addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
+                addr = get_data_ptr(d, d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
                                     linear_addr);
             }
 
@@ -1061,19 +1113,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(&address_space_memory, addr);
+                    ival = vp_ldub(d, addr);
                     fval = uint8_to_float(ival & 0xff);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(&address_space_memory, addr);
+                    ival = vp_lduw(d, addr);
                     fval = int16_to_float(ival & 0xffff);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(&address_space_memory, addr);
+                    ival = vp_ldl(d, addr);
                     fval = int24_to_float(ival);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(&address_space_memory, addr);
+                    ival = vp_ldl(d, addr);
                     fval = int32_to_float(ival);
                     break;
                 default:
@@ -1170,8 +1222,12 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
          * so use it for now.
          */
         // FIXME: Don't do 2ch resampling if this is a mono voice
-        filter->resampler = src_callback_new(&voice_resample_callback,
-                                           SRC_SINC_FASTEST, 2, &err, filter);
+        /* Lockstep runs every voice on the CPU thread's time, where the
+         * sinc's cost per voice adds up; linear, as the note above allows
+         * the hardware may be, costs a fraction. */
+        filter->resampler = src_callback_new(
+            &voice_resample_callback, d->lockstep ? SRC_LINEAR : SRC_SINC_FASTEST,
+            2, &err, filter);
         if (filter->resampler == NULL) {
             fprintf(stderr, "src error: %s\n", src_strerror(err));
             assert(0);
@@ -1334,6 +1390,7 @@ static void voice_process(MCPXAPUState *d,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS);
     dbg->multipass = multipass;
 
+    const uint64_t samples_from = rombie_prof_now();
     if (multipass) {
         get_multipass_samples(d, mixbins, v, samples);
     } else {
@@ -1341,6 +1398,8 @@ static void voice_process(MCPXAPUState *d,
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
             if (!active) {
+                rombie_prof_add(ROMBIE_PROF_VP_SAMPLES_NS,
+                                rombie_prof_now() - samples_from);
                 return;
             }
             int count =
@@ -1352,6 +1411,7 @@ static void voice_process(MCPXAPUState *d,
             sample_count += count;
         }
     }
+    rombie_prof_add(ROMBIE_PROF_VP_SAMPLES_NS, rombie_prof_now() - samples_from);
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
@@ -1423,6 +1483,7 @@ static void voice_process(MCPXAPUState *d,
         return;
     }
 
+    const uint64_t fx_from = rombie_prof_now();
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
 
@@ -1463,6 +1524,7 @@ static void voice_process(MCPXAPUState *d,
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
         }
     }
+    rombie_prof_add(ROMBIE_PROF_VP_FX_NS, rombie_prof_now() - fx_from);
 
     // FIXME: ParaEQ
 
@@ -1588,6 +1650,14 @@ static void *voice_worker_thread(void *arg)
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
     rcu_register_thread();
+#if defined(__x86_64__) || defined(__i386__)
+    /* Lockstep: a voice's filter decaying toward silence goes denormal, and
+     * each step on one costs as much as a hundred others; every PC flushes
+     * them alike (the guest's own floats are softfloat, unaffected). */
+    if (rombie_engine_lockstep_sync(ROMBIE_SYNC_APU)) {
+        _mm_setcsr(_mm_getcsr() | 0x8040); /* FTZ | DAZ */
+    }
+#endif
     qemu_mutex_lock(&vwd->lock);
 
     int worker_id = ctz64(vwd->workers_pending);
@@ -1613,19 +1683,9 @@ static void *voice_worker_thread(void *arg)
 
             qemu_mutex_lock(&vwd->lock);
 
-            // Add voice contributions
-            for (int b = 0; b < NUM_MIXBINS; b++) {
-                for (int s = 0; s < NUM_SAMPLES_PER_FRAME; s++) {
-                    vwd->mixbins[b][s] += self->mixbins[b][s];
-                }
-            }
-            if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
-                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-                    d->vp.sample_buf[i][0] += self->sample_buf[i][0];
-                    d->vp.sample_buf[i][1] += self->sample_buf[i][1];
-                }
-            }
-
+            /* The dispatcher adds the workers' mixes in worker order, so
+             * the sum is the same whichever finishes first. */
+            self->mixed = true;
             self->queue_len = 0;
         }
 
@@ -1731,7 +1791,9 @@ voice_work_dispatch(MCPXAPUState *d,
             return;
         }
 
-        if (!any_queued_voice_locked(d)) {
+        /* In lockstep the guest can't unlock a voice until the frame is
+         * done (mcpx_apu_lockstep_tick). */
+        if (d->lockstep || !any_queued_voice_locked(d)) {
             break;
         }
 
@@ -1749,6 +1811,25 @@ voice_work_dispatch(MCPXAPUState *d,
         qemu_cond_wait(&vwd->work_finished, &vwd->lock);
         assert(!vwd->workers_pending);
         vwd->queue_len = 0;
+
+        for (int w = 0; w < vwd->num_workers; w++) {
+            VoiceWorker *worker = &vwd->workers[w];
+            if (!worker->mixed) {
+                continue;
+            }
+            worker->mixed = false;
+            for (int b = 0; b < NUM_MIXBINS; b++) {
+                for (int s = 0; s < NUM_SAMPLES_PER_FRAME; s++) {
+                    vwd->mixbins[b][s] += worker->mixbins[b][s];
+                }
+            }
+            if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    d->vp.sample_buf[i][0] += worker->sample_buf[i][0];
+                    d->vp.sample_buf[i][1] += worker->sample_buf[i][1];
+                }
+            }
+        }
 
         // Add voice contributions
         for (int b = 0; b < NUM_MIXBINS; b++) {
@@ -1769,6 +1850,11 @@ static void voice_work_init(MCPXAPUState *d)
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
     int num_workers = g_config.audio.vp.num_workers ?: SDL_GetNumLogicalCPUCores();
+    /* How voices are shared out decides the order their mixes are added in,
+     * so lockstep has the same number of workers on every PC. */
+    if (rombie_engine_lockstep_sync(ROMBIE_SYNC_APU)) {
+        num_workers = 4;
+    }
     vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
     vwd->workers = g_malloc0_n(vwd->num_workers, sizeof(VoiceWorker));
     vwd->workers_should_exit = false;

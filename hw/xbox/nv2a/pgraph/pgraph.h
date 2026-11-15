@@ -219,6 +219,9 @@ typedef struct PGRAPHState {
     float point_params[8];
 
     VertexAttribute vertex_attributes[NV2A_VERTEXSHADER_ATTRIBUTES];
+    /* The attributes as a state carries them (nv2a.c's subsection): packed
+     * at the save, put back at the load. */
+    uint32_t vertex_attributes_saved[NV2A_VERTEXSHADER_ATTRIBUTES][10];
     uint16_t compressed_attrs;
     uint16_t uniform_attrs;
     uint16_t swizzle_attrs;
@@ -294,6 +297,16 @@ void pgraph_check_within_begin_end_block(PGRAPHState *pg);
 
 void *pfifo_thread(void *arg);
 void pfifo_kick(NV2AState *d);
+void pgraph_gl_lockstep_dump_surfaces(NV2AState *d);
+void pfifo_lockstep_init(NV2AState *d, bool lockstep, bool ahead);
+void pfifo_lockstep_exit(NV2AState *d);
+void pfifo_lockstep_sync(NV2AState *d);
+void pfifo_lockstep_reset(NV2AState *d, bool begin);
+void pfifo_lockstep_defer(NV2AState *d);
+void nv2a_lockstep_gpu_write(NV2AState *d, void *dest, const void *data,
+                         size_t len);
+void nv2a_lockstep_park(NV2AState *d);
+void nv2a_lockstep_park_ram(NV2AState *d);
 
 void pgraph_renderer_register(const PGRAPHRenderer *renderer);
 

@@ -21,6 +21,9 @@
 
 #include "apu_int.h"
 #include "ui/rombie-engine.h"
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 
 MCPXAPUState *g_state; // Used via debug handlers
 
@@ -47,6 +50,8 @@ static void update_irq(MCPXAPUState *d)
 static uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    /* Lockstep's pipeline: any APU access sees its frame landed first. */
+    mcpx_apu_lockstep_commit(d);
 
     uint64_t r = 0;
     switch (addr) {
@@ -68,6 +73,7 @@ static void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    mcpx_apu_lockstep_commit(d);
 
     trace_mcpx_apu_reg_write(addr, size, val);
 
@@ -245,8 +251,12 @@ static void se_frame(MCPXAPUState *d)
     /* Buffer for all mixbins for this frame */
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME] = { 0 };
 
+    const uint64_t vp_from = rombie_prof_now();
     mcpx_apu_vp_frame(d, mixbins);
+    const uint64_t dsp_from = rombie_prof_now();
     mcpx_apu_dsp_frame(d, mixbins);
+    rombie_prof_add(ROMBIE_PROF_APU_VP_NS, dsp_from - vp_from);
+    rombie_prof_add(ROMBIE_PROF_APU_DSP_NS, rombie_prof_now() - dsp_from);
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -260,7 +270,21 @@ static void *mcpx_apu_frame_thread(void *arg)
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
     qemu_mutex_lock(&d->lock);
     while (!qatomic_read(&d->exiting)) {
-        if (d->pause_requested) {
+        /* Lockstep's pipeline: a frame's voices, launched at its tick. */
+        if (d->pipeline && qatomic_read(&d->vp_running)) {
+            qemu_mutex_unlock(&d->lock);
+#if defined(__x86_64__) || defined(__i386__)
+            _mm_setcsr(_mm_getcsr() | 0x8040); /* as the workers */
+#endif
+            const uint64_t vp_from = rombie_prof_now();
+            mcpx_apu_vp_frame(d, d->vp_mixbins);
+            rombie_prof_add(ROMBIE_PROF_APU_VP_NS, rombie_prof_now() - vp_from);
+            qemu_mutex_lock(&d->lock);
+            qatomic_set(&d->vp_running, false);
+            qemu_cond_broadcast(&d->vp_cond);
+            continue;
+        }
+        if (d->pause_requested || d->lockstep) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
             qemu_cond_wait(&d->cond, &d->lock);
@@ -303,6 +327,212 @@ static void *mcpx_apu_frame_thread(void *arg)
     return NULL;
 }
 
+/* 32 samples at 48 kHz, in nanoseconds: 2/3 of a millisecond. */
+#define LOCKSTEP_FRAME_NS(n) ((int64_t)((n) * 2000000ULL / 3))
+
+#define VP_DESC_SIZE (MCPX_HW_MAX_VOICES * NV_PAVS_SIZE)
+
+static void with_flushed_denormals(MCPXAPUState *d,
+                                   void (*fn)(MCPXAPUState *d))
+{
+#if defined(__x86_64__) || defined(__i386__)
+    /* As the voice workers do: denormals flushed alike everywhere, here
+     * only, so nothing else on this thread changes. */
+    const unsigned int csr = _mm_getcsr();
+    _mm_setcsr(csr | 0x8040);
+    fn(d);
+    _mm_setcsr(csr);
+#else
+    fn(d);
+#endif
+}
+
+/* The DSPs' part of a pipelined frame, the sound and the frame's count, on
+ * the CPU thread at its commit, as se_frame ends a frame. */
+static void lockstep_frame_end(MCPXAPUState *d)
+{
+    const uint64_t dsp_from = rombie_prof_now();
+    mcpx_apu_dsp_frame(d, d->vp_mixbins);
+    rombie_prof_add(ROMBIE_PROF_APU_DSP_NS, rombie_prof_now() - dsp_from);
+    mcpx_apu_monitor_frame(d);
+    d->ep_frame_div++;
+    mcpx_debug_end_frame();
+}
+
+/* Lockstep's pipeline, at a frame's tick with d->lock held: its voices
+ * start on the frame thread from a copy of the descriptors as they are now. */
+static void lockstep_launch(MCPXAPUState *d)
+{
+    const hwaddr base = d->regs[NV_PAPU_VPVADDR];
+    if (base + VP_DESC_SIZE > d->ram_size) {
+        with_flushed_denormals(d, se_frame);
+        return;
+    }
+    mcpx_apu_update_dsp_preference(d);
+    mcpx_debug_begin_frame();
+    g_dbg.gp_realtime = d->gp.realtime;
+    g_dbg.ep_realtime = d->ep.realtime;
+    memcpy(d->vp_desc, d->ram_ptr + base, VP_DESC_SIZE);
+    memcpy(d->vp_desc_base, d->vp_desc, VP_DESC_SIZE);
+    d->vp_desc_addr = base;
+    memset(d->vp_mixbins, 0, sizeof(d->vp_mixbins));
+    d->vp_pending = true;
+    qatomic_set(&d->vp_running, true);
+    qemu_cond_broadcast(&d->cond);
+}
+
+/* With d->lock held: the frame's voices done, what the guest could see of
+ * them lands now, then the frame's DSPs run. True if there was one. */
+static bool lockstep_commit_locked(MCPXAPUState *d)
+{
+    if (!d->vp_pending) {
+        return false;
+    }
+    while (qatomic_read(&d->vp_running)) {
+        qemu_cond_wait(&d->vp_cond, &d->lock);
+    }
+    d->vp_pending = false;
+
+    /* Only the words the voices changed, so nothing else is overwritten. */
+    const uint8_t *work = d->vp_desc, *base = d->vp_desc_base;
+    for (size_t i = 0; i < VP_DESC_SIZE; i += 4) {
+        if (memcmp(work + i, base + i, 4)) {
+            stl_le_phys(&address_space_memory, d->vp_desc_addr + i,
+                        ldl_le_p(work + i));
+        }
+    }
+    qemu_mutex_lock(&d->vp_notify_lock);
+    for (guint i = 0; i < d->vp_notify->len; i++) {
+        MCPXAPUHeldByte *b = &g_array_index(d->vp_notify, MCPXAPUHeldByte, i);
+        stb_phys(&address_space_memory, b->addr, b->value);
+    }
+    g_array_set_size(d->vp_notify, 0);
+    qemu_mutex_unlock(&d->vp_notify_lock);
+
+    with_flushed_denormals(d, lockstep_frame_end);
+    if (d->set_irq) {
+        update_irq(d);
+        d->set_irq = false;
+    }
+    return true;
+}
+
+void mcpx_apu_lockstep_commit(MCPXAPUState *d)
+{
+    if (!d->pipeline) {
+        return;
+    }
+    qemu_mutex_lock(&d->lock);
+    lockstep_commit_locked(d);
+    qemu_mutex_unlock(&d->lock);
+}
+
+/* Rombie's netplay handoff: frames count again from the handed-over state's
+ * guest time, as from 0 at a boot. */
+void mcpx_apu_lockstep_rebase(int64_t epoch_ns)
+{
+    MCPXAPUState *d = g_state;
+    if (!d || !d->lockstep) {
+        return;
+    }
+    d->lockstep_epoch = epoch_ns;
+    d->lockstep_frames = 1;
+    timer_mod_ns(d->lockstep_timer, epoch_ns + LOCKSTEP_FRAME_NS(1));
+}
+
+bool mcpx_apu_lockstep_catch_up(void)
+{
+    MCPXAPUState *d = g_state;
+    if (!d || !d->pipeline) {
+        return false;
+    }
+    qemu_mutex_lock(&d->lock);
+    const bool committed = lockstep_commit_locked(d);
+    qemu_mutex_unlock(&d->lock);
+    return committed;
+}
+
+/*
+ * Lockstep: one frame on the CPU thread, as the frame thread's loop runs one,
+ * at its own point of guest time. The vblank keeps real time, so there is no
+ * throttle; and a voice the guest has locked isn't waited for, since the
+ * guest can't run until the frame is done.
+ */
+static void mcpx_apu_lockstep_tick(void *opaque)
+{
+    MCPXAPUState *d = opaque;
+    const uint64_t from = rombie_prof_now();
+
+    qemu_mutex_lock(&d->lock);
+    if (d->pipeline) {
+        lockstep_commit_locked(d);
+    }
+    if (!d->pause_requested) {
+        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                NV_PAPU_SECTL_XCNTMODE);
+        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        bool stopped = xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF ||
+                       (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) ||
+                       (fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        if (stopped || d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+        if (!stopped) {
+            if (d->pipeline) {
+                lockstep_launch(d);
+            } else {
+                with_flushed_denormals(d, se_frame);
+            }
+        }
+    }
+    qemu_mutex_unlock(&d->lock);
+
+    d->lockstep_frames++;
+    timer_mod_ns(d->lockstep_timer,
+                 d->lockstep_epoch + LOCKSTEP_FRAME_NS(d->lockstep_frames));
+    rombie_prof_add(ROMBIE_PROF_APU_NS, rombie_prof_now() - from);
+}
+
+/* Lockstep's APU hash: its registers and both DSPs' memories. */
+uint64_t mcpx_apu_lockstep_hash(void)
+{
+    MCPXAPUState *d = g_state;
+    if (!d) {
+        return 0;
+    }
+    qemu_mutex_lock(&d->lock);
+    /* The vblank's catch-up has committed any frame already; this keeps the
+     * hash off a frame thread at work all the same. */
+    lockstep_commit_locked(d);
+    uint64_t h = rombie_hash64(d->regs, sizeof(d->regs), 2);
+    h = rombie_hash64(d->gp.regs, sizeof(d->gp.regs), h);
+    h = rombie_hash64(d->ep.regs, sizeof(d->ep.regs), h);
+    DSPState *dsps[2] = { d->gp.dsp, d->ep.dsp };
+    static const struct {
+        char space;
+        uint32_t size;
+    } spaces[] = {
+        { 'X', DSP_XRAM_SIZE }, { 'Y', DSP_YRAM_SIZE }, { 'P', DSP_PRAM_SIZE },
+    };
+    static uint32_t words[DSP_XRAM_SIZE];
+    for (int i = 0; i < 2; i++) {
+        if (!dsps[i]) {
+            continue;
+        }
+        for (size_t s = 0; s < ARRAY_SIZE(spaces); s++) {
+            for (uint32_t a = 0; a < spaces[s].size; a++) {
+                words[a] = dsp_read_memory(dsps[i], spaces[s].space, a);
+            }
+            h = rombie_hash64(words, spaces[s].size * sizeof(words[0]), h);
+        }
+    }
+    const uint64_t counters[] = { d->ep_frame_div, d->lockstep_frames };
+    h = rombie_hash64(counters, sizeof(counters), h);
+    qemu_mutex_unlock(&d->lock);
+    return h;
+}
+
 static void mcpx_apu_wait_for_idle(MCPXAPUState *d)
 {
     d->pause_requested = true;
@@ -320,6 +550,17 @@ static void mcpx_apu_resume(MCPXAPUState *d)
 
 static void mcpx_apu_reset_locked(MCPXAPUState *d)
 {
+    /* Lockstep's frame in flight belongs to the machine before the reset (or
+     * the load): its voices end, and nothing of it lands. */
+    if (d->pipeline) {
+        while (qatomic_read(&d->vp_running)) {
+            qemu_cond_wait(&d->vp_cond, &d->lock);
+        }
+        d->vp_pending = false;
+        qemu_mutex_lock(&d->vp_notify_lock);
+        g_array_set_size(d->vp_notify, 0);
+        qemu_mutex_unlock(&d->vp_notify_lock);
+    }
     memset(d->regs, 0, sizeof(d->regs));
 
     mcpx_apu_vp_reset(d);
@@ -351,6 +592,13 @@ static void mcpx_apu_vm_state_change(void *opaque, bool running, RunState state)
     MCPXAPUState *d = opaque;
 
     if (!running) {
+        /* A pipelined frame lands before the machine stops (a save). */
+        if (d->pipeline && rombie_lockstep_tracing()) {
+            fprintf(stderr, "rombie-trace apu stop: frame %s, frames %" PRId64
+                    "\n", d->vp_pending ? "pending" : "none",
+                    (int64_t)d->lockstep_frames);
+        }
+        mcpx_apu_lockstep_commit(d);
         bql_unlock();
         qemu_mutex_lock(&d->lock);
         mcpx_apu_wait_for_idle(d);
@@ -364,11 +612,19 @@ static void mcpx_apu_vm_state_change(void *opaque, bool running, RunState state)
         bql_lock();
     } else {
         qemu_mutex_lock(&d->lock);
-        if (d->gp.dsp) {
-            dsp_sync_from_vm(d->gp.dsp);
-        }
-        if (d->ep.dsp) {
-            dsp_sync_from_vm(d->ep.dsp);
+        /* Only a load changes the saved copy. Put back after a save or a
+         * pause, the round trip isn't exact (the power state, interrupts
+         * beyond four, the old snapshots' M and N register fix-ups applied
+         * to live registers), and a netplay host's DSPs, after it saved a
+         * state, ran on differently from every guest's (Rombie BRAIN-38). */
+        if (d->dsp_from_vm) {
+            if (d->gp.dsp) {
+                dsp_sync_from_vm(d->gp.dsp);
+            }
+            if (d->ep.dsp) {
+                dsp_sync_from_vm(d->ep.dsp);
+            }
+            d->dsp_from_vm = false;
         }
         mcpx_apu_resume(d);
         qemu_mutex_unlock(&d->lock);
@@ -380,6 +636,7 @@ static int mcpx_apu_pre_load(void *opaque)
     MCPXAPUState *d = opaque;
     qemu_mutex_lock(&d->lock);
     mcpx_apu_reset_locked(d);
+    d->dsp_from_vm = true;
     qemu_mutex_unlock(&d->lock);
     return 0;
 }
@@ -425,6 +682,25 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
     }
 
+    d->lockstep = rombie_engine_lockstep_sync(ROMBIE_SYNC_APU);
+    d->pipeline =
+        d->lockstep && rombie_engine_lockstep_sync(ROMBIE_SYNC_APU_AHEAD);
+    if (d->pipeline) {
+        d->vp_desc = g_malloc0(VP_DESC_SIZE);
+        d->vp_desc_base = g_malloc0(VP_DESC_SIZE);
+        d->vp_notify = g_array_new(false, false, sizeof(MCPXAPUHeldByte));
+        qemu_cond_init(&d->vp_cond);
+        qemu_mutex_init(&d->vp_notify_lock);
+    }
+    if (d->lockstep) {
+        d->lockstep_timer =
+            timer_new_ns(QEMU_CLOCK_VIRTUAL, mcpx_apu_lockstep_tick, d);
+        d->lockstep_frames = 1;
+        timer_mod_ns(d->lockstep_timer, LOCKSTEP_FRAME_NS(1));
+    }
+
+    /* The first start puts the saved copy in, as every resume did. */
+    d->dsp_from_vm = true;
     qemu_add_vm_change_state_handler(mcpx_apu_vm_state_change, d);
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread", mcpx_apu_frame_thread,
                        d, QEMU_THREAD_JOINABLE);
@@ -621,4 +897,5 @@ void mcpx_apu_init(PCIBus *bus, int devfn, MemoryRegion *ram)
 
     d->ram = ram;
     d->ram_ptr = memory_region_get_ram_ptr(d->ram);
+    d->ram_size = memory_region_size(d->ram);
 }
