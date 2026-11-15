@@ -576,12 +576,18 @@ void bql_lock_impl(const char *file, int line)
 
     g_assert(!bql_locked());
     bql_lock_fn(&bql, file, line);
+#ifdef XBOX
+    rombie_timers_bql_taken();
+#endif
 }
 
 void bql_unlock(void)
 {
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
+#ifdef XBOX
+    rombie_timers_bql_released();
+#endif
     qemu_mutex_unlock(&bql);
 }
 

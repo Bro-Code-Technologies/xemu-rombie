@@ -264,10 +264,61 @@ static const VMStateDescription icount_vmstate_timers = {
     }
 };
 
+#ifdef XBOX
+/*
+ * Rombie's netplay handoff: the guest time the handed-over state was saved
+ * at, while it loads (-1 otherwise). That state comes from an engine running
+ * alone, without icount, or at another guest speed; either way, guest time
+ * goes on from there, counted in instructions, so every timer the state
+ * holds comes due when it would have. The devices load after this.
+ */
+int64_t rombie_handoff_clock_ns = -1;
+
+static int timers_post_load(void *opaque, int version_id)
+{
+    TimersState *s = opaque;
+    if (rombie_handoff_clock_ns >= 0 && icount_enabled()) {
+        qatomic_set_i64(&s->qemu_icount_bias,
+                        rombie_handoff_clock_ns -
+                            icount_to_ns(qatomic_read_i64(&s->qemu_icount)));
+    }
+    return 0;
+}
+
+/* A state saved in lockstep (icount), loaded later by an engine running
+ * alone, goes on from its guest time: that engine takes the time from
+ * cpu_clock_offset, which icount doesn't keep. */
+static int64_t solo_clock_offset;
+
+static int timers_pre_save(void *opaque)
+{
+    TimersState *s = opaque;
+    if (icount_enabled()) {
+        solo_clock_offset = s->cpu_clock_offset;
+        s->cpu_clock_offset = icount_get();
+    }
+    return 0;
+}
+
+static int timers_post_save(void *opaque)
+{
+    TimersState *s = opaque;
+    if (icount_enabled()) {
+        s->cpu_clock_offset = solo_clock_offset;
+    }
+    return 0;
+}
+#endif
+
 static const VMStateDescription vmstate_timers = {
     .name = "timer",
     .version_id = 2,
     .minimum_version_id = 1,
+#ifdef XBOX
+    .pre_save = timers_pre_save,
+    .post_save = timers_post_save,
+    .post_load = timers_post_load,
+#endif
     .fields = (const VMStateField[]) {
         VMSTATE_INT64(cpu_ticks_offset, TimersState),
         VMSTATE_UNUSED(8),

@@ -10,7 +10,12 @@
  *   0x02 disc data [u8 type][3 pad][u32 request id][bytes] (empty = failed)
  *   0x03 pad       [u8 type][u8 player][2 pad][u32 buttons][f32 lx][f32 ly]
  *                  [f32 rx][f32 ry][f32 lt][f32 rt]        (player 0-3)
- *   0x04 control   [u8 type][u8 op]          (1 pause, 2 resume, 3 exit)
+ *   0x04 control   [u8 type][u8 op]          (1 pause, 2 resume, 3 exit,
+ *                  4 restart: the engine starts itself again, with the same
+ *                  key and port, and ends; the page connects again;
+ *                  5 System Link's cable in, 6 out, before boot or while the
+ *                  game runs, never in lockstep; the engine answers with the
+ *                  link-cable event, "in" or "out")
  *   0x05 ping      [u8 type][7 pad][f64 page time, ms]
  *   0x06 save state   [u8 type][u8 slot]     (1-255; replaces the slot)
  *   0x07 load state   [u8 type][u8 slot]
@@ -18,24 +23,87 @@
  *                  game, which starts from the blank hard disk)
  *   0x09 speed     [u8 type][3 pad][f32 ratio] (1 = normal; more = faster)
  *   0x0E delete state [u8 type][u8 slot]
+ *   0x0B lockstep  [u8 type][u8 flags][2 pad][u32 hash every][u16 year]
+ *                  [u8 month][u8 day][u8 hour][u8 minute][u8 second][pad]
+ *                  (before boot; flags: 1 lockstep, 2 unthrottled; 0x04
+ *                  a speed test, which sends one frame in ten and no game
+ *                  data, so its page and tools cost the PC little; 0x08
+ *                  keeps the GPU from working
+ *                  ahead between the CPU's waits; 0x10, 0x20 and 0x40
+ *                  leave the APU, GPU and I/O syncs off; 0x80 runs each
+ *                  APU frame's voices on the CPU thread; 0x04 and up for
+ *                  development tests only)
+ *                  [u32 guest speed, optional: sixteenths of a ns an
+ *                  instruction, 8-1024; 0 or absent: QEMU's shift]
+ *   0x0C inputs    [u8 type][3 pad][u32 first vblank][u32 count]
+ *                  [count x 4 pads: u16 buttons, i8 lx, ly, rx, ry,
+ *                  u8 lt, rt]     (lockstep: vblank N runs once N's are in)
+ *   0x0D netplay   [u8 type][u8 op][2 pad][u32 vblank][u32 hash every]
+ *                  [join: the state]
+ *                  1 host, while the game runs (never paused): the machine
+ *                  stops where it is and the engine sends 0x85 and 0x88,
+ *                  which every PC boots with, this one too (restart);
+ *                  2 join, after 0x0B and 0x08 and before boot: the machine
+ *                  loads the state before it first runs, and lockstep goes
+ *                  on from the vblank named;
+ *                  3 end, in lockstep: the vblanks wait for no input and the
+ *                  guest reads 0x03's pads, at the guest speed reached
+ *                  Development: with ROMBIE_HANDOFF_DIR set, the host writes
+ *                  the handoff there (host-gamedata.bin, guests-gamedata.bin,
+ *                  state.bin) and sends 0x88 empty, and a join with no state
+ *                  reads the state and the game data from there ([2]: 1 the
+ *                  guests', 2 the host's own), so a test page's DevTools
+ *                  connection never carries them (Halo 2's disk: 700 MB);
+ *                  ROMBIE_LOCKSTEP_READBACK_MS has a speed test read its
+ *                  game data back that often, as 0x85 would, and drop it
+ *   0x0F speed at  [u8 type][3 pad][u32 vblank][u32 guest speed, as 0x0B's]
+ *                  (lockstep: from that vblank on; every engine needs the
+ *                  same before it gets there, so the page slows or speeds
+ *                  the guest's CPU for all to what the slowest keeps up with)
+ *   0x11 link frame [u8 type][3 pad][Ethernet frame, 14-1518 bytes]
+ *                  (System Link: for the network card, with the cable in)
  * Engine to page (binary):
  *   0x81 disc read [u8 type][3 pad][u32 request id][u64 offset][u32 length]
  *   0x82 frame     [u8 type][3 pad][u32 frame no][f64 engine time, ms]
  *                  [u16 w][u16 h][u32 vblank no][RGBA]
  *   0x83 audio     [u8 type][3 pad][u32 frames][f32 stereo, 48 kHz]
  *   0x85 game data [u8 type][7 pad][blob]    (a second after the game last
- *                  wrote its hard disk, after every state change, before a
- *                  pause and on exit)
- * Engine to page (text, JSON): hello, event, stats (once a second), pong,
- * and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after boot
- * and after every state change.
+ *                  wrote its hard disk outside its cache partitions, after
+ *                  every state change, before a pause and on exit; in
+ *                  netplay a write waits for the session's end or the exit,
+ *                  and a handoff sends it)
+ *   0x86 hashes    [u8 type][3 pad][u32 vblank][u32 count][count x u64]
+ *                  (lockstep, at the start of the vblank: RAM, CPU, NV2A,
+ *                  APU, I/O, guest time)
+ *   0x87 vblank    [u8 type][3 pad][u32 vblank] (lockstep: runs next, once
+ *                  its input is in)
+ *   0x88 netplay   [u8 type][3 pad][u32 vblank][u64 game data size]
+ *                  [game data][state]  (after 0x0D host: what every PC
+ *                  boots with; the game data is a blob as 0x08's, its disk
+ *                  as it stands without the player's save states or what
+ *                  is the disc's, and the state is u64 guest time (ns), u32
+ *                  run count, u32 0, the runs of disk that are the disc's
+ *                  sectors (u64 disk offset, u32 sector, u32 sectors, u64
+ *                  check), which each PC reads from its own disc, and the
+ *                  machine's state, without the BIOS, which each PC has its
+ *                  own of)
+ *   0x89 link frame [u8 type][3 pad][Ethernet frame] (System Link: what the
+ *                  network card sent, with the cable in; the page is the
+ *                  switch that takes it to the other consoles)
+ * Engine to page (text, JSON): hello, event, stats (once a second: with
+ * flips, the game's own frames, lw, the ms lockstep waited for input, and
+ * link, System Link's frames and bytes from the page and to it),
+ * pong, and slots: {"t":"slots","slots":[{"slot","engine","date"}]} after
+ * boot and after every state change. In lockstep, prof (once a second,
+ * before stats) says where the CPU thread's time went.
  * The game data blob is the game's one stored object: its hard disk image,
  * whose save states live inside it as snapshots, and its EEPROM
  * (rombie-engine-media.h has the layout).
  * Pad buttons: bit i is the Duke's button i in xemu's ControllerState order
  * (A, B, X, Y, d-pad left, up, right, down, Back, Start, White, Black,
  * left stick, right stick). Sticks and triggers run -1..1 and 0..1, with +y
- * down as in the browser's standard gamepad mapping.
+ * down as in the browser's standard gamepad mapping; lockstep's are the same
+ * in eight bits (-128..127, 0..255).
  *
  * One game per process: the machine boots when the page's boot message
  * arrives and the process ends when the game stops or the page stays gone.
@@ -52,6 +120,8 @@
 
 #include "../rombie-engine.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -60,6 +130,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -95,12 +166,24 @@ typedef int engine_socket;
 
 extern "C" {
 #include "system/cpu-timers.h"
+extern uint64_t vblank_interval_ns; /* ui/xemu.c */
+void rombie_icount_set_scale(int64_t q16); /* accel/tcg/icount-common.c */
+void nv2a_lockstep_dump(uint32_t vblank);  /* hw/xbox/nv2a/nv2a.c */
+void rombie_rtc_restart_clock(void);       /* hw/rtc/mc146818rtc.c */
+void xemu_lockstep_vblank_rebase(int64_t epoch_ns); /* ui/xemu.c */
+void mcpx_apu_lockstep_rebase(int64_t epoch_ns);   /* hw/xbox/mcpx/apu */
 }
+
+/* Development (0x10): the vblank at which to dump RAM's page hashes and the
+ * GPU's surfaces into the log, to find what differs between two engines. */
+static std::atomic<uint32_t> s_dump_at{UINT32_MAX};
 
 #include "../rombie-engine-media.h"
 #include "../rombie-engine-version.h"
 
-static constexpr int PROTOCOL_VERSION = 1;
+/* 2: lockstep (0x0B, 0x0C, 0x86, 0x87, lw in the stats). 3: netplay (0x0D,
+ * 0x88, restart). 4: System Link (0x11, 0x89, the cable's 0x04 ops). */
+static constexpr int PROTOCOL_VERSION = 4;
 static constexpr uint16_t ENGINE_PORT = 47653;
 
 static constexpr uint8_t MSG_BOOT = 0x01;
@@ -113,10 +196,38 @@ static constexpr uint8_t MSG_LOAD_STATE = 0x07;
 static constexpr uint8_t MSG_GAME_DATA = 0x08;
 static constexpr uint8_t MSG_SPEED = 0x09;
 static constexpr uint8_t MSG_DELETE_STATE = 0x0E;
+static constexpr uint8_t MSG_LOCKSTEP = 0x0B;
+static constexpr uint8_t MSG_INPUTS = 0x0C;
+static constexpr uint8_t MSG_NETPLAY = 0x0D;
+static constexpr uint8_t MSG_SPEED_AT = 0x0F;
+static constexpr uint8_t MSG_DUMP_AT = 0x10; /* development */
+static constexpr uint8_t MSG_LINK_FRAME = 0x11;
 static constexpr uint8_t MSG_DISC_READ = 0x81;
 static constexpr uint8_t MSG_FRAME = 0x82;
 static constexpr uint8_t MSG_AUDIO = 0x83;
 static constexpr uint8_t MSG_GAME_DATA_SAVED = 0x85;
+static constexpr uint8_t MSG_HASHES = 0x86;
+static constexpr uint8_t MSG_VBLANK = 0x87;
+static constexpr uint8_t MSG_NETPLAY_STATE = 0x88;
+static constexpr uint8_t MSG_LINK_FRAME_OUT = 0x89;
+
+static constexpr uint8_t NETPLAY_HOST = 1;
+static constexpr uint8_t NETPLAY_JOIN = 2;
+static constexpr uint8_t NETPLAY_END = 3;
+
+static constexpr uint8_t LOCKSTEP_ON = 0x01;
+static constexpr uint8_t LOCKSTEP_UNTHROTTLED = 0x02;
+static constexpr uint8_t LOCKSTEP_SPEED_TEST = 0x04;
+static constexpr uint8_t LOCKSTEP_GPU_SERIAL = 0x08;
+static constexpr uint8_t LOCKSTEP_NO_APU_SYNC = 0x10;
+static constexpr uint8_t LOCKSTEP_NO_GPU_SYNC = 0x20;
+static constexpr uint8_t LOCKSTEP_NO_IO_SYNC = 0x40;
+static constexpr uint8_t LOCKSTEP_APU_SERIAL = 0x80;
+static constexpr size_t LOCKSTEP_PAD_SIZE = 8;
+static constexpr uint32_t MAX_INPUT_FRAMES = 3600;
+/* Further behind real time than this (a pause, a long wait for the other
+ * PCs), lockstep starts keeping time afresh rather than run flat out. */
+static constexpr double PACE_RESET_MS = 1000.0;
 
 /* A game usually writes several times in a row when it saves; wait for it
  * to finish before sending the image. */
@@ -125,6 +236,9 @@ static constexpr double HDD_SETTLE_MS = 1000.0;
 static constexpr uint8_t CONTROL_PAUSE = 1;
 static constexpr uint8_t CONTROL_RESUME = 2;
 static constexpr uint8_t CONTROL_EXIT = 3;
+static constexpr uint8_t CONTROL_RESTART = 4;
+static constexpr uint8_t CONTROL_LINK_IN = 5;
+static constexpr uint8_t CONTROL_LINK_OUT = 6;
 
 static constexpr size_t FRAME_HEADER = 24;
 static constexpr size_t AUDIO_HEADER = 8;
@@ -132,13 +246,19 @@ static constexpr size_t AUDIO_RING_FRAMES = 48000; /* 1 s of 48 kHz stereo */
 /* The game data blob carries every save state (~50 MB each) with the disk. */
 static constexpr size_t MAX_MESSAGE_SIZE = (size_t)1 << 30;
 
-/* The only pages that may drive the engine. */
+/* The only pages that may drive the engine: Rombie in production, its staging site, and Rombie's local servers below. */
 static constexpr const char *ALLOWED_ORIGINS[] = {
     "https://rombie.app",
     "https://staged.rombie.app",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
 };
+/* Rombie's local port block (brotocol's web-apps profile): its dev server, its preview and the rest of the block, on
+ * either local host name. */
+static constexpr const char *DEV_BLOCK_HOSTS[] = {
+    "http://localhost:",
+    "http://127.0.0.1:",
+};
+static constexpr int DEV_BLOCK_FIRST_PORT = 10020;
+static constexpr int DEV_BLOCK_LAST_PORT = 10029;
 
 /* How long a link-started engine waits for its page before booting, and how
  * long a running game outlives its page, so a reload can reconnect. */
@@ -148,6 +268,9 @@ static constexpr double RECONNECT_GRACE_S = 10.0;
 enum class Mode { None, Setup, Unregister, Link, Dev };
 
 static Mode s_mode = Mode::None;
+/* Started by an engine's restart (0x04 op 4), whose process lets go of the
+ * port just before this one listens. */
+static bool s_restarted;
 static uint16_t s_port = ENGINE_PORT;
 static std::string s_dev_origin;
 static std::string s_data_dir;
@@ -193,12 +316,21 @@ static double s_hdd_written_ms;
  * slots and the current image. */
 static std::atomic<bool> s_resend_media{false};
 static void SendGameData(void);
+static void SendGameDataNow(void);
+[[noreturn]] static void RestartSelf(void);
 static uint64_t s_disc_size;
 static std::string s_disc_name;
 
 /* Control work for the UI thread, run inside the main-loop lock. */
 static std::mutex s_work_mutex;
 static std::deque<std::function<void()>> s_work;
+/* In lockstep, work that stops the machine (a save, a load, netplay's host,
+ * exit) waits until the CPU thread holds at a vblank (s_held_at), where the
+ * GPU has done all it was given: stopped anywhere else, its thread may be
+ * parked on an interrupt for a CPU that no longer runs. */
+static std::deque<std::function<void()>> s_held_work; /* s_work_mutex */
+static std::atomic<bool> s_hold{false};
+static std::atomic<int64_t> s_held_at{-1};
 
 /* Pads as the page last sent them (s_pad_mutex). */
 struct PadState {
@@ -212,16 +344,147 @@ static PadState s_pads[4];
 static constexpr float MAX_SPEED = 10.0f;
 static std::atomic<double> s_speed{1.0};
 
-/* Pending disc reads (s_disc_mutex). */
-struct PendingRead {
+/* Lockstep, as 0x0B set it before boot (s_boot_mutex until then; read-only
+ * once QEMU starts). */
+static uint8_t s_lockstep_flags;
+static uint32_t s_hash_every;
+static std::string s_icount_option;
+static std::string s_rtc_option;
+
+struct LockstepPad {
+    uint16_t buttons;
+    int8_t axes[4]; /* lx, ly, rx, ry; +y down */
+    uint8_t triggers[2];
+};
+using LockstepInput = std::array<LockstepPad, 4>;
+/* Input for the vblanks from s_inputs_first on, as 0x0C brought it. */
+static std::mutex s_input_mutex;
+static std::condition_variable s_input_cv;
+static std::deque<LockstepInput> s_inputs;
+static uint32_t s_inputs_first;
+/* What the guest's pads read in lockstep (s_pad_mutex), from the vblank
+ * that applied them. */
+static LockstepInput s_lockstep_pads;
+/* The CPU thread's: the vblank that runs next, and real time's anchor. */
+static uint32_t s_lockstep_vblank;
+static uint32_t s_announced_vblank = UINT32_MAX;
+static double s_pace_from_ms = -1.0;
+static uint32_t s_pace_from_vblank;
+/* Netplay's join, as 0x0D brought it before boot (s_boot_mutex): the state
+ * the machine loads before it first runs (rombie_engine_before_start). */
+static std::vector<uint8_t> s_join_state;
+static uint32_t s_join_vblank;
+/* After 0x0D's end: guest time stays counted in instructions, but the
+ * vblanks wait for no input and the guest reads the page's own pads. */
+static std::atomic<bool> s_netplay_ended{false};
+/* Its 0x86 and 0x87, for the sender thread. */
+static std::mutex s_lockstep_out_mutex;
+static std::deque<std::vector<uint8_t>> s_lockstep_out;
+static void SendLockstepMessages(void);
+
+/* The disc, read from the page in whole chunks (s_disc_mutex). The page
+ * answers each read in tens of milliseconds, so every read also asks for
+ * the chunks after it, which a sequential stream then finds here, and the
+ * last few dozen chunks stay for reads that come back to them. */
+static constexpr uint32_t DISC_CHUNK = 1024 * 1024;
+static constexpr uint64_t DISC_AHEAD = 2; /* chunks asked for past a read */
+static constexpr size_t DISC_KEEP = 24;   /* chunks kept */
+struct DiscWaiter {
     void *dst;
+    uint64_t offset;
     uint32_t length;
     rombie_disc_read_cb cb;
     void *opaque;
+    int missing; /* its chunks still to come */
+    bool settled;
+};
+struct DiscChunk {
+    std::vector<uint8_t> data;
+    bool ready;
+    uint32_t id; /* the page request, until ready */
+    double asked_ms;
+    uint64_t used; /* for keeping the most recent */
+    std::vector<std::shared_ptr<DiscWaiter>> waiters;
+    /* Reads still to copy from it: it stays until they have. One that went
+     * while a read waited on its other chunk handed that read whatever was
+     * left, which differed between PCs. */
+    int pins;
 };
 static std::mutex s_disc_mutex;
-static std::unordered_map<uint32_t, PendingRead> s_reads;
+static std::unordered_map<uint64_t, DiscChunk> s_chunks; /* by index */
+static std::unordered_map<uint32_t, uint64_t> s_chunk_ids;
 static uint32_t s_next_read_id;
+static uint64_t s_chunk_clock;
+static double NowMs(void);
+
+/* s_disc_mutex held, every chunk of the read ready. */
+static void CopyFromChunksLocked(const DiscWaiter &w)
+{
+    uint64_t at = w.offset;
+    const uint64_t end = w.offset + w.length;
+    while (at < end) {
+        const DiscChunk &chunk = s_chunks[at / DISC_CHUNK];
+        const uint64_t in = at % DISC_CHUNK;
+        const uint64_t n = std::min<uint64_t>(end - at, chunk.data.size() - in);
+        memcpy((uint8_t *)w.dst + (at - w.offset), chunk.data.data() + in, n);
+        at += n;
+    }
+}
+
+/* s_disc_mutex held: a settled read lets go of its chunks. */
+static void UnpinLocked(const DiscWaiter &w)
+{
+    const uint64_t last = (w.offset + w.length - 1) / DISC_CHUNK;
+    for (uint64_t i = w.offset / DISC_CHUNK; i <= last; i++) {
+        const auto it = s_chunks.find(i);
+        if (it != s_chunks.end() && it->second.pins > 0) {
+            it->second.pins--;
+        }
+    }
+}
+
+/* s_disc_mutex held: the least recently used chunks go, if no read still
+ * needs them. */
+static void EvictChunksLocked(void)
+{
+    while (s_chunks.size() >= DISC_KEEP) {
+        auto victim = s_chunks.end();
+        for (auto it = s_chunks.begin(); it != s_chunks.end(); ++it) {
+            if (it->second.ready && it->second.pins == 0 &&
+                (victim == s_chunks.end() ||
+                 it->second.used < victim->second.used)) {
+                victim = it;
+            }
+        }
+        if (victim == s_chunks.end()) {
+            break;
+        }
+        s_chunks.erase(victim);
+    }
+}
+
+/* s_disc_mutex held: chunk `index` is here or on its way. Returns the id of
+ * a request to send for it, or 0. */
+static uint32_t AskChunkLocked(uint64_t index)
+{
+    if (index * DISC_CHUNK >= s_disc_size) {
+        return 0;
+    }
+    const auto it = s_chunks.find(index);
+    if (it != s_chunks.end()) {
+        it->second.used = ++s_chunk_clock;
+        return 0;
+    }
+    EvictChunksLocked();
+    DiscChunk &chunk = s_chunks[index];
+    chunk.ready = false;
+    chunk.pins = 0;
+    chunk.id = ++s_next_read_id;
+    chunk.asked_ms = NowMs();
+    chunk.used = ++s_chunk_clock;
+    s_chunk_ids[chunk.id] = index;
+    return chunk.id;
+}
 
 /* Frame handoff: capture writes `back`, swaps it in as `pending`. */
 static std::mutex s_frame_mutex;
@@ -250,9 +513,19 @@ struct Stats {
     std::atomic<uint32_t> disc_reads{0};
     std::atomic<uint64_t> disc_bytes{0};
     std::atomic<uint64_t> disc_wait_us{0};
+    std::atomic<uint64_t> lockstep_wait_us{0}; /* waiting for input */
+    /* A wait for input still going: the monotonic us it was last counted
+     * from (0 for none), so a long one shows in each second it lasts. */
+    std::atomic<int64_t> lockstep_wait_mark_us{0};
+    std::atomic<uint64_t> lockstep_pace_us{0}; /* ahead of real time */
     std::atomic<uint32_t> width{0}, height{0};
+    /* System Link's frames from the page and to it, and their bytes. */
+    std::atomic<uint32_t> link_in{0}, link_out{0};
+    std::atomic<uint64_t> link_in_bytes{0}, link_out_bytes{0};
 };
 static Stats s_stats;
+/* System Link's cable, as the page last set it (0x04): out until then. */
+static std::atomic<bool> s_link_cable{false};
 
 static double NowMs(void)
 {
@@ -362,6 +635,27 @@ static std::string QueryParam(const std::string &url, const char *name)
     return "";
 }
 
+/* Exactly a block host and five digits within the block, with nothing after them. */
+static bool IsDevBlockOrigin(const std::string &origin)
+{
+    for (const char *host : DEV_BLOCK_HOSTS) {
+        const size_t length = strlen(host);
+        if (origin.size() != length + 5 || origin.compare(0, length, host) != 0) {
+            continue;
+        }
+        int port = 0;
+        for (size_t i = length; i < origin.size(); i++) {
+            const char ch = origin[i];
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            port = port * 10 + (ch - '0');
+        }
+        return port >= DEV_BLOCK_FIRST_PORT && port <= DEV_BLOCK_LAST_PORT;
+    }
+    return false;
+}
+
 static bool IsAllowedOrigin(const std::string &origin)
 {
     for (const char *allowed : ALLOWED_ORIGINS) {
@@ -369,7 +663,7 @@ static bool IsAllowedOrigin(const std::string &origin)
             return true;
         }
     }
-    return !s_dev_origin.empty() && origin == s_dev_origin;
+    return IsDevBlockOrigin(origin) || (!s_dev_origin.empty() && origin == s_dev_origin);
 }
 
 /* --------------------------------------------------------------------------
@@ -667,10 +961,26 @@ static Response Decide(const Request &request)
     return { 101 };
 }
 
+static void QueueAtVblank(std::function<void()> work);
+
 static void QueueWork(std::function<void()> work)
 {
     std::unique_lock<std::mutex> lock(s_work_mutex);
     s_work.push_back(std::move(work));
+}
+
+static void QueueAtVblank(std::function<void()> work)
+{
+    if (!rombie_engine_lockstep() || !s_booted.load()) {
+        QueueWork(std::move(work));
+        return;
+    }
+    {
+        std::unique_lock<std::mutex> lock(s_work_mutex);
+        s_held_work.push_back(std::move(work));
+    }
+    s_hold.store(true);
+    s_input_cv.notify_all();
 }
 
 /* --------------------------------------------------------------------------
@@ -740,32 +1050,92 @@ static void HandleDiscData(const std::vector<uint8_t> &data)
     }
     const uint32_t id = ReadValue<uint32_t>(data, 4);
 
-    PendingRead read;
+    std::vector<std::shared_ptr<DiscWaiter>> done, failed;
+    uint64_t arrived = UINT64_MAX;
+    size_t arrived_size = 0;
     {
         std::unique_lock<std::mutex> lock(s_disc_mutex);
-        const auto it = s_reads.find(id);
-        if (it == s_reads.end()) {
+        const auto idit = s_chunk_ids.find(id);
+        if (idit == s_chunk_ids.end()) {
             return;
         }
-        read = it->second;
-        s_reads.erase(it);
+        const uint64_t index = idit->second;
+        s_chunk_ids.erase(idit);
+        const auto it = s_chunks.find(index);
+        if (it == s_chunks.end()) {
+            return;
+        }
+        DiscChunk &chunk = it->second;
+        s_stats.disc_wait_us.fetch_add(
+            (uint64_t)((NowMs() - chunk.asked_ms) * 1000),
+            std::memory_order_relaxed);
+        const uint64_t offset = index * DISC_CHUNK;
+        const size_t expect = (size_t)std::min<uint64_t>(DISC_CHUNK,
+                                                         s_disc_size - offset);
+        if (data.size() - 8 != expect) {
+            const auto waiters = std::move(chunk.waiters);
+            s_chunks.erase(it);
+            for (auto &w : waiters) {
+                if (!w->settled) {
+                    w->settled = true;
+                    UnpinLocked(*w);
+                    failed.push_back(w);
+                }
+            }
+        } else {
+            chunk.data.assign(data.begin() + 8, data.end());
+            chunk.ready = true;
+            arrived = offset;
+            arrived_size = expect;
+            const auto waiters = std::move(chunk.waiters);
+            chunk.waiters.clear();
+            for (auto &w : waiters) {
+                if (!w->settled && --w->missing == 0) {
+                    CopyFromChunksLocked(*w);
+                    w->settled = true;
+                    UnpinLocked(*w);
+                    done.push_back(w);
+                }
+            }
+        }
     }
-    const bool ok = data.size() - 8 == read.length;
-    if (ok) {
-        memcpy(read.dst, data.data() + 8, read.length);
+    /* Known before any read it answers returns. */
+    if (arrived != UINT64_MAX) {
+        rombie_media_disc_chunk(arrived, data.data() + 8, arrived_size);
     }
-    read.cb(read.opaque, ok);
+    for (auto &w : done) {
+        w->cb(w->opaque, true);
+    }
+    for (auto &w : failed) {
+        w->cb(w->opaque, false);
+    }
 }
 
 static void FailAllDiscReads(void)
 {
-    std::unordered_map<uint32_t, PendingRead> reads;
+    std::vector<std::shared_ptr<DiscWaiter>> failed;
     {
         std::unique_lock<std::mutex> lock(s_disc_mutex);
-        reads.swap(s_reads);
+        for (auto it = s_chunks.begin(); it != s_chunks.end();) {
+            if (it->second.ready) {
+                ++it;
+                continue;
+            }
+            for (auto &w : it->second.waiters) {
+                if (!w->settled) {
+                    w->settled = true;
+                    failed.push_back(w);
+                }
+            }
+            it = s_chunks.erase(it);
+        }
+        for (auto &w : failed) {
+            UnpinLocked(*w);
+        }
+        s_chunk_ids.clear();
     }
-    for (auto &entry : reads) {
-        entry.second.cb(entry.second.opaque, false);
+    for (auto &w : failed) {
+        w->cb(w->opaque, false);
     }
 }
 
@@ -774,9 +1144,135 @@ static float ClampUnit(float v, float lo)
     return (v != v) ? 0.0f : (v < lo ? lo : (v > 1.0f ? 1.0f : v));
 }
 
+/* Lockstep's guest speed, in sixteenths of a ns an instruction: 0x0B's to
+ * start with and 0x0F's changes, each from the vblank it names, applied by
+ * the CPU thread (ApplyIcountSchedule). Every engine gets the same, ahead
+ * of that vblank, so all change at the same point of guest time. */
+static constexpr uint32_t SPEED_Q16_MIN = 8;    /* 0.5 ns */
+static constexpr uint32_t SPEED_Q16_MAX = 1024; /* 64 ns */
+static std::mutex s_speed_mutex;
+static std::vector<std::pair<uint32_t, uint32_t>> s_speed_changes;
+static std::atomic<uint32_t> s_speed_q16{0};
+
+static void QueueSpeedChange(uint32_t vblank, uint32_t q16)
+{
+    if (q16 < SPEED_Q16_MIN || q16 > SPEED_Q16_MAX) {
+        SendEvent("error", "A lockstep speed is out of range.");
+        return;
+    }
+    std::unique_lock<std::mutex> lock(s_speed_mutex);
+    s_speed_changes.emplace_back(vblank, q16);
+}
+
+static void HandleSpeedAt(const std::vector<uint8_t> &data)
+{
+    if (!rombie_engine_lockstep() || data.size() < 12) {
+        return;
+    }
+    QueueSpeedChange(ReadValue<uint32_t>(data, 4), ReadValue<uint32_t>(data, 8));
+}
+
+static void HandleLockstep(const std::vector<uint8_t> &data)
+{
+    if (data.size() < 16) {
+        return;
+    }
+    const uint8_t flags = data[1];
+    const uint32_t every = ReadValue<uint32_t>(data, 4);
+    const unsigned year = ReadValue<uint16_t>(data, 8);
+    const unsigned month = data[10], day = data[11], hour = data[12],
+                   minute = data[13], second = data[14];
+    if (year < 2001 || year > 2099 || month < 1 || month > 12 || day < 1 ||
+        day > 31 || hour > 23 || minute > 59 || second > 59) {
+        SendEvent("error", "The lockstep message's clock isn't a valid date.");
+        return;
+    }
+    if (data.size() >= 20) {
+        const uint32_t q16 = ReadValue<uint32_t>(data, 16);
+        if (q16) {
+            QueueSpeedChange(0, q16);
+        }
+    }
+    char rtc[64];
+    snprintf(rtc, sizeof(rtc), "base=%04u-%02u-%02uT%02u:%02u:%02u,clock=vm",
+             year, month, day, hour, minute, second);
+
+    /* Development only: how many guest instructions make a nanosecond, as
+     * QEMU's icount shift (2^shift ns an instruction). */
+    int shift = 0;
+    const char *shift_env = getenv("ROMBIE_ICOUNT_SHIFT");
+    if (shift_env && shift_env[0] >= '0' && shift_env[0] <= '9' &&
+        !shift_env[1]) {
+        shift = shift_env[0] - '0';
+    }
+
+    std::unique_lock<std::mutex> lock(s_boot_mutex);
+    if (s_boot_ready) {
+        lock.unlock();
+        SendEvent("error", "Lockstep must be set before the boot message.");
+        return;
+    }
+    s_lockstep_flags = (flags & LOCKSTEP_ON) ? flags : 0;
+    /* Lockstep boots every PC at a handoff, so the full startup animation
+     * would cost each one its seconds of heavy GPU work; and its render
+     * targets, copied into memory the game may later read before writing,
+     * differ between GPU makers. ROMBIE_LOCKSTEP_FULL_ANIMATION=1 keeps it
+     * (development). */
+    const char *full_anim = getenv("ROMBIE_LOCKSTEP_FULL_ANIMATION");
+    if (s_lockstep_flags && !(full_anim && full_anim[0] == '1')) {
+        g_config.general.skip_boot_anim = true;
+    }
+    s_hash_every = every;
+    s_rtc_option = rtc;
+    s_icount_option =
+        "shift=" + std::to_string(shift) + ",sleep=off,align=off";
+}
+
+static void HandleInputs(const std::vector<uint8_t> &data)
+{
+    if (!rombie_engine_lockstep() || data.size() < 12) {
+        return;
+    }
+    const uint32_t first = ReadValue<uint32_t>(data, 4);
+    const uint32_t count = ReadValue<uint32_t>(data, 8);
+    if (count > MAX_INPUT_FRAMES ||
+        data.size() < 12 + (size_t)count * 4 * LOCKSTEP_PAD_SIZE) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(s_input_mutex);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t vblank = first + i;
+        if (vblank < s_inputs_first) {
+            continue; /* already run */
+        }
+        const size_t index = vblank - s_inputs_first;
+        if (index > s_inputs.size()) {
+            break; /* a gap; what fills it comes first */
+        }
+        LockstepInput input;
+        for (int p = 0; p < 4; p++) {
+            const size_t at = 12 + ((size_t)i * 4 + p) * LOCKSTEP_PAD_SIZE;
+            input[p].buttons = ReadValue<uint16_t>(data, at);
+            for (int a = 0; a < 4; a++) {
+                input[p].axes[a] = (int8_t)data[at + 2 + a];
+            }
+            input[p].triggers[0] = data[at + 6];
+            input[p].triggers[1] = data[at + 7];
+        }
+        if (index == s_inputs.size()) {
+            s_inputs.push_back(input);
+        } else {
+            s_inputs[index] = input;
+        }
+    }
+    lock.unlock();
+    s_input_cv.notify_all();
+}
+
 static void HandlePad(const std::vector<uint8_t> &data)
 {
-    if (data.size() < 32 || data[1] >= 4) {
+    /* In lockstep the pads are the vblanks' inputs (0x0C). */
+    if (data.size() < 32 || data[1] >= 4 || rombie_engine_lockstep()) {
         return;
     }
     PadState pad;
@@ -798,11 +1294,12 @@ static void HandleControl(const std::vector<uint8_t> &data)
         return;
     }
     const uint8_t op = data[1];
-    QueueWork([op]() {
-        if (!s_vm_ready.load()) {
-            return;
-        }
-        if (op == CONTROL_PAUSE && runstate_is_running()) {
+    if (op == CONTROL_PAUSE) {
+        /* In lockstep at a vblank, as a save is. */
+        QueueAtVblank([]() {
+            if (!s_vm_ready.load() || !runstate_is_running()) {
+                return;
+            }
             /* A save written just before pausing shouldn't wait for the
              * game to resume. */
             if (s_hdd_dirty) {
@@ -810,16 +1307,42 @@ static void HandleControl(const std::vector<uint8_t> &data)
             }
             vm_stop(RUN_STATE_PAUSED);
             SendEvent("paused");
-        } else if (op == CONTROL_RESUME && !runstate_is_running()) {
+        });
+        return;
+    }
+    if (op == CONTROL_LINK_IN || op == CONTROL_LINK_OUT) {
+        /* Lockstep's machines must see the same, so it never links. */
+        const bool in = op == CONTROL_LINK_IN && !rombie_engine_lockstep();
+        s_link_cable.store(in);
+        /* Before boot the machine takes it as it's made (rombie_link_init). */
+        QueueWork([in]() {
+            if (s_link_cable.load() == in) {
+                rombie_link_set_cable(in);
+            }
+        });
+        SendEvent("link-cable", in ? "in" : "out");
+        return;
+    }
+    QueueWork([op]() {
+        if (!s_vm_ready.load()) {
+            return;
+        }
+        if (op == CONTROL_RESUME && !runstate_is_running()) {
             vm_start();
             SendEvent("resumed");
-        } else if (op == CONTROL_EXIT) {
-            if (s_booted.load()) {
-                SendGameData();
-            }
-            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        } else if (op == CONTROL_RESTART) {
+            RestartSelf();
         }
     });
+    if (op == CONTROL_EXIT) {
+        QueueAtVblank([]() {
+            /* Netplay's held game data goes now too. */
+            if (s_booted.load() && !(s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
+                SendGameDataNow();
+            }
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        });
+    }
 }
 
 static void HandlePing(const std::vector<uint8_t> &data)
@@ -837,7 +1360,8 @@ static void HandlePing(const std::vector<uint8_t> &data)
 
 static void HandleSpeed(const std::vector<uint8_t> &data)
 {
-    if (data.size() < 8) {
+    /* Lockstep runs at the console's own speed, or flat out (0x0B). */
+    if (data.size() < 8 || rombie_engine_lockstep()) {
         return;
     }
     const float ratio = ReadValue<float>(data, 4);
@@ -860,28 +1384,42 @@ static void HandleSpeed(const std::vector<uint8_t> &data)
 struct GameDataView {
     const uint8_t *eeprom;
     size_t eeprom_size;
+    const uint8_t *runs; /* format 2's disc runs, 24 bytes each */
+    uint32_t run_count;
     const uint8_t *hdd;
     size_t hdd_size;
 };
 
+/* rombie-engine-media.h has both formats. */
 static bool ParseGameData(const std::vector<uint8_t> &blob, GameDataView *view)
 {
-    if (blob.size() < 20 || memcmp(blob.data(), "RXBX", 4) != 0 ||
-        ReadValue<uint32_t>(blob, 4) != 1) {
+    if (blob.size() < 20 || memcmp(blob.data(), "RXBX", 4) != 0) {
+        return false;
+    }
+    const uint32_t format = ReadValue<uint32_t>(blob, 4);
+    const size_t header = format == 2 ? 28 : 20;
+    if ((format != 1 && format != 2) || blob.size() < header) {
         return false;
     }
     const uint32_t eeprom_size = ReadValue<uint32_t>(blob, 8);
     const uint64_t hdd_size = ReadValue<uint64_t>(blob, 12);
+    const uint32_t run_count = format == 2 ? ReadValue<uint32_t>(blob, 20) : 0;
+    const uint64_t runs_size = (uint64_t)run_count * 24;
     if (eeprom_size > 4096 || hdd_size < 4 ||
-        20 + (uint64_t)eeprom_size + hdd_size != blob.size()) {
+        header + (uint64_t)eeprom_size + runs_size + hdd_size != blob.size()) {
         return false;
     }
-    view->eeprom = blob.data() + 20;
+    view->eeprom = blob.data() + header;
     view->eeprom_size = eeprom_size;
-    view->hdd = blob.data() + 20 + eeprom_size;
+    view->runs = view->eeprom + eeprom_size;
+    view->run_count = run_count;
+    view->hdd = view->runs + runs_size;
     view->hdd_size = (size_t)hdd_size;
     return memcmp(view->hdd, "QFI\xfb", 4) == 0; /* a qcow2 image */
 }
+
+/* A format 2 blob's runs, for rombie_engine_before_start. */
+static std::vector<uint8_t> s_save_runs;
 
 /* Main thread, before QEMU starts: the stored disk and EEPROM become the
  * files xemu opens. */
@@ -891,6 +1429,7 @@ static bool WriteGameData(const std::vector<uint8_t> &blob)
     if (!ParseGameData(blob, &view)) {
         return false;
     }
+    s_save_runs.assign(view.runs, view.runs + (size_t)view.run_count * 24);
     if (view.eeprom_size == 0) {
         g_remove(g_config.sys.files.eeprom_path);
     } else if (!g_file_set_contents(g_config.sys.files.eeprom_path,
@@ -915,13 +1454,16 @@ static void HandleGameData(const std::vector<uint8_t> &data)
 }
 
 /* UI thread: hands the page the game's blob as it is now. */
-static void SendGameData(void)
+static void SendGameDataNow(void)
 {
     s_hdd_dirty = false;
     uint8_t *blob = nullptr;
     size_t size = 0;
     char *error = nullptr;
-    if (!rombie_media_read_blob(&blob, &size, &error)) {
+    const uint64_t held_from = rombie_prof_now();
+    const bool read = rombie_media_read_blob(&blob, &size, &error);
+    rombie_prof_add(ROMBIE_PROF_HELD_NS, rombie_prof_now() - held_from);
+    if (!read) {
         SendEvent("error", error ? error : "Reading the game's data failed.");
         g_free(error);
         return;
@@ -929,6 +1471,275 @@ static void SendGameData(void)
     uint8_t header[8] = { MSG_GAME_DATA_SAVED };
     SendMessageParts(0x2, header, sizeof(header), blob, size);
     g_free(blob);
+}
+
+/* Development: with ROMBIE_LOCKSTEP_READBACK_MS set, a speed test (which
+ * sends no game data) still reads its game data back every that many ms
+ * while it runs, as 0x85 would at its own moments, and drops it: a check that
+ * the drain and the read don't change what the game sees. */
+static void ReadBackForTest(void)
+{
+    static const double every = [] {
+        const char *env = getenv("ROMBIE_LOCKSTEP_READBACK_MS");
+        return env ? atof(env) : 0.0;
+    }();
+    static double last;
+    static int count;
+    if (every <= 0 || !rombie_engine_lockstep() || !runstate_is_running() ||
+        NowMs() - last < every) {
+        return;
+    }
+    uint8_t *blob = nullptr;
+    size_t size = 0;
+    char *error = nullptr;
+    const double from = NowMs();
+    const bool ok = rombie_media_read_blob(&blob, &size, &error);
+    last = NowMs();
+    if (++count % 10 == 1 || !ok) {
+        fprintf(stderr,
+                "rombie-engine: game data read back (development) %d: %s, "
+                "%zu bytes in %.0f ms\n",
+                count, ok ? "ok" : (error ? error : "failed"), size,
+                last - from);
+    }
+    g_free(blob);
+    g_free(error);
+}
+
+static void SendGameData(void)
+{
+    /* A speed test keeps nothing, and a game that fills its cache
+     * partitions (Halo 2: 700 MB) would have it read and sent again and
+     * again. */
+    if (rombie_engine_lockstep() && (s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
+        s_hdd_dirty = false;
+        return;
+    }
+    /* Netplay: the read stalls every PC (Halo 2's 700 MB, a second or two)
+     * and a game may save every few seconds (Halo 2 does), so it waits for
+     * the session's end, a handoff, a state change or the exit. */
+    if (rombie_engine_lockstep() && !s_netplay_ended.load()) {
+        s_hdd_dirty = true;
+        return;
+    }
+    SendGameDataNow();
+}
+
+/* Netplay (0x0D). */
+static void HandleNetplay(const std::vector<uint8_t> &data)
+{
+    if (data.size() < 12) {
+        return;
+    }
+    const uint8_t op = data[1];
+    const uint32_t vblank = ReadValue<uint32_t>(data, 4);
+    const uint32_t every = ReadValue<uint32_t>(data, 8);
+
+    if (op == NETPLAY_JOIN) {
+        std::vector<uint8_t> state(data.begin() + 12, data.end());
+        std::vector<uint8_t> files_game_data;
+        const char *dir = getenv("ROMBIE_HANDOFF_DIR");
+        if (state.empty() && dir && *dir) {
+            const std::string base = std::string(dir) + "\\";
+            gchar *bytes = nullptr;
+            gsize size = 0;
+            if (g_file_get_contents((base + "state.bin").c_str(), &bytes, &size,
+                                    nullptr)) {
+                state.assign(bytes, bytes + size);
+                g_free(bytes);
+            }
+            const char *name =
+                data[2] == 2 ? "host-gamedata.bin" : "guests-gamedata.bin";
+            if (g_file_get_contents((base + name).c_str(), &bytes, &size,
+                                    nullptr)) {
+                files_game_data.assign(bytes, bytes + size);
+                g_free(bytes);
+            }
+        }
+        std::unique_lock<std::mutex> lock(s_boot_mutex);
+        if (s_boot_ready || !s_lockstep_flags || state.empty()) {
+            lock.unlock();
+            SendEvent("error", "Netplay's join needs lockstep, a state, and "
+                               "no boot yet.");
+            return;
+        }
+        if (!files_game_data.empty()) {
+            s_game_data = std::move(files_game_data);
+            GameDataView view;
+            s_game_data_ok = ParseGameData(s_game_data, &view);
+        }
+        s_join_state = std::move(state);
+        s_join_vblank = vblank;
+        if (every) {
+            s_hash_every = every;
+        }
+        /* The CPU thread hasn't started: lockstep goes on from here. */
+        s_lockstep_vblank = vblank;
+        std::unique_lock<std::mutex> input_lock(s_input_mutex);
+        s_inputs.clear();
+        s_inputs_first = vblank;
+        return;
+    }
+
+    if (op == NETPLAY_END) {
+        if (rombie_engine_lockstep()) {
+            s_netplay_ended.store(true);
+            s_input_cv.notify_all();
+            SendEvent("netplay-ended", std::to_string(vblank));
+        }
+        return;
+    }
+
+    if (op != NETPLAY_HOST) {
+        return;
+    }
+    QueueAtVblank([vblank]() {
+        if (!s_vm_ready.load() || !s_booted.load()) {
+            return;
+        }
+        if (!runstate_is_running()) {
+            SendEvent("netplay-failed", "The game is paused.");
+            return;
+        }
+        uint8_t *state = nullptr, *game_data = nullptr;
+        size_t state_size = 0, game_data_size = 0;
+        char *error = nullptr;
+        const double from = NowMs();
+        if (!rombie_media_handoff(s_data_dir.c_str(), &state, &state_size,
+                                  &game_data, &game_data_size, &error)) {
+            SendEvent("netplay-failed", error ? error : "?");
+            g_free(error);
+            return;
+        }
+        fprintf(stderr,
+                "rombie-engine: netplay host at vblank %u: state %zu bytes, "
+                "game data %zu bytes, in %.0f ms\n",
+                vblank, state_size, game_data_size, NowMs() - from);
+        const char *dir = getenv("ROMBIE_HANDOFF_DIR");
+        if (dir && *dir) {
+            const std::string base = std::string(dir) + "\\";
+            uint8_t *own = nullptr;
+            size_t own_size = 0;
+            char *own_error = nullptr;
+            const bool ok =
+                rombie_media_read_blob(&own, &own_size, &own_error) &&
+                g_file_set_contents((base + "host-gamedata.bin").c_str(),
+                                    (const gchar *)own, (gssize)own_size,
+                                    nullptr) &&
+                g_file_set_contents((base + "guests-gamedata.bin").c_str(),
+                                    (const gchar *)game_data,
+                                    (gssize)game_data_size, nullptr) &&
+                g_file_set_contents((base + "state.bin").c_str(),
+                                    (const gchar *)state, (gssize)state_size,
+                                    nullptr);
+            g_free(own);
+            g_free(own_error);
+            if (!ok) {
+                SendEvent("netplay-failed", "Writing the handoff's files failed.");
+            } else {
+                fprintf(stderr, "rombie-engine: netplay's files in %s: the "
+                                "host's game data %zu bytes\n",
+                        dir, own_size);
+                uint8_t header[16] = { MSG_NETPLAY_STATE };
+                memcpy(header + 4, &vblank, 4);
+                SendMessageParts(0x2, header, sizeof(header), nullptr, 0);
+            }
+            g_free(state);
+            g_free(game_data);
+            return;
+        }
+        /* The host boots again with its own game data, save states and all;
+         * the guests with the copy. */
+        SendGameDataNow();
+        std::vector<uint8_t> header(16 + game_data_size);
+        header[0] = MSG_NETPLAY_STATE;
+        memcpy(header.data() + 4, &vblank, 4);
+        const uint64_t size64 = game_data_size;
+        memcpy(header.data() + 8, &size64, 8);
+        memcpy(header.data() + 16, game_data, game_data_size);
+        SendMessageParts(0x2, header.data(), header.size(), state, state_size);
+        g_free(state);
+        g_free(game_data);
+    });
+}
+
+/* 0x04 op 4: a new process of this engine, with the same arguments, takes
+ * over the key and the port, and this one ends. A running machine's guest
+ * time can't change how it's counted (lockstep's icount is fixed when QEMU
+ * starts), so netplay's host boots again this way. */
+[[noreturn]] static void RestartSelf(void)
+{
+    fprintf(stderr, "rombie-engine: restarting (process %lu)\n",
+            (unsigned long)GetCurrentProcessId());
+#ifdef _WIN32
+    std::wstring command = GetCommandLineW();
+    if (command.find(L" --restarted") == std::wstring::npos) {
+        command += L" --restarted";
+    }
+    {
+        std::unique_lock<std::mutex> lock(s_send_mutex);
+        s_page_connected.store(false, std::memory_order_release);
+        if (s_client != ENGINE_INVALID_SOCKET) {
+            /* Reset, not closed: a close from this end would leave the
+             * port in TIME_WAIT, which an exclusive bind refuses for
+             * minutes. */
+            LINGER reset = { 1, 0 };
+            setsockopt(s_client, SOL_SOCKET, SO_LINGER, (const char *)&reset,
+                       sizeof(reset));
+            engine_closesocket(s_client);
+            s_client = ENGINE_INVALID_SOCKET;
+        }
+    }
+    /* Let go of the port before the new process listens on it. */
+    engine_closesocket(s_listener);
+    s_listener = ENGINE_INVALID_SOCKET;
+
+    /* The new process inherits only the log (a development engine's
+     * stdout and stderr): an inherited socket would keep the port. */
+    HANDLE inherit[2];
+    DWORD count = 0;
+    for (DWORD which : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
+        HANDLE h = GetStdHandle(which);
+        DWORD flags;
+        if (h && h != INVALID_HANDLE_VALUE && GetHandleInformation(h, &flags) &&
+            (count == 0 || inherit[0] != h)) {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            inherit[count++] = h;
+        }
+    }
+    SIZE_T list_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &list_size);
+    std::vector<uint8_t> list_bytes(list_size ? list_size : 1);
+    auto *list = (LPPROC_THREAD_ATTRIBUTE_LIST)list_bytes.data();
+    const bool have_list =
+        count > 0 && InitializeProcThreadAttributeList(list, 1, 0, &list_size) &&
+        UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                  inherit, count * sizeof(HANDLE), NULL, NULL);
+    STARTUPINFOEXW startup = {};
+    startup.StartupInfo.cb = sizeof(startup);
+    if (have_list) {
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        startup.StartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        startup.lpAttributeList = list;
+    }
+    PROCESS_INFORMATION process = {};
+    if (CreateProcessW(NULL, command.data(), NULL, NULL, have_list ? TRUE : FALSE,
+                       have_list ? EXTENDED_STARTUPINFO_PRESENT : 0, NULL, NULL,
+                       &startup.StartupInfo, &process)) {
+        fprintf(stderr, "rombie-engine: restarted as process %lu\n",
+                (unsigned long)process.dwProcessId);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    } else {
+        fprintf(stderr, "rombie-engine: restart failed (error %lu)\n",
+                (unsigned long)GetLastError());
+    }
+    if (have_list) {
+        DeleteProcThreadAttributeList(list);
+    }
+#endif
+    QuitNow(EXIT_SUCCESS);
 }
 
 static void SendSlots(void)
@@ -945,13 +1756,14 @@ static void HandleState(const std::vector<uint8_t> &data)
     }
     const uint8_t op = data[0];
     const int slot = data[1];
-    QueueWork([op, slot]() {
+    auto work = [op, slot]() {
         if (!s_vm_ready.load() || !s_booted.load()) {
             return;
         }
         char *error = nullptr;
         bool ok;
         const char *done;
+        const uint64_t held_from = rombie_prof_now();
         if (op == MSG_SAVE_STATE) {
             ok = rombie_media_save_state(slot, ROMBIE_XBOX_ENGINE_VERSION,
                                          &error);
@@ -964,6 +1776,7 @@ static void HandleState(const std::vector<uint8_t> &data)
             ok = rombie_media_delete_state(slot, &error);
             done = "state-deleted";
         }
+        rombie_prof_add(ROMBIE_PROF_HELD_NS, rombie_prof_now() - held_from);
 
         if (ok) {
             SendEvent(done, std::to_string(slot));
@@ -977,12 +1790,18 @@ static void HandleState(const std::vector<uint8_t> &data)
         g_free(error);
 
         SendSlots();
-        if (ok) {
+        if (ok && !(s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
             /* The image changed: a save or delete rewrote its snapshots, a
-             * load put its disk back to the state's. */
-            SendGameData();
+             * load put its disk back to the state's. The page waits for it,
+             * in netplay too (the state already held the game). */
+            SendGameDataNow();
         }
-    });
+    };
+    if (op == MSG_DELETE_STATE) {
+        QueueWork(work);
+    } else {
+        QueueAtVblank(work);
+    }
 }
 
 static void HandleBinary(const std::vector<uint8_t> &message)
@@ -1013,6 +1832,31 @@ static void HandleBinary(const std::vector<uint8_t> &message)
         break;
     case MSG_SPEED:
         HandleSpeed(message);
+        break;
+    case MSG_LOCKSTEP:
+        HandleLockstep(message);
+        break;
+    case MSG_INPUTS:
+        HandleInputs(message);
+        break;
+    case MSG_SPEED_AT:
+        HandleSpeedAt(message);
+        break;
+    case MSG_NETPLAY:
+        HandleNetplay(message);
+        break;
+    case MSG_DUMP_AT:
+        if (message.size() >= 8) {
+            s_dump_at.store(ReadValue<uint32_t>(message, 4));
+        }
+        break;
+    case MSG_LINK_FRAME:
+        if (message.size() > 4 && s_link_cable.load()) {
+            s_stats.link_in.fetch_add(1, std::memory_order_relaxed);
+            s_stats.link_in_bytes.fetch_add(message.size() - 4,
+                                            std::memory_order_relaxed);
+            rombie_link_from_page(message.data() + 4, message.size() - 4);
+        }
         break;
     default:
         break;
@@ -1238,6 +2082,7 @@ static void SenderThread(void)
             continue;
         }
 
+        SendLockstepMessages();
         SendPendingAudio(audio);
 
         if (!frame.empty()) {
@@ -1269,15 +2114,91 @@ static void SenderThread(void)
             const uint32_t reads = s_stats.disc_reads.exchange(0);
             const uint64_t read_bytes = s_stats.disc_bytes.exchange(0);
             const uint64_t read_us = s_stats.disc_wait_us.exchange(0);
-            char stats[512];
+            uint64_t lockstep_wait_us = s_stats.lockstep_wait_us.exchange(0);
+            /* A wait still going counts up to now: another PC's handoff
+             * holds this one for seconds, and counted only at its end it
+             * read as seconds with nothing run and nothing waited for, which
+             * the page's slow rule took for this PC's own slowness. */
+            {
+                const int64_t stats_now = g_get_monotonic_time();
+                int64_t mark = s_stats.lockstep_wait_mark_us.load();
+                if (mark && stats_now > mark &&
+                    s_stats.lockstep_wait_mark_us.compare_exchange_strong(
+                        mark, stats_now)) {
+                    lockstep_wait_us += (uint64_t)(stats_now - mark);
+                }
+            }
+            /* The game's own frame rate, and the GPU's work, solo or
+             * lockstep. */
+            const uint64_t flips = rombie_prof_take(ROMBIE_PROF_FLIPS);
+            const uint64_t pusher_ns = rombie_prof_take(ROMBIE_PROF_PUSHER_NS);
+            const uint64_t shader_ns = rombie_prof_take(ROMBIE_PROF_SHADER_NS);
+            const uint64_t held_ns = rombie_prof_take(ROMBIE_PROF_HELD_NS);
+            if (rombie_engine_lockstep()) {
+                /* Where lockstep's time went this second, in ms (counts
+                 * for loops), and the guest instructions run. */
+                static uint64_t last_insns;
+                const uint64_t insns = rombie_prof_insns();
+                double ms[ROMBIE_PROF_COUNT];
+                for (int i = 0; i < ROMBIE_PROF_COUNT; i++) {
+                    ms[i] = rombie_prof_take((RombieProf)i) / 1e6;
+                }
+                char prof[640];
+                snprintf(prof, sizeof(prof),
+                         "{\"t\":\"prof\",\"minsns\":%.1f,\"exec\":%.0f,"
+                         "\"loops\":%.0f,\"empty\":%.0f,\"gpu\":%.0f,"
+                         "\"apu\":%.0f,\"io\":%.0f,\"hash\":%.0f,"
+                         "\"idle\":%.0f,\"bql\":%.0f,\"timers\":%.0f,"
+                         "\"warps\":%.0f,\"vblank\":%.0f,\"display\":%.0f,"
+                         "\"send\":%.0f,\"spins\":%.0f,\"syncs\":%.0f,"
+                         "\"gpuWork\":%.0f,\"gpuPending\":%.0f,"
+                         "\"gpuReports\":%.0f,\"gpuDeferred\":%.0f,"
+                         "\"gpuParks\":%.0f,\"apuVp\":%.0f,\"apuDsp\":%.0f,"
+                         "\"vpSamples\":%.0f,\"vpFx\":%.0f}",
+                         (insns - last_insns) / 1e6 / seconds,
+                         ms[ROMBIE_PROF_EXEC_NS],
+                         ms[ROMBIE_PROF_LOOPS] * 1e6,
+                         ms[ROMBIE_PROF_EMPTY_LOOPS] * 1e6,
+                         ms[ROMBIE_PROF_GPU_NS], ms[ROMBIE_PROF_APU_NS],
+                         ms[ROMBIE_PROF_IO_NS], ms[ROMBIE_PROF_HASH_NS],
+                         ms[ROMBIE_PROF_IDLE_NS], ms[ROMBIE_PROF_BQL_NS],
+                         ms[ROMBIE_PROF_TIMERS_NS],
+                         ms[ROMBIE_PROF_WARPS] * 1e6,
+                         ms[ROMBIE_PROF_VBLANK_NS],
+                         ms[ROMBIE_PROF_DISPLAY_NS], ms[ROMBIE_PROF_SEND_NS],
+                         ms[ROMBIE_PROF_SPINS] * 1e6,
+                         ms[ROMBIE_PROF_GPU_SYNCS] * 1e6,
+                         ms[ROMBIE_PROF_GPU_WORK_NS],
+                         ms[ROMBIE_PROF_GPU_PENDING_NS],
+                         ms[ROMBIE_PROF_GPU_REPORTS_NS],
+                         ms[ROMBIE_PROF_GPU_DEFERRED] * 1e6,
+                         ms[ROMBIE_PROF_GPU_PARKS] * 1e6,
+                         ms[ROMBIE_PROF_APU_VP_NS], ms[ROMBIE_PROF_APU_DSP_NS],
+                         ms[ROMBIE_PROF_VP_SAMPLES_NS], ms[ROMBIE_PROF_VP_FX_NS]);
+                last_insns = insns;
+                SendText(prof);
+            }
+            const uint32_t link_in = s_stats.link_in.exchange(0);
+            const uint32_t link_out = s_stats.link_out.exchange(0);
+            const uint64_t link_in_bytes = s_stats.link_in_bytes.exchange(0);
+            const uint64_t link_out_bytes = s_stats.link_out_bytes.exchange(0);
+            char stats[768];
             snprintf(stats, sizeof(stats),
-                     "{\"t\":\"stats\",\"vbl\":%.1f,\"speed\":%.1f,"
+                     "{\"t\":\"stats\",\"ms\":%.0f,\"lw\":%.0f,"
+                     "\"pace\":%.0f,\"ns\":%.4g,\"shader\":%.0f,\"held\":%.0f,"
+                     "\"flips\":%.1f,\"pusher\":%.0f,"
+                     "\"vbl\":%.1f,\"speed\":%.1f,"
                      "\"padMsgs\":%u,"
                      "\"guestPolls\":[%u,%u,%u,%u],\"guestSeen\":%u,"
                      "\"fps\":%.1f,\"mbps\":%.1f,"
                      "\"readback_us\":%u,\"drop\":%u,\"audio\":%u,"
                      "\"overflow\":%u,\"dr\":%u,\"drBytes\":%llu,"
-                     "\"drMs\":%.2f,\"w\":%u,\"h\":%u}",
+                     "\"drMs\":%.2f,\"w\":%u,\"h\":%u,"
+                     "\"link\":[%u,%llu,%u,%llu]}",
+                     seconds * 1000.0, lockstep_wait_us / 1000.0,
+                     s_stats.lockstep_pace_us.exchange(0) / 1000.0,
+                     s_speed_q16.load() / 16.0, shader_ns / 1e6, held_ns / 1e6,
+                     flips / seconds, pusher_ns / 1e6 / seconds,
                      vblanks / seconds, s_speed.load(),
                      pad_messages,
                      polls[0], polls[1], polls[2], polls[3], guest_seen,
@@ -1286,7 +2207,9 @@ static void SenderThread(void)
                      dropped, audio_frames, overflow, reads,
                      (unsigned long long)read_bytes,
                      reads ? read_us / 1000.0 / reads : 0.0,
-                     s_stats.width.load(), s_stats.height.load());
+                     s_stats.width.load(), s_stats.height.load(), link_in,
+                     (unsigned long long)link_in_bytes, link_out,
+                     (unsigned long long)link_out_bytes);
             SendText(stats);
         }
     }
@@ -1375,6 +2298,9 @@ void rombie_engine_early_init(int argc, char **argv)
                 QuitNow(EXIT_FAILURE);
             }
             s_port = (uint16_t)port;
+        } else if (arg == "--restarted") {
+            s_restarted = true;
+            argv[i] = NULL;
         } else if (arg == "--origin" && has_value) {
             s_dev_origin = argv[i + 1];
             argv[i] = argv[i + 1] = NULL;
@@ -1556,11 +2482,32 @@ void rombie_engine_wait_for_boot(void)
     g_config.general.show_welcome = false;
 
     int listen_error = 0;
-    if (!Listen(&listen_error)) {
+    bool listening = Listen(&listen_error);
+    /* A restart: the old process lets go of the port as it starts this one. */
+    for (int tries = 0; !listening && s_restarted && tries < 300; tries++) {
+        SDL_Delay(100);
+        listening = Listen(&listen_error);
+    }
+    if (!listening && s_restarted) {
+        /* What holds the port (development). */
+        char command[96];
+        snprintf(command, sizeof(command), "netstat -ano | findstr :%u",
+                 (unsigned)s_port);
+        fprintf(stderr, "rombie-engine: process %lu can't listen\n",
+                (unsigned long)GetCurrentProcessId());
+        if (FILE *p = _popen(command, "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), p)) {
+                fprintf(stderr, "rombie-engine: port: %s", line);
+            }
+            _pclose(p);
+        }
+    }
+    if (!listening) {
         /* An engine of ours already holds the port: an idle one takes this
          * link's key and serves the page; a busy one tells the page so.
          * Either way this process is done. */
-        if (s_mode == Mode::Link && TryHandOffKey()) {
+        if (s_mode == Mode::Link && !s_restarted && TryHandOffKey()) {
             QuitNow(EXIT_SUCCESS);
         }
         fprintf(stderr, "rombie-engine: can't listen on 127.0.0.1:%u "
@@ -1656,6 +2603,25 @@ void rombie_engine_run_pending(void)
         work();
     }
 
+    if (s_hold.load() && s_held_at.load() >= 0) {
+        std::deque<std::function<void()>> held;
+        {
+            std::unique_lock<std::mutex> lock(s_work_mutex);
+            held.swap(s_held_work);
+        }
+        for (auto &work : held) {
+            work();
+        }
+        {
+            std::unique_lock<std::mutex> lock(s_work_mutex);
+            if (s_held_work.empty()) {
+                s_hold.store(false);
+            }
+        }
+        s_held_at.store(-1);
+        s_input_cv.notify_all();
+    }
+
     if (s_booted.load()) {
         if (s_resend_media.exchange(false)) {
             SendSlots();
@@ -1668,6 +2634,7 @@ void rombie_engine_run_pending(void)
         if (s_hdd_dirty && NowMs() - s_hdd_written_ms >= HDD_SETTLE_MS) {
             SendGameData();
         }
+        ReadBackForTest();
     }
 
     /* A running game whose page stays gone has nobody to play it. */
@@ -1708,35 +2675,73 @@ uint64_t rombie_engine_disc_size(void)
     return s_disc_size;
 }
 
-void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
-                             rombie_disc_read_cb cb, void *opaque)
+static void SendChunkRequest(uint32_t id, uint64_t index)
 {
-    uint32_t id;
-    {
-        std::unique_lock<std::mutex> lock(s_disc_mutex);
-        if (!s_page_connected.load(std::memory_order_acquire)) {
-            lock.unlock();
-            cb(opaque, false);
-            return;
-        }
-        id = ++s_next_read_id;
-        s_reads.emplace(id, PendingRead{ dst, length, cb, opaque });
-    }
-
+    const uint64_t offset = index * DISC_CHUNK;
+    const uint32_t length =
+        (uint32_t)std::min<uint64_t>(DISC_CHUNK, s_disc_size - offset);
     uint8_t request[20] = { MSG_DISC_READ };
     memcpy(&request[4], &id, sizeof(id));
     memcpy(&request[8], &offset, sizeof(offset));
     memcpy(&request[16], &length, sizeof(length));
     if (!SendMessageParts(0x2, request, sizeof(request), nullptr, 0)) {
-        std::unique_lock<std::mutex> lock(s_disc_mutex);
-        if (s_reads.erase(id)) {
-            lock.unlock();
-            cb(opaque, false);
-        }
+        FailAllDiscReads(); /* the page has gone */
         return;
     }
     s_stats.disc_reads.fetch_add(1, std::memory_order_relaxed);
     s_stats.disc_bytes.fetch_add(length, std::memory_order_relaxed);
+}
+
+void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
+                             rombie_disc_read_cb cb, void *opaque)
+{
+    std::vector<std::pair<uint32_t, uint64_t>> asks;
+    bool done = false, failed = false;
+    {
+        std::unique_lock<std::mutex> lock(s_disc_mutex);
+        if (!s_page_connected.load(std::memory_order_acquire) ||
+            length == 0 || offset + length > s_disc_size) {
+            failed = length != 0;
+            done = length == 0;
+        } else {
+            auto w = std::make_shared<DiscWaiter>(
+                DiscWaiter{ dst, offset, length, cb, opaque, 0, false });
+            const uint64_t first = offset / DISC_CHUNK;
+            const uint64_t last = (offset + length - 1) / DISC_CHUNK;
+            /* Its own chunks are pinned before any chunk past it is asked
+             * for, which might evict one. */
+            for (uint64_t i = first; i <= last; i++) {
+                if (const uint32_t id = AskChunkLocked(i)) {
+                    asks.emplace_back(id, i);
+                }
+                DiscChunk &chunk = s_chunks[i];
+                chunk.pins++;
+                if (!chunk.ready) {
+                    chunk.waiters.push_back(w);
+                    w->missing++;
+                }
+            }
+            for (uint64_t i = last + 1; i <= last + DISC_AHEAD; i++) {
+                if (const uint32_t id = AskChunkLocked(i)) {
+                    asks.emplace_back(id, i);
+                }
+            }
+            if (w->missing == 0) {
+                CopyFromChunksLocked(*w);
+                w->settled = true;
+                UnpinLocked(*w);
+                done = true;
+            }
+        }
+    }
+    for (const auto &ask : asks) {
+        SendChunkRequest(ask.first, ask.second);
+    }
+    if (done) {
+        cb(opaque, true);
+    } else if (failed) {
+        cb(opaque, false);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -1748,6 +2753,12 @@ void rombie_engine_capture(uint32_t tex, bool flip)
     if (!rombie_engine_enabled() ||
         !s_page_connected.load(std::memory_order_acquire) || tex == 0) {
         return;
+    }
+    if (rombie_engine_lockstep() && (s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
+        static unsigned skipped;
+        if (++skipped % 10) {
+            return;
+        }
     }
     const double start_ms = NowMs();
 
@@ -1864,8 +2875,30 @@ static int16_t ToAxis(float v)
     return (int16_t)(v >= 0.0f ? v * 32767.0f : v * 32768.0f);
 }
 
+static int16_t StickFrom8(int v)
+{
+    v = v < -128 ? -128 : (v > 127 ? 127 : v);
+    return (int16_t)(v >= 0 ? v * 32767 / 127 : v * 256);
+}
+
 void rombie_engine_read_pad(int player, uint16_t *buttons, int16_t axis[6])
 {
+    if (rombie_engine_lockstep() && !s_netplay_ended.load()) {
+        LockstepPad pad;
+        {
+            std::unique_lock<std::mutex> lock(s_pad_mutex);
+            pad = s_lockstep_pads[player & 3];
+        }
+        *buttons = (uint16_t)(pad.buttons & 0x3FFF);
+        axis[CONTROLLER_AXIS_LTRIG] = (int16_t)(pad.triggers[0] * 32767 / 255);
+        axis[CONTROLLER_AXIS_RTRIG] = (int16_t)(pad.triggers[1] * 32767 / 255);
+        axis[CONTROLLER_AXIS_LSTICK_X] = StickFrom8(pad.axes[0]);
+        axis[CONTROLLER_AXIS_LSTICK_Y] = StickFrom8(-pad.axes[1]);
+        axis[CONTROLLER_AXIS_RSTICK_X] = StickFrom8(pad.axes[2]);
+        axis[CONTROLLER_AXIS_RSTICK_Y] = StickFrom8(-pad.axes[3]);
+        return;
+    }
+
     PadState pad;
     {
         std::unique_lock<std::mutex> lock(s_pad_mutex);
@@ -1898,4 +2931,329 @@ void rombie_engine_on_pad_poll(int port, uint16_t buttons)
     }
     s_stats.guest_polls[port].fetch_add(1, std::memory_order_relaxed);
     s_stats.guest_buttons_seen.fetch_or(buttons, std::memory_order_relaxed);
+}
+
+/* --------------------------------------------------------------------------
+ * Lockstep.
+ */
+
+bool rombie_engine_lockstep(void)
+{
+    return s_lockstep_flags != 0;
+}
+
+bool rombie_engine_lockstep_sync(RombieSync part)
+{
+    if (!rombie_engine_lockstep()) {
+        return false;
+    }
+    switch (part) {
+    case ROMBIE_SYNC_APU:
+        return !(s_lockstep_flags & LOCKSTEP_NO_APU_SYNC);
+    case ROMBIE_SYNC_GPU:
+        return !(s_lockstep_flags & LOCKSTEP_NO_GPU_SYNC);
+    case ROMBIE_SYNC_IO:
+        return !(s_lockstep_flags & LOCKSTEP_NO_IO_SYNC);
+    case ROMBIE_SYNC_GPU_AHEAD:
+        return !(s_lockstep_flags & (LOCKSTEP_NO_GPU_SYNC | LOCKSTEP_GPU_SERIAL));
+    case ROMBIE_SYNC_APU_AHEAD:
+        return !(s_lockstep_flags & (LOCKSTEP_NO_APU_SYNC | LOCKSTEP_APU_SERIAL));
+    }
+    return true;
+}
+
+const char *rombie_engine_icount_option(void)
+{
+    return s_icount_option.c_str();
+}
+
+const char *rombie_engine_rtc_option(void)
+{
+    return s_rtc_option.c_str();
+}
+
+/* The CPU thread never waits on the socket: its messages go out on the
+ * sender thread, ahead of frames and sound (SendLockstepMessages). */
+static void QueueLockstepMessage(const uint8_t *msg, size_t size)
+{
+    {
+        std::unique_lock<std::mutex> lock(s_lockstep_out_mutex);
+        s_lockstep_out.emplace_back(msg, msg + size);
+    }
+    s_wake.notify_one();
+}
+
+static void SendLockstepMessages(void)
+{
+    std::deque<std::vector<uint8_t>> out;
+    {
+        std::unique_lock<std::mutex> lock(s_lockstep_out_mutex);
+        out.swap(s_lockstep_out);
+    }
+    for (const auto &msg : out) {
+        SendMessageParts(0x2, msg.data(), msg.size(), nullptr, 0);
+    }
+}
+
+static void SendHashes(uint32_t vblank)
+{
+    uint64_t parts[ROMBIE_HASH_PARTS];
+    rombie_lockstep_hash(parts);
+    uint8_t msg[12 + sizeof(parts)] = { MSG_HASHES };
+    const uint32_t count = ROMBIE_HASH_PARTS;
+    memcpy(msg + 4, &vblank, 4);
+    memcpy(msg + 8, &count, 4);
+    memcpy(msg + 12, parts, sizeof(parts));
+    QueueLockstepMessage(msg, sizeof(msg));
+}
+
+static void SendVblank(uint32_t vblank)
+{
+    uint8_t msg[8] = { MSG_VBLANK };
+    memcpy(msg + 4, &vblank, 4);
+    QueueLockstepMessage(msg, sizeof(msg));
+}
+
+/* hw/xbox/rombie-link.c, BQL held: the card's frame goes out ahead of
+ * pictures and sound, as lockstep's messages do. */
+void rombie_engine_link_to_page(const uint8_t *frame, size_t size)
+{
+    if (!s_page_connected.load(std::memory_order_acquire) ||
+        !s_link_cable.load()) {
+        return;
+    }
+    std::vector<uint8_t> msg(4 + size);
+    msg[0] = MSG_LINK_FRAME_OUT;
+    memcpy(msg.data() + 4, frame, size);
+    {
+        std::unique_lock<std::mutex> lock(s_lockstep_out_mutex);
+        s_lockstep_out.push_back(std::move(msg));
+    }
+    s_wake.notify_one();
+    s_stats.link_out.fetch_add(1, std::memory_order_relaxed);
+    s_stats.link_out_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+bool rombie_engine_link_cable(void)
+{
+    return s_link_cable.load();
+}
+
+/* Development: ROMBIE_ICOUNT_NS="vblank:ns,..." sets the guest time an
+ * instruction takes (to a sixteenth of a ns) from those vblanks on, so a
+ * test's opening can run at one CPU speed and its play at another. */
+static void ApplyIcountSchedule(uint32_t vblank)
+{
+    static std::vector<std::pair<uint32_t, int64_t>> schedule;
+    static bool parsed;
+    if (!parsed) {
+        parsed = true;
+        const char *env = getenv("ROMBIE_ICOUNT_NS");
+        for (const char *p = env; p && *p;) {
+            unsigned at = 0;
+            double ns = 0.0;
+            int used = 0;
+            if (sscanf(p, "%u:%lf%n", &at, &ns, &used) != 2 || ns <= 0.0) {
+                break;
+            }
+            schedule.emplace_back(at, (int64_t)(ns * 16.0 + 0.5));
+            p += used;
+            if (*p == ',') {
+                p++;
+            }
+        }
+    }
+    for (const auto &entry : schedule) {
+        if (entry.first == vblank) {
+            rombie_icount_set_scale(entry.second);
+            s_speed_q16.store((uint32_t)entry.second);
+            fprintf(stderr, "rombie-engine: lockstep from vblank %u at %.4g ns an instruction\n",
+                    vblank, entry.second / 16.0);
+        }
+    }
+
+    std::unique_lock<std::mutex> lock(s_speed_mutex);
+    for (size_t i = 0; i < s_speed_changes.size();) {
+        const auto change = s_speed_changes[i];
+        if (change.first > vblank) {
+            i++;
+            continue;
+        }
+        if (change.first < vblank) {
+            /* Too late to land where the other engines' will. */
+            SendEvent("error", "A lockstep speed change for vblank " +
+                                   std::to_string(change.first) +
+                                   " arrived at " + std::to_string(vblank) + ".");
+        }
+        rombie_icount_set_scale(change.second);
+        s_speed_q16.store(change.second);
+        s_speed_changes.erase(s_speed_changes.begin() + i);
+    }
+}
+
+bool rombie_engine_lockstep_vblank(void)
+{
+    const uint32_t vblank = s_lockstep_vblank;
+    const bool ended = s_netplay_ended.load();
+    if (!ended && s_announced_vblank != vblank) {
+        s_announced_vblank = vblank;
+        if (vblank == s_dump_at.load()) {
+            nv2a_lockstep_dump(vblank);
+        }
+        if (s_hash_every && vblank % s_hash_every == 0) {
+            SendHashes(vblank);
+        }
+        rombie_lockstep_trace(vblank);
+        const uint64_t send_from = rombie_prof_now();
+        SendVblank(vblank);
+        rombie_prof_add(ROMBIE_PROF_SEND_NS, rombie_prof_now() - send_from);
+    } else if (!ended) {
+        rombie_lockstep_trace_time(vblank, "again");
+    }
+
+    /* The rest of the machine runs on while this waits: the page's work on
+     * the UI thread, disc reads, a stop. */
+    LockstepInput input;
+    bool have = false;
+    s_stats.lockstep_wait_mark_us.store(g_get_monotonic_time());
+    rombie_lockstep_unlock();
+    {
+        std::unique_lock<std::mutex> lock(s_input_mutex);
+        for (;;) {
+            if (s_hold.load() && !rombie_lockstep_stopping()) {
+                s_held_at.store(vblank);
+                s_input_cv.wait_for(lock, std::chrono::milliseconds(5));
+                continue;
+            }
+            if (s_netplay_ended.load()) {
+                have = true;
+                break;
+            }
+            if (!s_inputs.empty()) {
+                input = s_inputs.front();
+                s_inputs.pop_front();
+                s_inputs_first++;
+                have = true;
+                break;
+            }
+            if (rombie_lockstep_stopping()) {
+                break;
+            }
+            s_input_cv.wait_for(lock, std::chrono::milliseconds(5));
+        }
+    }
+    if (rombie_lockstep_tracing() && rombie_lockstep_stopping()) {
+        fprintf(stderr, "rombie-trace %u stopping: %s\n", vblank,
+                have ? "input there, the vblank ends" : "no input, again later");
+    }
+    double now = NowMs();
+    /* What the stats haven't counted of the wait yet. */
+    const int64_t wait_mark = s_stats.lockstep_wait_mark_us.exchange(0);
+    const int64_t wait_left = (int64_t)(now * 1000.0) - wait_mark;
+    if (wait_mark && wait_left > 0) {
+        s_stats.lockstep_wait_us.fetch_add((uint64_t)wait_left,
+                                           std::memory_order_relaxed);
+    }
+
+    /* Real time at fixed deadlines from an anchor, so a late vblank's time
+     * is made back over the ones after it. */
+    if (have && !(s_lockstep_flags & LOCKSTEP_UNTHROTTLED)) {
+        const double interval_ms = vblank_interval_ns / 1e6;
+        if (s_pace_from_ms < 0.0 ||
+            now - (s_pace_from_ms +
+                   (vblank - s_pace_from_vblank) * interval_ms) >
+                PACE_RESET_MS) {
+            s_pace_from_ms = now;
+            s_pace_from_vblank = vblank;
+        }
+        const double due =
+            s_pace_from_ms + (vblank + 1 - s_pace_from_vblank) * interval_ms;
+        if (now < due) {
+            SDL_DelayPrecise((Uint64)((due - now) * 1e6));
+            /* The CPU thread's spare time: what the page's speed control
+             * reads to know this engine could run the guest faster. */
+            s_stats.lockstep_pace_us.fetch_add((uint64_t)((due - now) * 1000.0),
+                                               std::memory_order_relaxed);
+        }
+    }
+    rombie_lockstep_relock();
+    if (!have) {
+        return false;
+    }
+
+    if (!ended) {
+        std::unique_lock<std::mutex> lock(s_pad_mutex);
+        s_lockstep_pads = input;
+    }
+    ApplyIcountSchedule(vblank);
+    s_lockstep_vblank = vblank + 1;
+    return true;
+}
+
+void rombie_engine_before_start(void)
+{
+    if (!rombie_engine_enabled()) {
+        return;
+    }
+    if (!s_save_runs.empty()) {
+        /* The stored disk's own copies of the disc, from the disc. */
+        char *error = nullptr;
+        const bool ok = rombie_media_fill_save_runs(
+            s_save_runs.data(), (uint32_t)(s_save_runs.size() / 24), &error);
+        s_save_runs = {};
+        if (!ok) {
+            fprintf(stderr, "rombie-engine: the saved disk failed: %s\n",
+                    error ? error : "?");
+            SendEvent("error", std::string("Boot failed: ") +
+                                   (error ? error : "the game's saved data "
+                                                    "couldn't be read."));
+            g_free(error);
+            SDL_Delay(500);
+            QuitNow(EXIT_FAILURE);
+        }
+    }
+    if (s_join_state.empty()) {
+        return;
+    }
+    /* The host's machine had its four pads plugged in; this one must too
+     * before it takes the state. */
+    xemu_input_init();
+    char *error = nullptr;
+    int64_t clock = 0;
+    const double from = NowMs();
+    const bool ok = rombie_media_load_handoff(
+        s_data_dir.c_str(), s_join_state.data(), s_join_state.size(), &clock,
+        &error);
+    const size_t size = s_join_state.size();
+    s_join_state = {};
+    if (!ok) {
+        fprintf(stderr, "rombie-engine: netplay join failed: %s\n",
+                error ? error : "?");
+        SendEvent("netplay-failed", error ? error : "?");
+        g_free(error);
+        /* The event goes out before the process does. */
+        SDL_Delay(500);
+        QuitNow(EXIT_FAILURE);
+    }
+    rombie_rtc_restart_clock();
+    xemu_lockstep_vblank_rebase(clock);
+    mcpx_apu_lockstep_rebase(clock);
+    /* 0x0B's guest speed holds from here, as from a boot's first vblank. */
+    {
+        std::unique_lock<std::mutex> lock(s_speed_mutex);
+        for (size_t i = 0; i < s_speed_changes.size();) {
+            if (s_speed_changes[i].first == 0) {
+                rombie_icount_set_scale(s_speed_changes[i].second);
+                s_speed_q16.store(s_speed_changes[i].second);
+                s_speed_changes.erase(s_speed_changes.begin() + i);
+            } else {
+                i++;
+            }
+        }
+    }
+    fprintf(stderr,
+            "rombie-engine: netplay state loaded (%zu bytes, %.0f ms): "
+            "lockstep from vblank %u, guest time %.3f s\n",
+            size, NowMs() - from, s_join_vblank, clock / 1e9);
+    SendEvent("netplay-joined", std::to_string(s_join_vblank));
 }

@@ -68,4 +68,11 @@ bool delete_snapshot(const char *name,
  */
 void load_snapshot_resume(RunState state);
 
+#ifdef XBOX
+/* Rombie's netplay handoff: the machine's state as a stream in a file, apart
+ * from the disk (migration/savevm.c). */
+bool rombie_savevm_file(const char *path, Error **errp);
+bool rombie_loadvm_file(const char *path, Error **errp);
+#endif
+
 #endif

@@ -21,6 +21,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/main-loop.h"
+#include "ui/rombie-engine.h"
 
 void nv2a_update_irq(NV2AState *d)
 {
@@ -241,9 +242,153 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
 
     pgraph_init(d);
 
+    pfifo_lockstep_init(d, rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU),
+                        rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU_AHEAD));
+
     /* fire up pfifo */
     qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo_thread",
                        pfifo_thread, d, QEMU_THREAD_JOINABLE);
+}
+
+/* Development (ROMBIE_LOCKSTEP_PROFILE=1): the register accesses that make
+ * the CPU wait for the GPU, every 4000 of them. */
+static void note_mmio_wait(NV2AState *d, int block, hwaddr addr, bool write)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *env = getenv("ROMBIE_LOCKSTEP_PROFILE");
+        on = env && env[0] == '1';
+    }
+    if (!on || !d->pfifo.guest_work) {
+        return;
+    }
+    static struct { uint32_t key; uint32_t count; } slots[64];
+    static uint32_t total;
+    const uint32_t key = (block << 24) | ((uint32_t)addr & 0xFFFFFF) |
+                         (write ? 0x80000000u : 0);
+    for (int i = 0; i < 64; i++) {
+        if (slots[i].count == 0 || slots[i].key == key) {
+            slots[i].key = key;
+            slots[i].count++;
+            break;
+        }
+    }
+    if (++total < 4000) {
+        return;
+    }
+    fprintf(stderr, "rombie-lockstep: gpu waits by register:");
+    for (int i = 0; i < 64 && slots[i].count; i++) {
+        fprintf(stderr, " %c%s+%06x:%u", (slots[i].key >> 31) ? 'w' : 'r',
+                blocktable[(slots[i].key >> 24) & 0x7f].name,
+                slots[i].key & 0xFFFFFF, slots[i].count);
+    }
+    fprintf(stderr, "\n");
+    memset(slots, 0, sizeof(slots));
+    total = 0;
+}
+
+/* Lockstep's MMIO: work the guest left waiting (DMA_PUT) runs before it
+ * reads or writes any NV2A register but DMA_PUT itself. */
+static uint64_t nv2a_lockstep_read(void *opaque, hwaddr addr, unsigned size)
+{
+    typeof(g_nv2a->lockstep_blocks[0]) *b = opaque;
+    NV2AState *d = b->d;
+    if (b->block == NV_PFB) {
+        /* PFB's registers don't follow the GPU's work (its WBC flush, which
+         * the guest polls after kicks, reads as done). */
+        return blocktable[b->block].ops.read(d, addr, size);
+    }
+    /* Ahead: the guest reads DMA_GET or REF after kicks to see how far the
+     * GPU got. Its first read since the CPU last waited gets the value that
+     * wait left, which the GPU has passed; a second, with no wait between,
+     * is a poll, and waits. Both follow only the guest's own steps. */
+    const hwaddr reg = addr & 0xFFFF;
+    if (b->block == NV_USER && d->pfifo.ahead &&
+        (reg == NV_USER_DMA_GET || reg == NV_USER_REF)) {
+        if (d->pfifo.user_read_syncs != d->pfifo.syncs) {
+            d->pfifo.user_read_syncs = d->pfifo.syncs;
+            return reg == NV_USER_DMA_GET ? d->pfifo.synced_dma_get
+                                          : d->pfifo.synced_ref;
+        }
+        nv2a_lockstep_catch_up();
+        d->pfifo.user_read_syncs = d->pfifo.syncs;
+        return blocktable[b->block].ops.read(d, addr, size);
+    }
+    note_mmio_wait(b->d, b->block, addr, false);
+    nv2a_lockstep_catch_up();
+    return blocktable[b->block].ops.read(b->d, addr, size);
+}
+
+static void nv2a_lockstep_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    typeof(g_nv2a->lockstep_blocks[0]) *b = opaque;
+    /* Nor does the WBC flush the guest asks for after kicks (the GPU reads
+     * only PFB's tiles). */
+    const bool flush = b->block == NV_PFB && addr == NV_PFB_WBC;
+    if (!flush && (b->block != NV_USER || (addr & 0xFFFF) != NV_USER_DMA_PUT)) {
+        note_mmio_wait(b->d, b->block, addr, true);
+        nv2a_lockstep_catch_up();
+    }
+    blocktable[b->block].ops.write(b->d, addr, val, size);
+}
+
+/* Development: every 4 KB page's hash and the GPU's surfaces, to find what
+ * differs when two engines' RAM hashes do. */
+void nv2a_lockstep_dump(uint32_t vblank)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        return;
+    }
+    const size_t size = memory_region_size(d->vram);
+    fprintf(stderr, "rombie-lockstep: dump at vblank %u\n", vblank);
+    for (size_t page = 0; page < size / 4096; page++) {
+        fprintf(stderr, "rombie-lockstep: page %05zx %016" PRIx64 "\n", page,
+                rombie_hash64(d->vram_ptr + page * 4096, 4096, 0));
+    }
+    if (d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_OPENGL) {
+        qemu_mutex_lock(&d->pgraph.lock);
+        pgraph_gl_lockstep_dump_surfaces(d);
+        qemu_mutex_unlock(&d->pgraph.lock);
+    }
+    fprintf(stderr, "rombie-lockstep: dump done\n");
+}
+
+/* Lockstep's RAM hash: the Xbox's memory is the GPU's (UMA). */
+uint64_t nv2a_lockstep_ram_hash(void)
+{
+    NV2AState *d = g_nv2a;
+    return d ? rombie_hash64(d->vram_ptr, memory_region_size(d->vram), 0) : 0;
+}
+
+/* Lockstep's NV2A hash: the registers the guest can read, and the state of
+ * the interrupts and the scanout. */
+uint64_t nv2a_lockstep_hash(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        return 0;
+    }
+    qemu_mutex_lock(&d->pfifo.lock);
+    qemu_mutex_lock(&d->pgraph.lock);
+    uint64_t h = rombie_hash64(d->pfifo.regs, sizeof(d->pfifo.regs), 1);
+    h = rombie_hash64(d->pgraph.regs_, sizeof(d->pgraph.regs_), h);
+    const uint64_t small[] = {
+        d->pmc.pending_interrupts,     d->pmc.enabled_interrupts,
+        d->pfifo.pending_interrupts,   d->pfifo.enabled_interrupts,
+        d->pgraph.pending_interrupts,  d->pgraph.enabled_interrupts,
+        d->ptimer.pending_interrupts,  d->ptimer.enabled_interrupts,
+        d->ptimer.numerator,           d->ptimer.denominator,
+        d->ptimer.alarm_time,          d->pcrtc.pending_interrupts,
+        d->pcrtc.enabled_interrupts,   d->pcrtc.start,
+        d->pcrtc.raster,
+    };
+    h = rombie_hash64(small, sizeof(small), h);
+    h = rombie_hash64(d->pvideo.regs, sizeof(d->pvideo.regs), h);
+    qemu_mutex_unlock(&d->pgraph.lock);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    return h;
 }
 
 static void nv2a_init_vga(NV2AState *d)
@@ -288,6 +433,7 @@ static void nv2a_unlock_fifo(NV2AState *d)
 
 static void nv2a_reset(NV2AState *d)
 {
+    pfifo_lockstep_reset(d, true);
     nv2a_lock_fifo(d);
     bool halted = qatomic_read(&d->pfifo.halt);
     if (!halted) {
@@ -342,6 +488,7 @@ static void nv2a_reset(NV2AState *d)
     }
 
     nv2a_unlock_fifo(d);
+    pfifo_lockstep_reset(d, false);
 }
 
 static void nv2a_realize(PCIDevice *dev, Error **errp)
@@ -357,10 +504,22 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
     memory_region_init(&d->mmio, OBJECT(dev), "nv2a-mmio", 0x1000000);
     pci_register_bar(PCI_DEVICE(d), 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
 
+    const bool lockstep = rombie_engine_lockstep_sync(ROMBIE_SYNC_GPU);
     for (int i=0; i < ARRAY_SIZE(blocktable); i++) {
         if (!blocktable[i].name) continue;
+        const MemoryRegionOps *ops = &blocktable[i].ops;
+        void *opaque = d;
+        if (lockstep) {
+            d->lockstep_ops[i] = blocktable[i].ops;
+            d->lockstep_ops[i].read = nv2a_lockstep_read;
+            d->lockstep_ops[i].write = nv2a_lockstep_write;
+            d->lockstep_blocks[i].d = d;
+            d->lockstep_blocks[i].block = i;
+            ops = &d->lockstep_ops[i];
+            opaque = &d->lockstep_blocks[i];
+        }
         memory_region_init_io(&d->block_mmio[i], OBJECT(dev),
-                              &blocktable[i].ops, d,
+                              ops, opaque,
                               blocktable[i].name, blocktable[i].size);
         memory_region_add_subregion(&d->mmio, blocktable[i].offset,
                                     &d->block_mmio[i]);
@@ -378,6 +537,7 @@ static void nv2a_exitfn(PCIDevice *dev)
 
     d->exiting = true;
 
+    pfifo_lockstep_exit(d);
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
     qemu_thread_join(&d->pfifo.thread);
 
@@ -390,13 +550,18 @@ static void nv2a_reset_hold(Object *obj, ResetType type)
     nv2a_reset(s);
 }
 
+bool nv2a_save_keeps_surfaces;
+
 // Note: This is handled as a VM state change and not as a `pre_save` callback
 // because we want to halt the FIFO before any VM state is saved/restored to
 // avoid corruption.
 static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
 {
     NV2AState *d = opaque;
-    if (state == RUN_STATE_SAVE_VM) {
+    if (state == RUN_STATE_SAVE_VM && nv2a_save_keeps_surfaces) {
+        nv2a_lock_fifo(d);
+        qatomic_set(&d->pfifo.halt, true);
+    } else if (state == RUN_STATE_SAVE_VM) {
         nv2a_lock_fifo(d);
         qatomic_set(&d->pfifo.halt, true);
         pgraph_pre_savevm_trigger(d);
@@ -458,6 +623,66 @@ const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         // FIXME
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/*
+ * The vertex attributes' formats, offsets and inline values, which the state
+ * above leaves out: after a load every attribute read as unset until the game
+ * set it again, and Halo 2 drew an inline array first after a netplay
+ * resync, which divided by its vertex size of 0 (Rombie BRAIN-38). A
+ * subsection, so a state without it loads as before.
+ */
+static int nv2a_vertex_attributes_pre_save(void *opaque)
+{
+    NV2AState *d = opaque;
+    for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        const VertexAttribute *attr = &d->pgraph.vertex_attributes[i];
+        uint32_t *saved = d->pgraph.vertex_attributes_saved[i];
+        saved[0] = attr->dma_select;
+        saved[1] = (uint32_t)attr->offset;
+        saved[2] = attr->format;
+        saved[3] = attr->size;
+        saved[4] = attr->count;
+        saved[5] = attr->stride;
+        memcpy(&saved[6], attr->inline_value, sizeof(attr->inline_value));
+    }
+    return 0;
+}
+
+static int nv2a_vertex_attributes_post_load(void *opaque, int version_id)
+{
+    NV2AState *d = opaque;
+    PGRAPHState *pg = &d->pgraph;
+    pg->compressed_attrs = 0;
+    for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        VertexAttribute *attr = &pg->vertex_attributes[i];
+        const uint32_t *saved = pg->vertex_attributes_saved[i];
+        attr->dma_select = saved[0];
+        attr->offset = saved[1];
+        attr->format = saved[2];
+        attr->size = saved[3];
+        attr->count = saved[4];
+        attr->stride = saved[5];
+        memcpy(attr->inline_value, &saved[6], sizeof(attr->inline_value));
+        attr->inline_buffer_populated = false;
+        if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP) {
+            pg->compressed_attrs |= 1 << i;
+        }
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_nv2a_vertex_attributes_saved = {
+    .name = "nv2a/pgraph/vertex-attributes",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = nv2a_vertex_attributes_pre_save,
+    .post_load = nv2a_vertex_attributes_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_2DARRAY(pgraph.vertex_attributes_saved, NV2AState,
+                               NV2A_VERTEXSHADER_ATTRIBUTES, 10),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -590,6 +815,10 @@ static const VMStateDescription vmstate_nv2a = {
         VMSTATE_BUFFER_UNSAFE(pgraph.vsh_carry_fog, NV2AState, 5,
                               sizeof(((PGRAPHState *)0)->vsh_carry_fog)),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_nv2a_vertex_attributes_saved,
+        NULL
     },
 };
 

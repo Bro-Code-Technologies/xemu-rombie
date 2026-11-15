@@ -185,10 +185,15 @@ static void dsp_jit_sync_to_vm(DSPState *dsp)
     /* Mixbuffer is aliased at xram[0xC00] */
     memcpy(vm->mixbuffer, be->xram + 0xC00,
            DSP_MIXBUFFER_SIZE * sizeof(uint32_t));
-    /* Peripheral state: read current values via callbacks */
+    /* Peripheral state: read current values via callbacks. The DMA's control
+     * as it is: read, it counts as the guest polling it, and a third poll
+     * stops the DMA, so a save stopped it on a netplay host alone (Rombie
+     * BRAIN-38). */
     for (int i = 0; i < DSP_PERIPH_SIZE; i++) {
-        vm->periph[i] =
-            dsp56300_read_memory(jit, DSP56300_MEM_SPACE_X, 0xFFFF80 + i);
+        const uint32_t address = 0xFFFF80 + i;
+        vm->periph[i] = address == 0xFFFFD6 ?
+            dsp->dma.control :
+            dsp56300_read_memory(jit, DSP56300_MEM_SPACE_X, address);
     }
 }
 

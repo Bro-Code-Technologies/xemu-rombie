@@ -263,6 +263,7 @@ static void proc_rst_write(DSPState *dsp, uint32_t oldval, uint32_t val)
 static uint64_t gp_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    mcpx_apu_lockstep_commit(d);
 
     assert(size == 4);
     assert(addr % 4 == 0);
@@ -305,6 +306,7 @@ static uint64_t gp_read(void *opaque, hwaddr addr, unsigned int size)
 static void gp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    mcpx_apu_lockstep_commit(d);
 
     qemu_mutex_lock(&d->lock);
 
@@ -359,6 +361,7 @@ const MemoryRegionOps gp_ops = {
 static uint64_t ep_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    mcpx_apu_lockstep_commit(d);
 
     assert(size == 4);
     assert(addr % 4 == 0);
@@ -395,6 +398,7 @@ static uint64_t ep_read(void *opaque, hwaddr addr, unsigned int size)
 static void ep_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
+    mcpx_apu_lockstep_commit(d);
 
     qemu_mutex_lock(&d->lock);
 

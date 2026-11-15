@@ -22,6 +22,7 @@
 #include <math.h>
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "ui/rombie-engine.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
@@ -175,6 +176,8 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     qemu_mutex_unlock(&pg->lock);
     qemu_mutex_unlock(&d->pfifo.lock);
+
+    pfifo_lockstep_sync(d);
 }
 
 void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
@@ -199,6 +202,7 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
 
         pg->waiting_for_context_switch = true;
         qemu_mutex_unlock(&pg->lock);
+        nv2a_lockstep_park(d);
         bql_lock();
         pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
         nv2a_update_irq(d);
@@ -870,6 +874,7 @@ DEF_METHOD(NV097, NO_OPERATION)
     pg->waiting_for_nop = true;
 
     qemu_mutex_unlock(&pg->lock);
+    nv2a_lockstep_park(d);
     bql_lock();
     nv2a_update_irq(d);
     bql_unlock();
@@ -925,6 +930,7 @@ DEF_METHOD(NV097, FLIP_STALL)
     d->pgraph.renderer->ops.flip_stall(d);
     nv2a_profile_flip_stall();
     pg->waiting_for_flip = true;
+    rombie_prof_add(ROMBIE_PROF_FLIPS, 1);
 }
 
 // TODO: these should be loading the dma objects from ramin here?
@@ -2780,7 +2786,9 @@ DEF_METHOD(NV097, BACK_END_WRITE_SEMAPHORE_RELEASE)
     assert(semaphore_offset < semaphore_dma_len);
     semaphore_data += semaphore_offset;
 
-    stl_le_p((uint32_t*)semaphore_data, parameter);
+    uint8_t value[4];
+    stl_le_p(value, parameter);
+    nv2a_lockstep_gpu_write(d, semaphore_data, value, sizeof(value));
 
     //qemu_mutex_lock(&d->pgraph.lock);
     //bql_unlock();
@@ -3078,9 +3086,23 @@ void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter,
     assert(offset < report_dma_len);
     report_data += offset;
 
-    stq_le_p((uint64_t *)&report_data[0], timestamp);
-    stl_le_p((uint32_t *)&report_data[8], result);
-    stl_le_p((uint32_t *)&report_data[12], done);
+    uint8_t report[16];
+    stq_le_p(&report[0], timestamp);
+    stl_le_p(&report[8], result);
+    stl_le_p(&report[12], done);
+    nv2a_lockstep_gpu_write(d, report_data, report, sizeof(report));
+
+    /* Development (ROMBIE_LOCKSTEP_TRACE_REPORTS=1): every occlusion count
+     * the guest gets, to compare two PCs' GPUs. */
+    static int trace = -1;
+    if (trace < 0) {
+        const char *env = getenv("ROMBIE_LOCKSTEP_TRACE_REPORTS");
+        trace = env && env[0] == '1';
+    }
+    if (trace) {
+        fprintf(stderr, "rombie-lockstep: report %" HWADDR_PRIx " = %u\n",
+                offset, result);
+    }
 
     NV2A_DPRINTF("Report result %d @%" HWADDR_PRIx, result, offset);
 }

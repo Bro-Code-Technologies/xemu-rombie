@@ -263,6 +263,14 @@ static const int port_map[4] = { 3, 4, 1, 2 };
 
 void xemu_input_init(void)
 {
+    /* Rombie's netplay join plugs the pads in before the machine loads the
+     * host's state, which holds them; the UI thread's call comes later. */
+    static bool initialized;
+    if (initialized) {
+        return;
+    }
+    initialized = true;
+
     if (rombie_engine_enabled()) {
         /* Input only ever comes from the page: four pads in the console's
          * four ports, and none of this PC's keyboards or gamepads, so a pad
@@ -529,9 +537,12 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
 
 void xemu_input_update_controller(ControllerState *state)
 {
+    /* In lockstep the guest reads the pads its vblank applied, every time,
+     * not as often as real time allows. */
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    if (ABS(now - state->last_input_updated_ts) <
-        XEMU_INPUT_MIN_INPUT_UPDATE_INTERVAL_US) {
+    if (!(state->type == INPUT_DEVICE_ROMBIE && rombie_engine_lockstep()) &&
+        ABS(now - state->last_input_updated_ts) <
+            XEMU_INPUT_MIN_INPUT_UPDATE_INTERVAL_US) {
         return;
     }
 
@@ -550,6 +561,11 @@ void xemu_input_update_controllers(void)
 {
     ControllerState *iter;
     QTAILQ_FOREACH(iter, &available_controllers, entry) {
+        /* In lockstep only the guest's own poll updates the page's pads, so
+         * this thread never writes a pad the guest is reading. */
+        if (iter->type == INPUT_DEVICE_ROMBIE && rombie_engine_lockstep()) {
+            continue;
+        }
         xemu_input_update_controller(iter);
     }
     QTAILQ_FOREACH(iter, &available_controllers, entry) {

@@ -5,6 +5,8 @@ specific_ss.add(files(
 	# 'chihiro.c',
 	'eeprom_generation.c',
 	'lpc47m157.c',
+	'rombie-link.c',
+	'rombie-lockstep.c',
 	'smbus_adm1032.c',
 	'smbus_cx25871.c',
 	'smbus_fs454.c',

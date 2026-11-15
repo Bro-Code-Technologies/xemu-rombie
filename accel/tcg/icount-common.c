@@ -154,9 +154,40 @@ int64_t icount_get(void)
     return icount;
 }
 
+/*
+ * Rombie lockstep: guest time per instruction in sixteenths of a
+ * nanosecond, finer than the shift's powers of two; 0 keeps the shift.
+ * Changed only on the vCPU thread between slices (rombie_icount_set_scale).
+ */
+static int64_t rombie_icount_q16;
+
 int64_t icount_to_ns(int64_t icount)
 {
+    const int64_t q16 = qatomic_read_i64(&rombie_icount_q16);
+    if (q16) {
+        return (icount * q16) >> 4;
+    }
     return icount << qatomic_read(&timers_state.icount_time_shift);
+}
+
+void rombie_icount_set_scale(int64_t q16)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    /* The clock goes on from where it is: the bias takes up the change. */
+    const int64_t now = icount_get_locked();
+    qatomic_set_i64(&rombie_icount_q16, q16);
+    qatomic_set_i64(&timers_state.qemu_icount_bias,
+                    now - icount_to_ns(qatomic_read_i64(
+                              &timers_state.qemu_icount)));
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+int64_t rombie_icount_scale(void)
+{
+    const int64_t q16 = qatomic_read_i64(&rombie_icount_q16);
+    return q16 ? q16 : (int64_t)16 << qatomic_read(&timers_state.icount_time_shift);
 }
 
 /*
@@ -225,6 +256,10 @@ static void icount_adjust_vm(void *opaque)
 
 int64_t icount_round(int64_t count)
 {
+    const int64_t q16 = qatomic_read_i64(&rombie_icount_q16);
+    if (q16) {
+        return (count * 16 + q16 - 1) / q16;
+    }
     int shift = qatomic_read(&timers_state.icount_time_shift);
     return (count + (1 << shift) - 1) >> shift;
 }
@@ -290,6 +325,72 @@ static void icount_timer_cb(void *opaque)
     icount_warp_rt();
 }
 
+/*
+ * Rombie's lockstep (sleep off): an idle vCPU moves QEMU_CLOCK_VIRTUAL on to
+ * its next deadline itself and runs the timers there, the warp
+ * icount_start_warp_timer() makes below. Left to the main loop, every halt
+ * cost two thread wake-ups, and on Windows that ran the guest at a sixth of
+ * its speed. Returns whether it warped.
+ */
+/*
+ * A stopped CPU counts as idle, and the rr loop turns QEMU_CLOCK_VIRTUAL back
+ * on each time round, but no warp may go on then: between vm_start's run
+ * state and its resume_all_vcpus the devices' handlers run, NV2A's lets go
+ * of the BQL, and a warp there moved guest time on with no instruction run.
+ * Only the netplay host saved, so only it ran on differently, now and then
+ * (Rombie BRAIN-38).
+ */
+static bool icount_cpus_stopped(void)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (cpu->stop || cpu->stopped) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool icount_warp_in_vcpu(void)
+{
+    if (!all_cpu_threads_idle() || icount_cpus_stopped() ||
+        !icount_warp_to_deadline()) {
+        return false;
+    }
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    return true;
+}
+
+/*
+ * The warp itself, for a vCPU that is idle or spinning (Rombie's lockstep
+ * finds the spins): QEMU_CLOCK_VIRTUAL jumps to its next deadline, whose
+ * timers the vCPU loop then runs. Only with sleep off, outside replay.
+ */
+bool icount_warp_to_deadline(void)
+{
+    int64_t deadline;
+
+    if (icount_sleep || replay_mode != REPLAY_MODE_NONE ||
+        !runstate_is_running()) {
+        return false;
+    }
+    deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                          ~QEMU_TIMER_ATTR_EXTERNAL);
+    if (deadline < 0) {
+        return false;
+    }
+    if (deadline > 0) {
+        seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                           &timers_state.vm_clock_lock);
+        qatomic_set_i64(&timers_state.qemu_icount_bias,
+                        timers_state.qemu_icount_bias + deadline);
+        seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                             &timers_state.vm_clock_lock);
+    }
+    return true;
+}
+
 void icount_start_warp_timer(void)
 {
     int64_t clock;
@@ -301,7 +402,7 @@ void icount_start_warp_timer(void)
      * Nothing to do if the VM is stopped: QEMU_CLOCK_VIRTUAL timers
      * do not fire, so computing the deadline does not make sense.
      */
-    if (!runstate_is_running()) {
+    if (!runstate_is_running() || icount_cpus_stopped()) {
         return;
     }
 

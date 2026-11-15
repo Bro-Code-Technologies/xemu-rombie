@@ -103,7 +103,42 @@ typedef struct NV2AState {
         QemuCond fifo_idle_cond;
         bool fifo_kick;
         bool halt;
+        /* Rombie's lockstep (ROMBIE_SYNC_GPU): the pusher runs only while
+         * the CPU waits for it (pfifo_lockstep_sync): after a PFIFO, PGRAPH
+         * or USER write, and before any NV2A access, a vblank or a spin
+         * once a DMA_PUT write has left work waiting (guest_work), so the
+         * GPU's work lands at points of guest time. */
+        bool lockstep;
+        bool guest_work;
+        uint64_t guest_kicks;
+        uint64_t guest_done;
+        /* With ahead (ROMBIE_SYNC_GPU_AHEAD) a DMA_PUT starts the pusher at
+         * once and the CPU waits only at those points (cpu_waiting). The
+         * GPU's semaphore and report writes made while the CPU runs wait in
+         * deferred for its next wait, and an interrupt waits for it
+         * (nv2a_lockstep_park). Its other writes land in surfaces' memory,
+         * whose every CPU access waits for the GPU first. */
+        bool ahead;
+        bool in_pusher; /* the GPU thread's, in pfifo_run_pusher */
+        bool cpu_waiting;
+        QemuMutex effects_lock;
+        QemuCond effects_cond;
+        GArray *deferred;
+        /* Ahead: the CPU's waits so far, and USER's DMA_GET and REF as the
+         * last one left them, which a first read since then gets without
+         * waiting (nv2a_lockstep_read). */
+        uint64_t syncs;
+        uint64_t user_read_syncs;
+        uint32_t synced_dma_get;
+        uint32_t synced_ref;
     } pfifo;
+
+    /* Lockstep's MMIO: every block's accesses run the GPU first. */
+    struct {
+        struct NV2AState *d;
+        int block;
+    } lockstep_blocks[NV_NUM_BLOCKS];
+    MemoryRegionOps lockstep_ops[NV_NUM_BLOCKS];
 
     struct {
         uint32_t regs[0x1000];

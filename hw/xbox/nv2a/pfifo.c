@@ -20,6 +20,8 @@
  */
 
 #include "nv2a_int.h"
+#include "system/cpus.h"
+#include "ui/rombie-engine.h"
 
 typedef struct RAMHTEntry {
     uint32_t handle;
@@ -91,12 +93,191 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     pfifo_kick(d);
 
     qemu_mutex_unlock(&d->pfifo.lock);
+
+    pfifo_lockstep_sync(d);
 }
 
 void pfifo_kick(NV2AState *d)
 {
     d->pfifo.fifo_kick = true;
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
+}
+
+/*
+ * Lockstep: the CPU waits for a pusher pass that starts now and ends with
+ * nothing more to do. Other threads' kicks (the display, surface downloads)
+ * never run the pusher, so the guest sees the GPU's progress, its
+ * interrupts and its writes to memory only at these points of its own time:
+ * after its PFIFO, PGRAPH and USER writes (DMA_PUT's leave the work waiting
+ * instead, pfifo_lockstep_defer), and, while work waits, before any NV2A
+ * access, a vblank or a spin (nv2a_lockstep_catch_up).
+ */
+typedef struct LockstepWrite {
+    uint8_t *dest;
+    uint32_t len;
+    uint8_t data[16];
+} LockstepWrite;
+
+void pfifo_lockstep_init(NV2AState *d, bool lockstep, bool ahead)
+{
+    d->pfifo.lockstep = lockstep;
+    d->pfifo.ahead = lockstep && ahead;
+    qemu_mutex_init(&d->pfifo.effects_lock);
+    qemu_cond_init(&d->pfifo.effects_cond);
+    d->pfifo.deferred = g_array_new(false, false, sizeof(LockstepWrite));
+}
+
+void pfifo_lockstep_exit(NV2AState *d)
+{
+    qemu_mutex_lock(&d->pfifo.effects_lock);
+    qemu_cond_broadcast(&d->pfifo.effects_cond);
+    qemu_mutex_unlock(&d->pfifo.effects_lock);
+}
+
+static void flush_deferred_locked(NV2AState *d)
+{
+    for (guint i = 0; i < d->pfifo.deferred->len; i++) {
+        LockstepWrite *w = &g_array_index(d->pfifo.deferred, LockstepWrite, i);
+        memcpy(w->dest, w->data, w->len);
+    }
+    g_array_set_size(d->pfifo.deferred, 0);
+}
+
+/* The held writes land as the CPU starts waiting, before any the GPU makes
+ * during the wait, so they keep the GPU's order. */
+static void set_cpu_waiting(NV2AState *d, bool waiting)
+{
+    qemu_mutex_lock(&d->pfifo.effects_lock);
+    flush_deferred_locked(d);
+    d->pfifo.cpu_waiting = waiting;
+    qemu_cond_broadcast(&d->pfifo.effects_cond);
+    qemu_mutex_unlock(&d->pfifo.effects_lock);
+}
+
+/* Lockstep ahead, at a reset (main thread, the CPU stopped): the GPU does
+ * the work it was given as if the CPU waited for it, so a GPU parked on an
+ * interrupt goes on and the held writes land, before the registers go. Done
+ * at the reset's own point of guest time, so every PC does the same. */
+void pfifo_lockstep_reset(NV2AState *d, bool begin)
+{
+    if (d->pfifo.ahead) {
+        set_cpu_waiting(d, begin);
+    }
+}
+
+void pfifo_lockstep_sync(NV2AState *d)
+{
+    if (!d->pfifo.lockstep || !qemu_in_vcpu_thread()) {
+        return;
+    }
+    d->pfifo.guest_work = false;
+    const uint64_t from = rombie_prof_now();
+    if (d->pfifo.ahead) {
+        set_cpu_waiting(d, true);
+    }
+    qemu_mutex_lock(&d->pfifo.lock);
+    const uint64_t kick = ++d->pfifo.guest_kicks;
+    pfifo_kick(d);
+    const bool locked = bql_locked();
+    if (locked) {
+        bql_unlock();
+    }
+    while (d->pfifo.guest_done < kick) {
+        qemu_cond_wait(&d->pfifo.fifo_idle_cond, &d->pfifo.lock);
+    }
+    d->pfifo.syncs++;
+    d->pfifo.synced_dma_get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+    d->pfifo.synced_ref = d->pfifo.regs[NV_PFIFO_CACHE1_REF];
+    qemu_mutex_unlock(&d->pfifo.lock);
+    if (d->pfifo.ahead) {
+        set_cpu_waiting(d, false);
+    }
+    if (locked) {
+        bql_lock();
+    }
+    rombie_prof_add(ROMBIE_PROF_GPU_NS, rombie_prof_now() - from);
+    rombie_prof_add(ROMBIE_PROF_GPU_SYNCS, 1);
+}
+
+/* Lockstep: a DMA_PUT write only adds work. Serial, the GPU does it at the
+ * next point the guest could see it, many kicks to a pass; ahead, it starts
+ * now and that point waits only for what's left. */
+void pfifo_lockstep_defer(NV2AState *d)
+{
+    if (!d->pfifo.lockstep) {
+        return;
+    }
+    d->pfifo.guest_work = true;
+    if (d->pfifo.ahead && qemu_in_vcpu_thread()) {
+        qemu_mutex_lock(&d->pfifo.lock);
+        d->pfifo.guest_kicks++;
+        pfifo_kick(d);
+        qemu_mutex_unlock(&d->pfifo.lock);
+    }
+}
+
+/* Lockstep ahead: a GPU write to memory the guest polls (a semaphore, a
+ * report) lands only while the CPU waits for the GPU. */
+void nv2a_lockstep_gpu_write(NV2AState *d, void *dest, const void *data,
+                         size_t len)
+{
+    if (!d->pfifo.ahead || qemu_in_vcpu_thread()) {
+        memcpy(dest, data, len);
+        return;
+    }
+    assert(len <= sizeof(((LockstepWrite *)0)->data));
+    qemu_mutex_lock(&d->pfifo.effects_lock);
+    if (d->pfifo.cpu_waiting) {
+        memcpy(dest, data, len);
+    } else {
+        LockstepWrite w = { .dest = dest, .len = len };
+        memcpy(w.data, data, len);
+        g_array_append_val(d->pfifo.deferred, w);
+        rombie_prof_add(ROMBIE_PROF_GPU_DEFERRED, 1);
+    }
+    qemu_mutex_unlock(&d->pfifo.effects_lock);
+}
+
+/* Lockstep ahead: the pusher's own writes to guest memory (a surface's
+ * download, a blit) wait until the CPU waits too, as interrupts do: written
+ * while it runs, they interleave with its writes to the same memory, which
+ * no longer trap once the surface is gone. A download the CPU asked for
+ * (pgraph_process_pending) comes while it waits already, outside the
+ * pusher. */
+void nv2a_lockstep_park_ram(NV2AState *d)
+{
+    if (d->pfifo.ahead && d->pfifo.in_pusher) {
+        nv2a_lockstep_park(d);
+    }
+}
+
+/* Lockstep ahead: the GPU thread waits here before raising an interrupt
+ * until the CPU waits for it, so the guest takes it at a point of its own
+ * time. The CPU's wait lasts until the pass this is in ends. */
+void nv2a_lockstep_park(NV2AState *d)
+{
+    if (!d->pfifo.ahead || qemu_in_vcpu_thread()) {
+        return;
+    }
+    qemu_mutex_lock(&d->pfifo.effects_lock);
+    if (!d->pfifo.cpu_waiting) {
+        rombie_prof_add(ROMBIE_PROF_GPU_PARKS, 1);
+    }
+    while (!d->pfifo.cpu_waiting && !d->exiting) {
+        qemu_cond_wait(&d->pfifo.effects_cond, &d->pfifo.effects_lock);
+    }
+    flush_deferred_locked(d);
+    qemu_mutex_unlock(&d->pfifo.effects_lock);
+}
+
+bool nv2a_lockstep_catch_up(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->pfifo.guest_work) {
+        return false;
+    }
+    pfifo_lockstep_sync(d);
+    return true;
 }
 
 static bool can_fifo_access(NV2AState *d) {
@@ -464,16 +645,32 @@ void *pfifo_thread(void *arg)
     qemu_mutex_lock(&d->pfifo.lock);
     while (true) {
         d->pfifo.fifo_kick = false;
+        const uint64_t guest_kicks = d->pfifo.guest_kicks;
+        const uint64_t pass_from = rombie_prof_now();
 
         pgraph_process_pending(d);
+        const uint64_t pusher_from = rombie_prof_now();
 
-        if (!d->pfifo.halt) {
+        if (!d->pfifo.halt &&
+            (!d->pfifo.lockstep || d->pfifo.guest_done < guest_kicks)) {
+            d->pfifo.in_pusher = true;
             pfifo_run_pusher(d);
+            d->pfifo.in_pusher = false;
         }
 
+        const uint64_t reports_from = rombie_prof_now();
+        rombie_prof_add(ROMBIE_PROF_PUSHER_NS, reports_from - pusher_from);
         pgraph_process_pending_reports(d);
+        if (d->pfifo.lockstep && d->pfifo.guest_done < guest_kicks) {
+            const uint64_t now = rombie_prof_now();
+            rombie_prof_add(ROMBIE_PROF_GPU_WORK_NS, now - pass_from);
+            rombie_prof_add(ROMBIE_PROF_GPU_PENDING_NS,
+                            pusher_from - pass_from);
+            rombie_prof_add(ROMBIE_PROF_GPU_REPORTS_NS, now - reports_from);
+        }
 
         if (!d->pfifo.fifo_kick) {
+            d->pfifo.guest_done = guest_kicks;
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);
 
             // Both the pusher and puller are waiting for some action

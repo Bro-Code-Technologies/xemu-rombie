@@ -120,18 +120,26 @@ static inline void hrtf_filter_process(HrtfFilter *f,
             int di = d;
             float dfrac = d - di;
 
-            // HRIR Convolution
+            // HRIR Convolution. The index walks down the ring buffer with one
+            // wrap a tap instead of two divisions; the sums are the same.
             float acc = 0.0f;
-            for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-                int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
-                float s = buf[idx1];
-
+            int idx1 = f->buf_pos - di;
+            if (idx1 < 0) {
+                idx1 += HRTF_BUFLEN;
+            }
+            if (dfrac > 0.0f) {
                 // Linear interpolation for fractional part
-                if (dfrac > 0.0f) {
-                    int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
-                    s = s * (1 - dfrac) + buf[idx2] * dfrac;
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    int idx2 = idx1 ? idx1 - 1 : HRTF_BUFLEN - 1;
+                    float s = buf[idx1] * (1 - dfrac) + buf[idx2] * dfrac;
+                    acc += coeff[k] * s;
+                    idx1 = idx2;
                 }
-                acc += coeff[k] * s;
+            } else {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    acc += coeff[k] * buf[idx1];
+                    idx1 = idx1 ? idx1 - 1 : HRTF_BUFLEN - 1;
+                }
             }
 
             out[n][ch] = acc;
