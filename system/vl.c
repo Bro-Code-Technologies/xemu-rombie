@@ -3077,9 +3077,15 @@ void qemu_init(int argc, char **argv)
         } else {
             fake_argv[fake_argc++] = strdup("-drive");
             char *escaped_hdd_path = strdup_double_commas(hdd_path);
-            fake_argv[fake_argc++] = g_strdup_printf("index=0,media=disk,file=%s%s",
+            // The engine's disk is scratch, written from the page's stored game
+            // data at every boot, so it needs no flush to the drive: flushes
+            // still hand qcow2's metadata to the OS, but filling Halo 2's
+            // 686 MB from the disc no longer waits 3-4.5 s for the laptop's
+            // SSD at the end (Rombie BRAIN-38 Phase 10.6).
+            fake_argv[fake_argc++] = g_strdup_printf("index=0,media=disk,file=%s%s%s",
                 escaped_hdd_path,
-                strlen(escaped_hdd_path) > 0 ? ",locked=on" : "");
+                strlen(escaped_hdd_path) > 0 ? ",locked=on" : "",
+                rombie_engine_enabled() ? ",cache=unsafe" : "");
             free(escaped_hdd_path);
         }
     }

@@ -557,7 +557,12 @@ into a machine that has never run.
   22 MB/s: Halo 2's 686 MB took 30-32 s from a cold file cache. One read at
   a time it takes 11-12 s there; two at a time took 14-18 s, and 32 MB
   pieces 13 s. The main PC's SSD takes 3-5 s (2.7-4.4 s through the
-  chunks).
+  chunks). The fill's log line splits its time: on the laptop, cold, about
+  8 s waiting for the disc and 3-4.5 s in the closing flush, the writes
+  having waited in the OS's cache. So the engine's disk opens with
+  `cache=unsafe` (`system/vl.c`): it is scratch, written from the page's
+  stored game data at every boot, and a flush still hands qcow2's metadata
+  to the OS, only not to the drive.
 - **No BIOS in the state**: `xbox.bios` (the flash) and `xbox.mcpx` (the
   flash with the MCPX ROM over its end) are marked not migratable around the
   save, so the stream leaves them out, and around the load, so a stream
