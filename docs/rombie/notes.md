@@ -290,7 +290,14 @@ on the main PC, 13-16 s on the laptop, at each save.
   drained file copy, 4.5-4.8 s before), and the build takes 1.6-2.3 s, up to
   6.9 s while the game loads.
 - One save at a time; one asked for meanwhile follows it. Exit makes the last
-  save, then shuts down once it's sent. A state change and the handoff move a
+  save, then shuts down once it's sent. A restart (0x04 op 4) does the same
+  before it starts the new process, since the page boots or stores what it
+  has once it's up: writes from after the restart was asked start no save,
+  netplay's held writes stay held until the session's end, and a save the
+  handoff overtook isn't waited for. The page must still answer the old
+  process's disc reads meanwhile: a save's disc index asks for the disc's
+  first sector, and unanswered it waits until the page lets go. A state
+  change and the handoff move a
   generation on, so a blob begun before them is dropped; before them a save's
   filter and images come out (`rombie_media_settle_blob`), since
   `save_snapshot` and `load_snapshot` take every writable disk. The handoff

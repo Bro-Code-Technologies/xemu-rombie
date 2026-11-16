@@ -14,7 +14,9 @@
  *                  [f32 rx][f32 ry][f32 lt][f32 rt]        (player 0-3)
  *   0x04 control   [u8 type][u8 op]          (1 pause, 2 resume, 3 exit,
  *                  4 restart: the engine starts itself again, with the same
- *                  key and port, and ends; the page connects again;
+ *                  key and port, and ends; the page connects again; game
+ *                  data written before it, and a save under way, is sent
+ *                  first (not netplay's held writes);
  *                  5 System Link's cable in, 6 out, before boot or while the
  *                  game runs, never in lockstep; the engine answers with the
  *                  link-cable event, "in" or "out")
@@ -334,6 +336,7 @@ static void StartSave(void);
 static void AfterSave(std::function<void()> work);
 static void SendGameDataNow(void);
 [[noreturn]] static void RestartSelf(void);
+static void RestartAfterSave(void);
 static uint64_t s_disc_size;
 static std::string s_disc_name;
 
@@ -1348,7 +1351,7 @@ static void HandleControl(const std::vector<uint8_t> &data)
             vm_start();
             SendEvent("resumed");
         } else if (op == CONTROL_RESTART) {
-            RestartSelf();
+            RestartAfterSave();
         }
     });
     if (op == CONTROL_EXIT) {
@@ -1481,6 +1484,8 @@ static void HandleGameData(const std::vector<uint8_t> &data)
  */
 static bool s_saving;
 static bool s_save_again;
+static uint64_t s_saving_generation; /* the running save's */
+static bool s_restarting; /* writes after a restart was asked aren't sent */
 static std::vector<std::function<void()>> s_after_save;
 /* Held around every send of game data, each part of it. A save's blob is
  * dropped, or the rest of it, once something moved the generation on after
@@ -1593,6 +1598,7 @@ static void StartSave(void)
         generation = s_save_generation;
     }
     s_saving = true;
+    s_saving_generation = generation;
     char *error = nullptr;
     const uint64_t held_from = rombie_prof_now();
     const bool started = rombie_media_read_blob_async(
@@ -1613,6 +1619,36 @@ static void AfterSave(std::function<void()> work)
         return;
     }
     s_after_save.push_back(std::move(work));
+}
+
+/* 0x04 op 4: the page boots the game data it has once the new process is
+ * up (a host booting again for System Link), or stores it (a linked guest
+ * back on the stream), so writes not yet sent go first and a save under way
+ * is sent. Netplay's held writes stay held (SendGameData), and a save the
+ * handoff overtook isn't waited for: its blob would be dropped anyway. */
+static void RestartAfterSave(void)
+{
+    if (s_booted.load()) {
+        if (rombie_media_hdd_written()) {
+            s_hdd_dirty = true;
+        }
+        if (s_hdd_dirty) {
+            SendGameData();
+        }
+    }
+    s_restarting = true;
+    bool overtaken;
+    {
+        std::unique_lock<std::mutex> lock(s_save_mutex);
+        overtaken = s_saving_generation != s_save_generation;
+    }
+    if (s_saving && !s_save_again && overtaken) {
+        RestartSelf();
+    }
+    if (s_saving) {
+        fprintf(stderr, "rombie-engine: restarting once the save is sent\n");
+    }
+    AfterSave([]() { RestartSelf(); });
 }
 
 /* UI thread: the game's blob as it is now, made and sent at once, ahead of
@@ -1674,6 +1710,12 @@ static void ReadBackForTest(void)
 
 static void SendGameData(void)
 {
+    /* The game keeps writing while a restart waits for its save, and each
+     * would start another. */
+    if (s_restarting) {
+        s_hdd_dirty = false;
+        return;
+    }
     /* A speed test keeps nothing, and a game that fills its cache
      * partitions (Halo 2: 700 MB) would have it read and sent again and
      * again. */
