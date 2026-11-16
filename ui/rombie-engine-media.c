@@ -695,11 +695,17 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
                                          list[0].length);
         ok = fetch != NULL;
     }
+    /* Where the time goes, for the log: a slow disc shows as waiting, a slow
+     * data folder as writing. */
+    const int64_t checked = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    int64_t waited_us = 0, wrote_us = 0;
     uint64_t got = HASH_P1;
     for (uint32_t p = 0; ok && p < pieces; p++) {
         const FillPiece *f = &list[p];
         const DiscRun *run = &need[f->run];
+        int64_t t = g_get_monotonic_time();
         ok = rombie_engine_disc_fetched(fetch, buf, f->length);
+        waited_us += g_get_monotonic_time() - t;
         fetch = NULL;
         if (ok && p + 1 < pieces) {
             const FillPiece *a = &list[p + 1];
@@ -707,8 +713,10 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
                 need[a->run].sector * DISC_SECTOR + a->at, a->length);
             ok = fetch != NULL;
         }
+        t = g_get_monotonic_time();
         ok = ok && blk_pwrite(hdd, run->disk + f->at, f->length, buf, 0) >= 0;
         got = check_sectors(got, buf, f->length);
+        wrote_us += g_get_monotonic_time() - t;
         if (!ok) {
             *error = g_strdup("Reading the disc for the game's hard disk "
                               "failed.");
@@ -731,17 +739,22 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
         *error = g_strdup("Reading the disc for the game's hard disk failed.");
     }
     qemu_vfree(buf);
+    const int64_t flushing = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     if (ok && blk_flush(hdd) < 0) {
         *error = g_strdup("Writing the game's hard disk failed.");
         ok = false;
     }
     if (ok) {
+        const int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         fprintf(stderr,
                 "rombie-engine: %s: %.1f MB from the disc, "
-                "%.1f MB already there (%u runs), in %" PRId64 " ms\n",
+                "%.1f MB already there (%u runs), in %" PRId64 " ms "
+                "(checking the disk %" PRId64 " ms, waiting for the disc "
+                "%" PRId64 " ms, writing %" PRId64 " ms, flushing %" PRId64
+                " ms)\n",
                 save ? "the saved disk" : "netplay's disk", filled / 1048576.0,
-                kept / 1048576.0, count,
-                qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - from);
+                kept / 1048576.0, count, now - from, checked - from,
+                waited_us / 1000, wrote_us / 1000, now - flushing);
     }
     return ok;
 }
