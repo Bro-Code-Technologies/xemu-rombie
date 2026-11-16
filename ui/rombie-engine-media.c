@@ -880,6 +880,7 @@ bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error)
 typedef struct {
     RombieBlobDone done;
     void *opaque;
+    char *dir;
     char *copy_path;
     char *fleece_path;
     char *disk_path;
@@ -906,6 +907,7 @@ static void blob_job_free(BlobJob *job)
     if (job->runs) {
         g_array_free(job->runs, true);
     }
+    g_free(job->dir);
     g_free(job->copy_path);
     g_free(job->fleece_path);
     g_free(job->disk_path);
@@ -1034,9 +1036,26 @@ static void coroutine_fn blob_job_co(void *opaque)
     aio_bh_schedule_oneshot(qemu_get_aio_context(), blob_job_copied, job);
 }
 
+static void blob_job_start_copy(void *opaque)
+{
+    qemu_coroutine_enter(qemu_coroutine_create(blob_job_co, opaque));
+}
+
+/* Worker thread: the disc's index, whose sector file it merges and saves and
+ * whose hashes it sorts (a third of a second on the laptop, which held the
+ * game on the UI thread), then the copy in the main loop. */
+static void *blob_job_index(void *opaque)
+{
+    BlobJob *job = opaque;
+    disc_index_open(job->dir, &job->index);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), blob_job_start_copy, job);
+    return NULL;
+}
+
 bool rombie_media_read_blob_async(RombieBlobDone done, void *opaque,
                                   char **error)
 {
+    const int64_t from = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     g_autofree char *dir = g_path_get_dirname(g_config.sys.files.hdd_path);
     Error *err = NULL;
     QEMUSnapshotInfo *info = NULL; /* xemu's own list */
@@ -1049,7 +1068,7 @@ bool rombie_media_read_blob_async(RombieBlobDone done, void *opaque,
     job->done = done;
     job->opaque = opaque;
     job->format1 = format1;
-    job->from = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    job->from = from;
     /* Not read_compact_blob's: the handoff's save can come while this runs. */
     job->copy_path = g_build_filename(dir, "save-bg-in-hdd.qcow2", NULL);
     job->fleece_path = g_build_filename(dir, "save-bg-fleece.qcow2", NULL);
@@ -1105,11 +1124,11 @@ bool rombie_media_read_blob_async(RombieBlobDone done, void *opaque,
         blob_job_free(job);
         return false;
     }
-    disc_index_open(dir, &job->index);
+    job->dir = g_strdup(dir);
     job->runs = g_array_new(false, false, sizeof(DiscRun));
     copying = job;
-    aio_co_schedule(qemu_get_aio_context(),
-                    qemu_coroutine_create(blob_job_co, job));
+    qemu_thread_create(&job->thread, "rombie-save", blob_job_index, job,
+                       QEMU_THREAD_DETACHED);
     return true;
 }
 
