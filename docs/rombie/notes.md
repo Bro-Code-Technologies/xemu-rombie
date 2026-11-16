@@ -554,8 +554,10 @@ into a machine that has never run.
   (`rombie_engine_disc_fetch`, past the game's chunks), the next asked for
   while this one is written. Through the chunks, an 8 MB read was ten 1 MB
   reads at once, and the laptop's 5400 rpm disk, seeking between them, gave
-  22 MB/s, 32 s for Halo 2's 686 MB (127 MB/s one read at a time); the main
-  PC's SSD did it in 2.7-4.4 s either way.
+  22 MB/s: Halo 2's 686 MB took 30-32 s from a cold file cache. One read at
+  a time it takes 11-12 s there; two at a time took 14-18 s, and 32 MB
+  pieces 13 s. The main PC's SSD takes 3-5 s (2.7-4.4 s through the
+  chunks).
 - **No BIOS in the state**: `xbox.bios` (the flash) and `xbox.mcpx` (the
   flash with the MCPX ROM over its end) are marked not migratable around the
   save, so the stream leaves them out, and around the load, so a stream

@@ -605,8 +605,6 @@ static bool add_disc_run(const DiscIndex *index, GArray *runs, uint64_t disk,
     return true;
 }
 
-#define FILL_AHEAD_MAX 8
-
 typedef struct {
     uint32_t run; /* in the runs the disk doesn't hold */
     uint32_t length;
@@ -674,51 +672,40 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
     /* In the disc's order, one read at a time, the next asked for while this
      * one is written (its answer waits in its own buffer): a hard disk reads
      * that at full speed, and seeks to and fro between reads asked for
-     * together (a 5400 rpm laptop disk gave 22 MB/s to ten 1 MB chunks at
-     * once, 127 MB/s to one read at a time). */
+     * together. The laptop's 5400 rpm disk filled Halo 2's 686 MB in 30 s
+     * through the chunks (ten 1 MB reads at once), 11 s this way; two reads
+     * at a time took 14-18 s, and an SSD fills in 3-5 s either way. */
     qsort(need, needed, sizeof(DiscRun), run_by_sector);
-    /* FIXME(Phase 10.6): tuning knobs, removed once both PCs are measured. */
-    const char *piece_env = g_getenv("ROMBIE_FILL_PIECE_MB");
-    const char *ahead_env = g_getenv("ROMBIE_FILL_AHEAD");
-    const uint64_t piece =
-        (uint64_t)MAX(1, MIN(64, piece_env ? atoi(piece_env) : 8)) << 20;
-    const uint32_t ahead = MAX(1, MIN(FILL_AHEAD_MAX,
-                                      ahead_env ? atoi(ahead_env) : 1));
     uint32_t pieces = 0;
     for (uint32_t i = 0; i < needed; i++) {
-        pieces += (uint32_t)DIV_ROUND_UP(need[i].sectors * DISC_SECTOR, piece);
+        pieces +=
+            (uint32_t)DIV_ROUND_UP(need[i].sectors * DISC_SECTOR, DISC_PIECE);
     }
     g_autofree FillPiece *list = g_new(FillPiece, pieces ? pieces : 1);
     for (uint32_t i = 0, p = 0; i < needed; i++) {
         const uint64_t bytes = need[i].sectors * DISC_SECTOR;
-        for (uint64_t at = 0; at < bytes; at += piece) {
-            list[p++] = (FillPiece){ i, (uint32_t)MIN(piece, bytes - at), at };
+        for (uint64_t at = 0; at < bytes; at += DISC_PIECE) {
+            list[p++] =
+                (FillPiece){ i, (uint32_t)MIN(DISC_PIECE, bytes - at), at };
         }
     }
-    if (piece > DISC_PIECE) {
-        qemu_vfree(buf);
-        buf = qemu_blockalign(blk_bs(hdd), piece);
-    }
-    void *fetches[FILL_AHEAD_MAX] = { NULL };
-    uint32_t asked = 0;
-    while (ok && asked < pieces && asked < ahead) {
-        const FillPiece *f = &list[asked];
-        fetches[asked % FILL_AHEAD_MAX] = rombie_engine_disc_fetch(
-            need[f->run].sector * DISC_SECTOR + f->at, f->length);
-        ok = fetches[asked++ % FILL_AHEAD_MAX] != NULL;
+    void *fetch = NULL;
+    if (ok && pieces) {
+        fetch = rombie_engine_disc_fetch(need[list[0].run].sector * DISC_SECTOR,
+                                         list[0].length);
+        ok = fetch != NULL;
     }
     uint64_t got = HASH_P1;
     for (uint32_t p = 0; ok && p < pieces; p++) {
         const FillPiece *f = &list[p];
         const DiscRun *run = &need[f->run];
-        ok = rombie_engine_disc_fetched(fetches[p % FILL_AHEAD_MAX], buf,
-                                        f->length);
-        fetches[p % FILL_AHEAD_MAX] = NULL;
-        if (ok && asked < pieces) {
-            const FillPiece *a = &list[asked];
-            fetches[asked % FILL_AHEAD_MAX] = rombie_engine_disc_fetch(
+        ok = rombie_engine_disc_fetched(fetch, buf, f->length);
+        fetch = NULL;
+        if (ok && p + 1 < pieces) {
+            const FillPiece *a = &list[p + 1];
+            fetch = rombie_engine_disc_fetch(
                 need[a->run].sector * DISC_SECTOR + a->at, a->length);
-            ok = fetches[asked++ % FILL_AHEAD_MAX] != NULL;
+            ok = fetch != NULL;
         }
         ok = ok && blk_pwrite(hdd, run->disk + f->at, f->length, buf, 0) >= 0;
         got = check_sectors(got, buf, f->length);
@@ -737,10 +724,8 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
             got = HASH_P1;
         }
     }
-    for (uint32_t i = 0; i < FILL_AHEAD_MAX; i++) {
-        if (fetches[i]) {
-            rombie_engine_disc_fetch_drop(fetches[i]);
-        }
+    if (fetch) {
+        rombie_engine_disc_fetch_drop(fetch);
     }
     if (!ok && !*error) {
         *error = g_strdup("Reading the disc for the game's hard disk failed.");
