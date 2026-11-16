@@ -32,6 +32,23 @@ bool rombie_media_hdd_written(void);
  *     file taken with the disk's I/O drained while the game runs on. */
 bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error);
 
+/* The same blob, made while the game runs: a copy-before-write filter over
+ * the disk keeps it as it stood when this was called (the game's I/O drained
+ * only to put the filter in; format 1 copies the image file with it drained),
+ * then a coroutine in the main loop and a worker thread make the blob from
+ * that. `done` gets it on that worker thread (the data, g_free() it) or an
+ * error (g_free() it), or on the main loop if the copy failed. False, and
+ * *error, if it couldn't start. One at a time: the scratch files are fixed. */
+typedef void (*RombieBlobDone)(uint8_t *data, size_t size, char *error,
+                               void *opaque);
+bool rombie_media_read_blob_async(RombieBlobDone done, void *opaque,
+                                  char **error);
+
+/* Holds until a running save's images are closed (its packing may go on):
+ * before a save state, a load, a delete or the handoff, which take every
+ * writable disk. */
+void rombie_media_settle_blob(void);
+
 /* Before the machine runs: a format 2 blob's runs read from the disc into
  * the disk, checked. */
 bool rombie_media_fill_save_runs(const uint8_t *runs, uint32_t count,

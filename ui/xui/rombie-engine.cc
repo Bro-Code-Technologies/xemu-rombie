@@ -5,8 +5,10 @@
  * Message layout matches the PS2 engine's (pcsx2-rombie Session.h) except
  * boot, which carries the Xbox's two firmware files. Every multi-byte value
  * is little-endian. Page to engine (binary, first byte is the type):
- *   0x01 boot      [u8 type][3 pad][u32 mcpx size][u32 flash size]
- *                  [u64 disc size][mcpx bytes][flash bytes][disc name, UTF-8]
+ *   0x01 boot      [u8 type][u8 flags][2 pad][u32 mcpx size]
+ *                  [u32 flash size][u64 disc size][mcpx bytes][flash bytes]
+ *                  [disc name, UTF-8]     (flags: 1 game data in parts, 0x8A,
+ *                  not 0x85)
  *   0x02 disc data [u8 type][3 pad][u32 request id][bytes] (empty = failed)
  *   0x03 pad       [u8 type][u8 player][2 pad][u32 buttons][f32 lx][f32 ly]
  *                  [f32 rx][f32 ry][f32 lt][f32 rt]        (player 0-3)
@@ -90,6 +92,10 @@
  *   0x89 link frame [u8 type][3 pad][Ethernet frame] (System Link: what the
  *                  network card sent, with the cable in; the page is the
  *                  switch that takes it to the other consoles)
+ *   0x8A game data part [u8 type][7 pad][u64 blob size][u64 offset][bytes]
+ *                  (0x85's blob, in order, for a page whose boot asked: a
+ *                  whole disk in one message holds the frames and the sound
+ *                  behind it for a second or so)
  * Engine to page (text, JSON): hello, event, stats (once a second: with
  * flips, the game's own frames, lw, the ms lockstep waited for input, and
  * link, System Link's frames and bytes from the page and to it),
@@ -210,6 +216,13 @@ static constexpr uint8_t MSG_HASHES = 0x86;
 static constexpr uint8_t MSG_VBLANK = 0x87;
 static constexpr uint8_t MSG_NETPLAY_STATE = 0x88;
 static constexpr uint8_t MSG_LINK_FRAME_OUT = 0x89;
+static constexpr uint8_t MSG_GAME_DATA_PART = 0x8A;
+static constexpr uint8_t BOOT_GAME_DATA_PARTS = 1;
+/* 1 MB every 8 ms or so, about 125 MB/s: a frame never waits long behind a
+ * part, and the frames' 75 MB/s and the parts together stay well inside what
+ * the socket carries (about 370 MB/s on the main PC). */
+static constexpr size_t GAME_DATA_PART_BYTES = 1 << 20;
+static constexpr int GAME_DATA_PART_GAP_MS = 5;
 
 static constexpr uint8_t NETPLAY_HOST = 1;
 static constexpr uint8_t NETPLAY_JOIN = 2;
@@ -309,6 +322,7 @@ static std::vector<uint8_t> s_mcpx;
 static std::vector<uint8_t> s_flash;
 static std::vector<uint8_t> s_game_data; /* the stored blob; empty = new */
 static bool s_game_data_ok = true;
+static std::atomic<bool> s_game_data_parts{false}; /* 0x8A, as the boot asked */
 
 static bool s_hdd_dirty; /* UI thread: written since last sent */
 static double s_hdd_written_ms;
@@ -316,6 +330,8 @@ static double s_hdd_written_ms;
  * slots and the current image. */
 static std::atomic<bool> s_resend_media{false};
 static void SendGameData(void);
+static void StartSave(void);
+static void AfterSave(std::function<void()> work);
 static void SendGameDataNow(void);
 [[noreturn]] static void RestartSelf(void);
 static uint64_t s_disc_size;
@@ -1036,6 +1052,7 @@ static void HandleBoot(const std::vector<uint8_t> &data)
     s_flash.assign(data.begin() + 20 + mcpx_size,
                    data.begin() + 20 + mcpx_size + flash_size);
     s_disc_size = disc_size;
+    s_game_data_parts.store(data[1] & BOOT_GAME_DATA_PARTS);
     s_disc_name.assign((const char *)data.data() + 20 + mcpx_size + flash_size,
                        data.size() - 20 - mcpx_size - flash_size);
     s_boot_ready = true;
@@ -1336,11 +1353,14 @@ static void HandleControl(const std::vector<uint8_t> &data)
     });
     if (op == CONTROL_EXIT) {
         QueueAtVblank([]() {
-            /* Netplay's held game data goes now too. */
+            /* Netplay's held game data goes now too, and the engine ends
+             * once the page has it. */
             if (s_booted.load() && !(s_lockstep_flags & LOCKSTEP_SPEED_TEST)) {
-                SendGameDataNow();
+                StartSave();
             }
-            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+            AfterSave([]() {
+                qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+            });
         });
     }
 }
@@ -1453,23 +1473,169 @@ static void HandleGameData(const std::vector<uint8_t> &data)
     s_game_data_ok = s_game_data.empty() || ParseGameData(s_game_data, &view);
 }
 
-/* UI thread: hands the page the game's blob as it is now. */
+/*
+ * Game data saves (Rombie BRAIN-38 Phase 10.3). The blob is made while the
+ * game runs (rombie_media_read_blob_async) and sent from the save's worker
+ * thread, one save at a time; one asked for while another runs follows it,
+ * so the page ends with the newest. UI thread, but for s_save_mutex's.
+ */
+static bool s_saving;
+static bool s_save_again;
+static std::vector<std::function<void()>> s_after_save;
+/* Held around every send of game data, each part of it. A save's blob is
+ * dropped, or the rest of it, once something moved the generation on after
+ * it began: the handoff's blob, made and sent at once, or a state change the
+ * page then waits for the data of. A new blob's first part tells the page to
+ * drop the parts it has. */
+static std::mutex s_save_mutex;
+static uint64_t s_save_generation; /* s_save_mutex */
+
+static bool SendGameDataPart(const uint8_t *blob, size_t size, size_t at)
+{
+    uint8_t header[24] = { MSG_GAME_DATA_PART };
+    const uint64_t total = size, offset = at;
+    memcpy(header + 8, &total, 8);
+    memcpy(header + 16, &offset, 8);
+    return SendMessageParts(0x2, header, sizeof(header), blob + at,
+                            std::min(GAME_DATA_PART_BYTES, size - at));
+}
+
+/* s_save_mutex held: the blob at once (a stopped machine's, the handoff's,
+ * which sends no frames). */
+static void SendGameDataBlob(const uint8_t *blob, size_t size)
+{
+    if (!s_game_data_parts.load()) {
+        uint8_t header[8] = { MSG_GAME_DATA_SAVED };
+        SendMessageParts(0x2, header, sizeof(header), blob, size);
+        return;
+    }
+    for (size_t at = 0; at < size; at += GAME_DATA_PART_BYTES) {
+        if (!SendGameDataPart(blob, size, at)) {
+            return;
+        }
+    }
+}
+
+/* A save's blob, from its worker thread, unless the generation moves on from
+ * `generation` before it's all gone; the parts leave room for the frames and
+ * the sound between them. */
+static void SendSavedGameData(const uint8_t *blob, size_t size,
+                              uint64_t generation)
+{
+    if (!s_game_data_parts.load()) {
+        std::unique_lock<std::mutex> lock(s_save_mutex);
+        if (generation == s_save_generation) {
+            SendGameDataBlob(blob, size);
+            return;
+        }
+    } else {
+        for (size_t at = 0; at < size; at += GAME_DATA_PART_BYTES) {
+            {
+                std::unique_lock<std::mutex> lock(s_save_mutex);
+                if (generation != s_save_generation ||
+                    !SendGameDataPart(blob, size, at)) {
+                    break;
+                }
+                if (at + GAME_DATA_PART_BYTES >= size) {
+                    return;
+                }
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(GAME_DATA_PART_GAP_MS));
+        }
+    }
+    fprintf(stderr, "rombie-engine: game data overtaken or undelivered\n");
+}
+
+static void FinishSave(void)
+{
+    s_saving = false;
+    if (s_save_again) {
+        s_save_again = false;
+        StartSave();
+        return;
+    }
+    std::vector<std::function<void()>> after;
+    after.swap(s_after_save);
+    for (auto &work : after) {
+        work();
+    }
+}
+
+/* The save's worker thread, or the main loop if its copy failed. */
+static void SaveDone(uint8_t *blob, size_t size, char *error, void *opaque)
+{
+    const uint64_t generation = (uint64_t)(uintptr_t)opaque;
+    if (blob) {
+        SendSavedGameData(blob, size, generation);
+    } else {
+        std::unique_lock<std::mutex> lock(s_save_mutex);
+        if (generation == s_save_generation) {
+            SendEvent("error",
+                      error ? error : "Reading the game's data failed.");
+        }
+    }
+    g_free(blob);
+    g_free(error);
+    QueueWork(FinishSave);
+}
+
+static void StartSave(void)
+{
+    s_hdd_dirty = false;
+    if (s_saving) {
+        s_save_again = true;
+        return;
+    }
+    uint64_t generation;
+    {
+        std::unique_lock<std::mutex> lock(s_save_mutex);
+        generation = s_save_generation;
+    }
+    s_saving = true;
+    char *error = nullptr;
+    const uint64_t held_from = rombie_prof_now();
+    const bool started = rombie_media_read_blob_async(
+        SaveDone, (void *)(uintptr_t)generation, &error);
+    rombie_prof_add(ROMBIE_PROF_HELD_NS, rombie_prof_now() - held_from);
+    if (!started) {
+        SendEvent("error", error ? error : "Reading the game's data failed.");
+        g_free(error);
+        FinishSave();
+    }
+}
+
+/* Runs `work` once no save is running or waiting. */
+static void AfterSave(std::function<void()> work)
+{
+    if (!s_saving) {
+        work();
+        return;
+    }
+    s_after_save.push_back(std::move(work));
+}
+
+/* UI thread: the game's blob as it is now, made and sent at once, ahead of
+ * any save still being made: netplay's handoff, which the page must have
+ * before the handoff's state. */
 static void SendGameDataNow(void)
 {
     s_hdd_dirty = false;
+    rombie_media_settle_blob();
     uint8_t *blob = nullptr;
     size_t size = 0;
     char *error = nullptr;
     const uint64_t held_from = rombie_prof_now();
     const bool read = rombie_media_read_blob(&blob, &size, &error);
     rombie_prof_add(ROMBIE_PROF_HELD_NS, rombie_prof_now() - held_from);
+    std::unique_lock<std::mutex> lock(s_save_mutex);
+    s_save_generation++;
     if (!read) {
         SendEvent("error", error ? error : "Reading the game's data failed.");
         g_free(error);
         return;
     }
-    uint8_t header[8] = { MSG_GAME_DATA_SAVED };
-    SendMessageParts(0x2, header, sizeof(header), blob, size);
+    SendGameDataBlob(blob, size);
     g_free(blob);
 }
 
@@ -1522,7 +1688,7 @@ static void SendGameData(void)
         s_hdd_dirty = true;
         return;
     }
-    SendGameDataNow();
+    StartSave();
 }
 
 /* Netplay (0x0D). */
@@ -1605,6 +1771,7 @@ static void HandleNetplay(const std::vector<uint8_t> &data)
         size_t state_size = 0, game_data_size = 0;
         char *error = nullptr;
         const double from = NowMs();
+        rombie_media_settle_blob();
         if (!rombie_media_handoff(s_data_dir.c_str(), &state, &state_size,
                                   &game_data, &game_data_size, &error)) {
             SendEvent("netplay-failed", error ? error : "?");
@@ -1764,6 +1931,7 @@ static void HandleState(const std::vector<uint8_t> &data)
         bool ok;
         const char *done;
         const uint64_t held_from = rombie_prof_now();
+        rombie_media_settle_blob();
         if (op == MSG_SAVE_STATE) {
             ok = rombie_media_save_state(slot, ROMBIE_XBOX_ENGINE_VERSION,
                                          &error);
@@ -1779,6 +1947,10 @@ static void HandleState(const std::vector<uint8_t> &data)
         rombie_prof_add(ROMBIE_PROF_HELD_NS, rombie_prof_now() - held_from);
 
         if (ok) {
+            /* A save begun before the change mustn't be the data the page
+             * takes for it. */
+            std::unique_lock<std::mutex> lock(s_save_mutex);
+            s_save_generation++;
             SendEvent(done, std::to_string(slot));
         } else if (error && g_str_has_prefix(error, "version:")) {
             /* Made on another engine version: QEMU can't load it. */
@@ -1794,7 +1966,7 @@ static void HandleState(const std::vector<uint8_t> &data)
             /* The image changed: a save or delete rewrote its snapshots, a
              * load put its disk back to the state's. The page waits for it,
              * in netplay too (the state already held the game). */
-            SendGameDataNow();
+            StartSave();
         }
     };
     if (op == MSG_DELETE_STATE) {
@@ -2642,7 +2814,10 @@ void rombie_engine_run_pending(void)
         IdleOverrunS() > 0.0) {
         fprintf(stderr, "rombie-engine: page gone; shutting down\n");
         MarkIdle(STARTUP_WAIT_S); /* don't request again each frame */
-        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        /* QEMU's cleanup asserts on a save's filter still in the graph. */
+        AfterSave([]() {
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        });
     }
 }
 

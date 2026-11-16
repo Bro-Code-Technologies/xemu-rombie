@@ -271,6 +271,34 @@ held, as xemu's own snapshot actions do.
   52.4 MB with one state. Deleting a state frees its space inside the file
   but does not shrink the file.
 
+### Saves while the game runs (Rombie BRAIN-38, Phase 10.3)
+
+The blob was built in `rombie_engine_run_pending`, with xemu's main loop
+locked, so nothing in the machine ran until it was done: 7-10 s for Halo 2
+on the main PC, 13-16 s on the laptop, at each save.
+
+- `rombie_media_read_blob_async` makes a format 2 blob from a point-in-time
+  view of the disk, as QEMU's fleecing does: `bdrv_cbw_append` puts a
+  copy-before-write filter over the disk's node (the game's I/O drained only
+  for that), with a scratch qcow2 (`save-bg-fleece.qcow2`) taking what the
+  game overwrites from then on, and a `snapshot-access` node over the filter
+  reads the disk as it stood. A coroutine in the main loop reads it into the
+  fresh image (contiguous kept grains in one write), the filter comes out, and
+  a worker thread packs the blob and sends it. Format 1 still copies the
+  image file with the disk drained: its save states are in the file.
+- Halo 2, the user's 692 MB disk: the game held 23-47 ms (0.37-0.43 s with a
+  drained file copy, 4.5-4.8 s before), and the build takes 1.6-2.3 s, up to
+  6.9 s while the game loads.
+- One save at a time; one asked for meanwhile follows it. Exit makes the last
+  save, then shuts down once it's sent. A state change and the handoff move a
+  generation on, so a blob begun before them is dropped; before them a save's
+  filter and images come out (`rombie_media_settle_blob`), since
+  `save_snapshot` and `load_snapshot` take every writable disk. The handoff
+  keeps the sync read, ahead of its 0x88.
+- A page whose boot sets byte 1's bit 0 gets the blob in 1 MB parts (0x8A,
+  about 125 MB/s): one 0x85 of 330 MB held the frames and the sound behind it
+  for a second.
+
 ## Lockstep (Rombie BRAIN-38, `.docs/plans/xbox-online.md` Phase 2)
 
 Two engines given the same game data, clock and input stay identical at

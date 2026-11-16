@@ -7,7 +7,9 @@
  * versions).
  *
  * Everything here runs on the UI thread with the BQL held
- * (rombie_engine_run_pending), as xemu's own snapshot actions do.
+ * (rombie_engine_run_pending), as xemu's own snapshot actions do, except a
+ * save's copy and packing (rombie_media_read_blob_async): a coroutine in the
+ * main loop and a worker thread.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,15 +22,19 @@
 #include "qapi/error.h"
 #include "qobject/qdict.h"
 #include "block/accounting.h"
+#include "block/aio.h"
 #include "block/block-global-state.h"
 #include "block/block-io.h"
+#include "block/copy-before-write.h"
 #include "block/graph-lock.h"
 #include "exec/cpu-common.h"
 #include "migration/global_state.h"
 #include "migration/snapshot.h"
 #include "qemu/bitmap.h"
 #include "qemu/bswap.h"
+#include "qemu/coroutine.h"
 #include "qemu/cutils.h"
+#include "qemu/main-loop.h"
 #include "qemu/memalign.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
@@ -120,35 +126,43 @@ static void put_runs(uint8_t *out, const GArray *runs)
     }
 }
 
-/* The blob from an image file and the EEPROM file: format 2 with `runs`,
- * format 1 without. */
-static bool pack_blob(const char *hdd_path, const GArray *runs, uint8_t **data,
-                      size_t *size, char **error)
+/* The blob from an image file and the EEPROM's bytes: format 2 with `runs`,
+ * format 1 without. The image is read straight into the blob, since a game's
+ * disk is hundreds of MB and a second copy of it is that much more memory.
+ * Touches no QEMU state, so a save's worker thread runs it. */
+static bool pack_blob_with(const char *hdd_path, const GArray *runs,
+                           const uint8_t *eeprom, size_t eeprom_size,
+                           uint8_t **data, size_t *size, char **error)
 {
-    gchar *hdd = NULL, *eeprom = NULL;
-    gsize hdd_size = 0, eeprom_size = 0;
-    GError *gerr = NULL;
-    const bool ok =
-        g_file_get_contents(hdd_path, &hdd, &hdd_size, &gerr) &&
-        g_file_get_contents(g_config.sys.files.eeprom_path, &eeprom,
-                            &eeprom_size, &gerr);
-    if (!ok) {
-        *error = g_strdup_printf("Reading the hard disk image failed: %s",
-                                 gerr ? gerr->message : "?");
-        g_clear_error(&gerr);
-        g_free(hdd);
-        g_free(eeprom);
+    FILE *in = g_fopen(hdd_path, "rb");
+    int64_t hdd_size = -1;
+    if (in && fseeko(in, 0, SEEK_END) == 0) {
+        hdd_size = ftello(in);
+    }
+    if (hdd_size < 0 || fseeko(in, 0, SEEK_SET) != 0) {
+        *error = g_strdup_printf("Reading the hard disk image %s failed.",
+                                 hdd_path);
+        if (in) {
+            fclose(in);
+        }
         return false;
     }
 
     const size_t header = runs ? BLOB_HEADER_RUNS : BLOB_HEADER;
     const size_t runs_size = runs ? (size_t)runs->len * RUN_BYTES : 0;
-    *size = header + eeprom_size + runs_size + hdd_size;
-    uint8_t *blob = g_malloc(*size);
+    *size = header + eeprom_size + runs_size + (size_t)hdd_size;
+    uint8_t *blob = g_try_malloc(*size);
+    if (!blob) {
+        fclose(in);
+        *error = g_strdup_printf("There isn't %.0f MB of memory free to send "
+                                 "the game's data.",
+                                 *size / 1048576.0);
+        return false;
+    }
     memcpy(blob, BLOB_MAGIC, 4);
     put_le32(blob + 4, runs ? BLOB_FORMAT_RUNS : BLOB_FORMAT);
     put_le32(blob + 8, (uint32_t)eeprom_size);
-    put_le64(blob + 12, hdd_size);
+    put_le64(blob + 12, (uint64_t)hdd_size);
     if (runs) {
         put_le32(blob + 20, runs->len);
         put_le32(blob + 24, 0);
@@ -157,11 +171,37 @@ static bool pack_blob(const char *hdd_path, const GArray *runs, uint8_t **data,
     if (runs) {
         put_runs(blob + header + eeprom_size, runs);
     }
-    memcpy(blob + header + eeprom_size + runs_size, hdd, hdd_size);
-    g_free(hdd);
-    g_free(eeprom);
+    const bool ok = fread(blob + header + eeprom_size + runs_size, 1,
+                          (size_t)hdd_size, in) == (size_t)hdd_size;
+    fclose(in);
+    if (!ok) {
+        g_free(blob);
+        *error = g_strdup_printf("Reading the hard disk image %s failed.",
+                                 hdd_path);
+        return false;
+    }
     *data = blob;
     return true;
+}
+
+/* As above, with the EEPROM as its file stands now. */
+static bool pack_blob(const char *hdd_path, const GArray *runs, uint8_t **data,
+                      size_t *size, char **error)
+{
+    gchar *eeprom = NULL;
+    gsize eeprom_size = 0;
+    GError *gerr = NULL;
+    if (!g_file_get_contents(g_config.sys.files.eeprom_path, &eeprom,
+                             &eeprom_size, &gerr)) {
+        *error = g_strdup_printf("Reading the EEPROM failed: %s",
+                                 gerr ? gerr->message : "?");
+        g_clear_error(&gerr);
+        return false;
+    }
+    const bool ok = pack_blob_with(hdd_path, runs, (const uint8_t *)eeprom,
+                                   eeprom_size, data, size, error);
+    g_free(eeprom);
+    return ok;
 }
 
 /* Neither BIOS goes in a handoff's state: each PC has its own (the flash,
@@ -553,32 +593,43 @@ bool rombie_media_fill_save_runs(const uint8_t *runs, uint32_t count,
     return fill_from_disc(runs, count, true, error);
 }
 
-/* A hard disk as the guest sees it (`src`: the machine's, stopped, or a copy
- * of its file), into a new image with no snapshots: only the clusters that
- * hold data (the player's save states stay out), and of those only what isn't
- * the disc's (`runs` names that). */
-static bool copy_disk(BlockBackend *src, const char *path,
-                      const DiscIndex *index, GArray *runs,
-                      uint64_t *data_bytes, uint64_t *disc_bytes, Error **errp)
+static int coroutine_fn disk_block_status_co(BlockDriverState *bs,
+                                             int64_t offset, int64_t bytes,
+                                             int64_t *count)
 {
-    if (!src) {
-        error_setg(errp, "The game has no hard disk.");
-        return false;
+    GRAPH_RDLOCK_GUARD();
+    return bdrv_co_block_status_above(bs, NULL, offset, bytes, count, NULL,
+                                      NULL);
+}
+
+/* The disk's layout from `offset`: in a save's coroutine (rombie_media_read_
+ * blob_async) or on the main thread (the handoff). */
+static int disk_block_status(BlockDriverState *bs, int64_t offset,
+                             int64_t bytes, int64_t *count)
+{
+    if (qemu_in_coroutine()) {
+        return disk_block_status_co(bs, offset, bytes, count);
     }
+    GRAPH_RDLOCK_GUARD_MAINLOOP();
+    return bdrv_block_status_above(bs, NULL, offset, bytes, count, NULL, NULL);
+}
+
+/* A hard disk as the guest sees it (`src`: the machine's, stopped, or a copy
+ * of its file), into `dst`, a new image with no snapshots: only the clusters
+ * that hold data (the player's save states stay out), and of those only what
+ * isn't the disc's (`runs` names that). Each stretch between zeros and disc
+ * blocks goes in one write: one write per 4 KB block was most of a save's
+ * time (Halo 2's 600 MB, Rombie BRAIN-38 Phase 10.3). In a coroutine the
+ * reads and writes yield, so the main loop runs on between them. */
+static bool copy_disk_into(BlockBackend *src, BlockBackend *dst,
+                           const DiscIndex *index, GArray *runs,
+                           uint64_t *data_bytes, uint64_t *disc_bytes,
+                           Error **errp)
+{
     BlockDriverState *bs = blk_bs(src);
     const int64_t size = blk_getlength(src);
     if (size < 0) {
         error_setg_errno(errp, (int)-size, "The hard disk's size is unknown");
-        return false;
-    }
-    bdrv_img_create(path, "qcow2", NULL, NULL, NULL, size, 0, true, errp);
-    if (*errp) {
-        return false;
-    }
-    QDict *options = qdict_new();
-    qdict_put_str(options, "driver", "qcow2");
-    BlockBackend *dst = blk_new_open(path, NULL, options, BDRV_O_RDWR, errp);
-    if (!dst) {
         return false;
     }
 
@@ -588,12 +639,7 @@ static bool copy_disk(BlockBackend *src, const char *path,
     bool ok = true;
     for (int64_t offset = 0; ok && offset < size;) {
         int64_t count = 0;
-        int ret;
-        {
-            GRAPH_RDLOCK_GUARD_MAINLOOP();
-            ret = bdrv_block_status_above(bs, NULL, offset, size - offset,
-                                          &count, NULL, NULL);
-        }
+        const int ret = disk_block_status(bs, offset, size - offset, &count);
         if (ret < 0 || count <= 0) {
             error_setg_errno(errp, ret < 0 ? -ret : EIO,
                              "Reading the hard disk's layout failed");
@@ -604,20 +650,36 @@ static bool copy_disk(BlockBackend *src, const char *path,
             for (int64_t at = offset; ok && at < offset + count; at += chunk) {
                 const int64_t n = MIN(chunk, offset + count - at);
                 ok = blk_pread(src, at, n, buf, 0) >= 0;
+                /* What's waiting to be written: buf from `from`, `pending`
+                 * bytes. */
+                int64_t from = 0, pending = 0;
                 /* A game's zero-filled files read the same unwritten. */
                 for (int64_t part = 0; ok && part < n; part += ZERO_GRAIN) {
                     const int64_t m = MIN(ZERO_GRAIN, n - part);
-                    if (buffer_is_zero(buf + part, m)) {
+                    bool keep = false;
+                    if (!buffer_is_zero(buf + part, m)) {
+                        *data_bytes += m;
+                        if (m == 2 * DISC_SECTOR &&
+                            add_disc_run(index, runs, at + part, buf + part,
+                                         &hint)) {
+                            *disc_bytes += m;
+                        } else {
+                            keep = true;
+                        }
+                    }
+                    if (keep && pending && from + pending == part) {
+                        pending += m;
                         continue;
                     }
-                    *data_bytes += m;
-                    if (m == 2 * DISC_SECTOR &&
-                        add_disc_run(index, runs, at + part, buf + part,
-                                     &hint)) {
-                        *disc_bytes += m;
-                    } else {
-                        ok = blk_pwrite(dst, at + part, m, buf + part, 0) >= 0;
+                    if (pending) {
+                        ok = blk_pwrite(dst, at + from, pending, buf + from,
+                                        0) >= 0;
                     }
+                    from = part;
+                    pending = keep ? m : 0;
+                }
+                if (ok && pending) {
+                    ok = blk_pwrite(dst, at + from, pending, buf + from, 0) >= 0;
                 }
             }
             if (!ok) {
@@ -631,6 +693,42 @@ static bool copy_disk(BlockBackend *src, const char *path,
         ok = false;
     }
     qemu_vfree(buf);
+    return ok;
+}
+
+/* A new image at `path` the size of `size`, open for writing. */
+static BlockBackend *new_disk_image(const char *path, int64_t size,
+                                    Error **errp)
+{
+    bdrv_img_create(path, "qcow2", NULL, NULL, NULL, size, 0, true, errp);
+    if (*errp) {
+        return NULL;
+    }
+    QDict *options = qdict_new();
+    qdict_put_str(options, "driver", "qcow2");
+    return blk_new_open(path, NULL, options, BDRV_O_RDWR, errp);
+}
+
+/* copy_disk_into, into a new image at `path`. Main thread. */
+static bool copy_disk(BlockBackend *src, const char *path,
+                      const DiscIndex *index, GArray *runs,
+                      uint64_t *data_bytes, uint64_t *disc_bytes, Error **errp)
+{
+    if (!src) {
+        error_setg(errp, "The game has no hard disk.");
+        return false;
+    }
+    const int64_t size = blk_getlength(src);
+    if (size < 0) {
+        error_setg_errno(errp, (int)-size, "The hard disk's size is unknown");
+        return false;
+    }
+    BlockBackend *dst = new_disk_image(path, size, errp);
+    if (!dst) {
+        return false;
+    }
+    const bool ok = copy_disk_into(src, dst, index, runs, data_bytes,
+                                   disc_bytes, errp);
     blk_unref(dst);
     return ok;
 }
@@ -763,6 +861,263 @@ bool rombie_media_read_blob(uint8_t **data, size_t *size, char **error)
         pack_blob(g_config.sys.files.hdd_path, NULL, data, size, error);
     bdrv_drain_all_end();
     return ok;
+}
+
+/*
+ * A save while the game runs (Rombie BRAIN-38 Phase 10.3). Building the blob
+ * on the UI thread, with xemu's main loop locked, held the whole machine for
+ * it: 7-10 s for Halo 2 on the main PC, 13-16 s on the laptop, and a copy of
+ * the image file with the disk drained still held it 0.4 s. The disk is read
+ * as it stood at one moment instead, as QEMU's fleecing does: a
+ * copy-before-write filter goes in over it (the game's I/O drained only for
+ * that), puts what the game overwrites from then on into a scratch image
+ * first, and a snapshot-access node reads the disk of that moment. A
+ * coroutine in the main loop reads it into the fresh image, its reads and
+ * writes yielding to the machine's own work, and a worker thread packs the
+ * blob and hands it over. Format 1 still copies the file: its save states
+ * are in the file, not the disk.
+ */
+typedef struct {
+    RombieBlobDone done;
+    void *opaque;
+    char *copy_path;
+    char *fleece_path;
+    char *disk_path;
+    uint8_t *eeprom;
+    size_t eeprom_size;
+    bool format1;
+    BlockDriverState *fleece;
+    BlockDriverState *cbw;
+    BlockBackend *src; /* the disk as it stood */
+    BlockBackend *dst;
+    DiscIndex index;
+    GArray *runs;
+    uint64_t disk_bytes;
+    uint64_t disc_bytes;
+    bool ok;
+    Error *err;
+    int64_t from;
+    int64_t held_ms;
+    QemuThread thread;
+} BlobJob;
+
+static void blob_job_free(BlobJob *job)
+{
+    if (job->runs) {
+        g_array_free(job->runs, true);
+    }
+    g_free(job->copy_path);
+    g_free(job->fleece_path);
+    g_free(job->disk_path);
+    g_free(job->eeprom);
+    error_free(job->err);
+    g_free(job);
+}
+
+/* Worker thread: the blob from the finished image, to `done`. */
+static void *blob_job_thread(void *opaque)
+{
+    BlobJob *job = opaque;
+    uint8_t *data = NULL;
+    size_t size = 0;
+    char *error = NULL;
+    const char *image = job->format1 ? job->copy_path : job->disk_path;
+    const bool ok = pack_blob_with(image, job->format1 ? NULL : job->runs,
+                                   job->eeprom, job->eeprom_size, &data, &size,
+                                   &error);
+    g_remove(image);
+    if (ok && !job->format1) {
+        fprintf(stderr,
+                "rombie-engine: game data: %.1f MB of disk, %.1f MB of it "
+                "the disc's (%u runs), %zu bytes, in %" PRId64
+                " ms (the game held %" PRId64 " ms)\n",
+                job->disk_bytes / 1048576.0, job->disc_bytes / 1048576.0,
+                job->runs->len, size,
+                qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - job->from,
+                job->held_ms);
+    } else if (ok) {
+        fprintf(stderr,
+                "rombie-engine: game data with save states: %zu bytes, in "
+                "%" PRId64 " ms (the game held %" PRId64 " ms)\n",
+                size, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - job->from,
+                job->held_ms);
+    }
+    job->done(ok ? data : NULL, ok ? size : 0, ok ? NULL : error, job->opaque);
+    blob_job_free(job);
+    return NULL;
+}
+
+/* The save whose images are open, if any: save_snapshot and load_snapshot
+ * take every writable disk, its fresh image too. */
+static BlobJob *copying;
+
+/* Main loop: the filter comes out and the scratch image goes. */
+static void close_disk_view(BlobJob *job)
+{
+    if (job->src) {
+        blk_unref(job->src);
+        job->src = NULL;
+    }
+    if (job->cbw) {
+        bdrv_cbw_drop(job->cbw);
+        job->cbw = NULL;
+    }
+    if (job->fleece) {
+        bdrv_unref(job->fleece);
+        job->fleece = NULL;
+    }
+    g_remove(job->fleece_path);
+}
+
+/* The disk as it stands now, in job->src, until close_disk_view. */
+static bool open_disk_view(BlobJob *job, BlockBackend *hdd, int64_t size,
+                           Error **errp)
+{
+    bdrv_img_create(job->fleece_path, "qcow2", NULL, NULL, NULL, size, 0,
+                    true, errp);
+    if (*errp) {
+        return false;
+    }
+    QDict *options = qdict_new();
+    qdict_put_str(options, "driver", "qcow2");
+    job->fleece = bdrv_open(job->fleece_path, NULL, options, BDRV_O_RDWR,
+                            errp);
+    if (!job->fleece) {
+        return false;
+    }
+    BlockDriverState *disk;
+    {
+        GRAPH_RDLOCK_GUARD_MAINLOOP();
+        disk = blk_bs(hdd);
+    }
+    BlockCopyState *bcs;
+    /* A failed copy before a write fails the save, not the game's write. */
+    job->cbw = bdrv_cbw_append(disk, job->fleece, NULL, false, 0, &bcs,
+                               ON_CBW_ERROR_BREAK_SNAPSHOT, errp);
+    if (!job->cbw) {
+        return false;
+    }
+    options = qdict_new();
+    qdict_put_str(options, "driver", "snapshot-access");
+    qdict_put_str(options, "file", bdrv_get_node_name(job->cbw));
+    job->src = blk_new_open(NULL, NULL, options, 0, errp);
+    return job->src != NULL;
+}
+
+/* Main loop, the copy done: its images close, and the worker packs. */
+static void blob_job_copied(void *opaque)
+{
+    BlobJob *job = opaque;
+    copying = NULL;
+    close_disk_view(job);
+    blk_unref(job->dst);
+    job->dst = NULL;
+    disc_index_close(&job->index);
+    if (!job->ok) {
+        char *error = NULL;
+        set_error(&error, job->err, "Copying the hard disk failed.");
+        job->err = NULL;
+        g_remove(job->disk_path);
+        job->done(NULL, 0, error, job->opaque);
+        blob_job_free(job);
+        return;
+    }
+    qemu_thread_create(&job->thread, "rombie-save", blob_job_thread, job,
+                       QEMU_THREAD_DETACHED);
+}
+
+static void coroutine_fn blob_job_co(void *opaque)
+{
+    BlobJob *job = opaque;
+    job->ok = copy_disk_into(job->src, job->dst, &job->index, job->runs,
+                             &job->disk_bytes, &job->disc_bytes, &job->err);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), blob_job_copied, job);
+}
+
+bool rombie_media_read_blob_async(RombieBlobDone done, void *opaque,
+                                  char **error)
+{
+    g_autofree char *dir = g_path_get_dirname(g_config.sys.files.hdd_path);
+    Error *err = NULL;
+    QEMUSnapshotInfo *info = NULL; /* xemu's own list */
+    const int states = xemu_snapshots_list(&info, NULL, &err);
+    const bool format1 = err || states != 0;
+    error_free(err);
+    err = NULL;
+
+    BlobJob *job = g_new0(BlobJob, 1);
+    job->done = done;
+    job->opaque = opaque;
+    job->format1 = format1;
+    job->from = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    /* Not read_compact_blob's: the handoff's save can come while this runs. */
+    job->copy_path = g_build_filename(dir, "save-bg-in-hdd.qcow2", NULL);
+    job->fleece_path = g_build_filename(dir, "save-bg-fleece.qcow2", NULL);
+    job->disk_path = g_build_filename(dir, "save-bg-out-hdd.qcow2", NULL);
+
+    /* The disk and the EEPROM as they stand at one moment. */
+    GError *gerr = NULL;
+    gsize eeprom_size = 0;
+    if (!g_file_get_contents(g_config.sys.files.eeprom_path,
+                             (gchar **)&job->eeprom, &eeprom_size, &gerr)) {
+        *error = g_strdup_printf("Reading the EEPROM failed: %s",
+                                 gerr ? gerr->message : "?");
+        g_clear_error(&gerr);
+        blob_job_free(job);
+        return false;
+    }
+    job->eeprom_size = eeprom_size;
+
+    /* A state holds the caches as they were, and an image can't be copied
+     * with its snapshots: the file goes as it is (format 1), copied with
+     * nothing in flight and every cache on disk. */
+    if (job->format1) {
+        bdrv_drain_all_begin();
+        bdrv_flush_all();
+        const bool ok = copy_file(g_config.sys.files.hdd_path,
+                                  job->copy_path, error);
+        bdrv_drain_all_end();
+        job->held_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - job->from;
+        if (!ok) {
+            blob_job_free(job);
+            return false;
+        }
+        qemu_thread_create(&job->thread, "rombie-save", blob_job_thread, job,
+                           QEMU_THREAD_DETACHED);
+        return true;
+    }
+
+    BlockBackend *hdd = blk_by_name(HDD_DEVICE);
+    const int64_t size = hdd ? blk_getlength(hdd) : -ENOMEDIUM;
+    if (size < 0) {
+        *error = g_strdup("The game has no hard disk.");
+        blob_job_free(job);
+        return false;
+    }
+    if (open_disk_view(job, hdd, size, &err)) {
+        job->dst = new_disk_image(job->disk_path, size, &err);
+    }
+    job->held_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - job->from;
+    if (!job->dst) {
+        set_error(error, err, "Opening the hard disk's view failed.");
+        close_disk_view(job);
+        g_remove(job->disk_path);
+        blob_job_free(job);
+        return false;
+    }
+    disc_index_open(dir, &job->index);
+    job->runs = g_array_new(false, false, sizeof(DiscRun));
+    copying = job;
+    aio_co_schedule(qemu_get_aio_context(),
+                    qemu_coroutine_create(blob_job_co, job));
+    return true;
+}
+
+void rombie_media_settle_blob(void)
+{
+    while (copying) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
 }
 
 bool rombie_media_handoff(const char *dir, uint8_t **state, size_t *state_size,
