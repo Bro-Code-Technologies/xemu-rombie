@@ -605,6 +605,20 @@ static bool add_disc_run(const DiscIndex *index, GArray *runs, uint64_t disk,
     return true;
 }
 
+#define FILL_AHEAD_MAX 8
+
+typedef struct {
+    uint32_t run; /* in the runs the disk doesn't hold */
+    uint32_t length;
+    uint64_t at; /* into the run */
+} FillPiece;
+
+static int run_by_sector(const void *a, const void *b)
+{
+    const DiscRun *x = a, *y = b;
+    return x->sector < y->sector ? -1 : x->sector > y->sector;
+}
+
 /* Before the machine runs (a save's runs) or the state loads (netplay's, on
  * every PC): each run's disk comes from this PC's own disc, unless the disk
  * already holds it (the host's own). */
@@ -622,6 +636,8 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
     }
     const uint64_t disc_sectors = rombie_engine_disc_size() / DISC_SECTOR;
     uint8_t *buf = qemu_blockalign(blk_bs(hdd), DISC_PIECE);
+    g_autofree DiscRun *need = g_new(DiscRun, count);
+    uint32_t needed = 0;
     uint64_t filled = 0, kept = 0;
     const int64_t from = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     bool ok = true;
@@ -647,27 +663,87 @@ static bool fill_from_disc(const uint8_t *runs, uint32_t count, bool save,
             ok = blk_pread(hdd, disk + at, n, buf, 0) >= 0;
             have = check_sectors(have, buf, n);
         }
-        if (ok && have == check) {
+        if (!ok) {
+            *error = g_strdup("Reading the game's hard disk failed.");
+        } else if (have == check) {
             kept += bytes;
-            continue;
+        } else {
+            need[needed++] = (DiscRun){ disk, sector, sectors, check };
         }
-        uint64_t got = HASH_P1;
-        for (uint64_t at = 0; ok && at < bytes; at += DISC_PIECE) {
-            const uint64_t n = MIN(DISC_PIECE, bytes - at);
-            ok = read_disc(sector * DISC_SECTOR + at, (uint32_t)n, buf) &&
-                 blk_pwrite(hdd, disk + at, n, buf, 0) >= 0;
-            got = check_sectors(got, buf, n);
+    }
+    /* In the disc's order, one read at a time, the next asked for while this
+     * one is written (its answer waits in its own buffer): a hard disk reads
+     * that at full speed, and seeks to and fro between reads asked for
+     * together (a 5400 rpm laptop disk gave 22 MB/s to ten 1 MB chunks at
+     * once, 127 MB/s to one read at a time). */
+    qsort(need, needed, sizeof(DiscRun), run_by_sector);
+    /* FIXME(Phase 10.6): tuning knobs, removed once both PCs are measured. */
+    const char *piece_env = g_getenv("ROMBIE_FILL_PIECE_MB");
+    const char *ahead_env = g_getenv("ROMBIE_FILL_AHEAD");
+    const uint64_t piece =
+        (uint64_t)MAX(1, MIN(64, piece_env ? atoi(piece_env) : 8)) << 20;
+    const uint32_t ahead = MAX(1, MIN(FILL_AHEAD_MAX,
+                                      ahead_env ? atoi(ahead_env) : 1));
+    uint32_t pieces = 0;
+    for (uint32_t i = 0; i < needed; i++) {
+        pieces += (uint32_t)DIV_ROUND_UP(need[i].sectors * DISC_SECTOR, piece);
+    }
+    g_autofree FillPiece *list = g_new(FillPiece, pieces ? pieces : 1);
+    for (uint32_t i = 0, p = 0; i < needed; i++) {
+        const uint64_t bytes = need[i].sectors * DISC_SECTOR;
+        for (uint64_t at = 0; at < bytes; at += piece) {
+            list[p++] = (FillPiece){ i, (uint32_t)MIN(piece, bytes - at), at };
         }
+    }
+    if (piece > DISC_PIECE) {
+        qemu_vfree(buf);
+        buf = qemu_blockalign(blk_bs(hdd), piece);
+    }
+    void *fetches[FILL_AHEAD_MAX] = { NULL };
+    uint32_t asked = 0;
+    while (ok && asked < pieces && asked < ahead) {
+        const FillPiece *f = &list[asked];
+        fetches[asked % FILL_AHEAD_MAX] = rombie_engine_disc_fetch(
+            need[f->run].sector * DISC_SECTOR + f->at, f->length);
+        ok = fetches[asked++ % FILL_AHEAD_MAX] != NULL;
+    }
+    uint64_t got = HASH_P1;
+    for (uint32_t p = 0; ok && p < pieces; p++) {
+        const FillPiece *f = &list[p];
+        const DiscRun *run = &need[f->run];
+        ok = rombie_engine_disc_fetched(fetches[p % FILL_AHEAD_MAX], buf,
+                                        f->length);
+        fetches[p % FILL_AHEAD_MAX] = NULL;
+        if (ok && asked < pieces) {
+            const FillPiece *a = &list[asked];
+            fetches[asked % FILL_AHEAD_MAX] = rombie_engine_disc_fetch(
+                need[a->run].sector * DISC_SECTOR + a->at, a->length);
+            ok = fetches[asked++ % FILL_AHEAD_MAX] != NULL;
+        }
+        ok = ok && blk_pwrite(hdd, run->disk + f->at, f->length, buf, 0) >= 0;
+        got = check_sectors(got, buf, f->length);
         if (!ok) {
             *error = g_strdup("Reading the disc for the game's hard disk "
                               "failed.");
-        } else if (got != check) {
-            *error = g_strdup(save ? "This disc isn't the one the game's data "
-                                     "was saved with."
-                                   : "This disc isn't the same as the host's.");
-            ok = false;
+        } else if (p + 1 == pieces || list[p + 1].run != f->run) {
+            if (got != run->check) {
+                *error = g_strdup(save ? "This disc isn't the one the game's "
+                                         "data was saved with."
+                                       : "This disc isn't the same as the "
+                                         "host's.");
+                ok = false;
+            }
+            filled += run->sectors * DISC_SECTOR;
+            got = HASH_P1;
         }
-        filled += bytes;
+    }
+    for (uint32_t i = 0; i < FILL_AHEAD_MAX; i++) {
+        if (fetches[i]) {
+            rombie_engine_disc_fetch_drop(fetches[i]);
+        }
+    }
+    if (!ok && !*error) {
+        *error = g_strdup("Reading the disc for the game's hard disk failed.");
     }
     qemu_vfree(buf);
     if (ok && blk_flush(hdd) < 0) {

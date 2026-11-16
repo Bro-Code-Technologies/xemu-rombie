@@ -437,11 +437,14 @@ static uint32_t s_next_read_id;
 static uint64_t s_chunk_clock;
 static double NowMs(void);
 
-/* The background read of the disc's unknown sectors (ScanThread) asks for
- * chunks outside the game's: they don't go in s_chunks, so they never push
- * out a chunk the game reads again. s_disc_mutex. */
+/* The background read of the disc's unknown sectors (ScanThread) and the
+ * disk's fill from the disc (rombie_engine_disc_fetch) ask for whole ranges
+ * outside the game's chunks: they don't go in s_chunks, so they never push
+ * out a chunk the game reads again, and each is one read of the player's
+ * file. s_disc_mutex. */
 struct ScanWait {
     std::condition_variable cv;
+    uint32_t id = 0;
     bool done = false;
     bool ok = false;
     std::vector<uint8_t> data;
@@ -3024,32 +3027,38 @@ static bool GameDiscReadOut(void)
     return false;
 }
 
-static bool ScanRead(uint64_t offset, uint32_t length,
-                     std::vector<uint8_t> &out)
+/* Asks the page for the whole range in one message; null if the page has
+ * gone. */
+static std::shared_ptr<ScanWait> AskWhole(uint64_t offset, uint32_t length)
 {
     auto w = std::make_shared<ScanWait>();
-    uint32_t id;
     {
         std::unique_lock<std::mutex> lock(s_disc_mutex);
         if (!s_page_connected.load(std::memory_order_acquire)) {
-            return false;
+            return nullptr;
         }
-        id = ++s_next_read_id;
-        s_scan_ids[id] = w;
+        w->id = ++s_next_read_id;
+        s_scan_ids[w->id] = w;
     }
     uint8_t request[20] = { MSG_DISC_READ };
-    memcpy(&request[4], &id, sizeof(id));
+    memcpy(&request[4], &w->id, sizeof(w->id));
     memcpy(&request[8], &offset, sizeof(offset));
     memcpy(&request[16], &length, sizeof(length));
     if (!SendMessageParts(0x2, request, sizeof(request), nullptr, 0)) {
         std::unique_lock<std::mutex> lock(s_disc_mutex);
-        s_scan_ids.erase(id);
-        return false;
+        s_scan_ids.erase(w->id);
+        return nullptr;
     }
+    return w;
+}
+
+static bool AwaitWhole(const std::shared_ptr<ScanWait> &w, uint32_t length,
+                       std::vector<uint8_t> &out)
+{
     std::unique_lock<std::mutex> lock(s_disc_mutex);
     if (!w->cv.wait_for(lock, std::chrono::seconds(SCAN_WAIT_S),
                         [&]() { return w->done; })) {
-        s_scan_ids.erase(id);
+        s_scan_ids.erase(w->id);
         return false;
     }
     if (!w->ok || w->data.size() != length) {
@@ -3057,6 +3066,42 @@ static bool ScanRead(uint64_t offset, uint32_t length,
     }
     out = std::move(w->data);
     return true;
+}
+
+static bool ScanRead(uint64_t offset, uint32_t length,
+                     std::vector<uint8_t> &out)
+{
+    const auto w = AskWhole(offset, length);
+    return w && AwaitWhole(w, length, out);
+}
+
+void *rombie_engine_disc_fetch(uint64_t offset, uint32_t length)
+{
+    /* Keeps the background read off the disc meanwhile. */
+    s_last_game_read_ms.store((int64_t)NowMs(), std::memory_order_relaxed);
+    auto w = AskWhole(offset, length);
+    return w ? new std::shared_ptr<ScanWait>(std::move(w)) : nullptr;
+}
+
+bool rombie_engine_disc_fetched(void *fetch, void *dst, uint32_t length)
+{
+    if (!fetch) {
+        return false;
+    }
+    std::unique_ptr<std::shared_ptr<ScanWait>> w(
+        static_cast<std::shared_ptr<ScanWait> *>(fetch));
+    std::vector<uint8_t> data;
+    if (!AwaitWhole(*w, length, data)) {
+        return false;
+    }
+    memcpy(dst, data.data(), length);
+    return true;
+}
+
+void rombie_engine_disc_fetch_drop(void *fetch)
+{
+    /* The page's answer, if it still comes, finds no one waiting. */
+    delete static_cast<std::shared_ptr<ScanWait> *>(fetch);
 }
 
 static void ScanThread(std::string dir)

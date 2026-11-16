@@ -102,6 +102,16 @@ typedef void (*rombie_disc_read_cb)(void *opaque, bool ok);
 void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
                              rombie_disc_read_cb cb, void *opaque);
 
+/* ui/rombie-engine-media.c, filling a disk from the disc: a read of its own,
+ * past the chunks, as one message the page answers with one read of the file
+ * (a hard disk loses most of its speed to reads asked for together). fetch
+ * asks (null if the page has gone), fetched waits and copies, and frees the
+ * fetch either way; drop frees one not waited for. Not the page session
+ * thread, which answers them. */
+void *rombie_engine_disc_fetch(uint64_t offset, uint32_t length);
+bool rombie_engine_disc_fetched(void *fetch, void *dst, uint32_t length);
+void rombie_engine_disc_fetch_drop(void *fetch);
+
 /* Lockstep (netplay): set by the page's 0x0B before boot, fixed after. The
  * guest's time is its instruction count, and everything it can see happens
  * at a point of that time, so two engines given the same inputs stay

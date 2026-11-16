@@ -548,7 +548,14 @@ into a machine that has never run.
   On every PC, before the state loads, each run comes from that PC's own
   disc (`fill_from_disc`), unless the disk already holds it (the host's own,
   rebooted with its full disk); a check that doesn't match fails the join
-  ("This disc isn't the same as the host's").
+  ("This disc isn't the same as the host's"). A save's runs fill the same
+  way at boot. The fill reads the runs in the disc's order, 8 MB at a time,
+  each one message the page answers with one read of its file
+  (`rombie_engine_disc_fetch`, past the game's chunks), the next asked for
+  while this one is written. Through the chunks, an 8 MB read was ten 1 MB
+  reads at once, and the laptop's 5400 rpm disk, seeking between them, gave
+  22 MB/s, 32 s for Halo 2's 686 MB (127 MB/s one read at a time); the main
+  PC's SSD did it in 2.7-4.4 s either way.
 - **No BIOS in the state**: `xbox.bios` (the flash) and `xbox.mcpx` (the
   flash with the MCPX ROM over its end) are marked not migratable around the
   save, so the stream leaves them out, and around the load, so a stream
