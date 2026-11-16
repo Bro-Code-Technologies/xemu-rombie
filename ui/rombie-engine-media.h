@@ -54,10 +54,22 @@ void rombie_media_settle_blob(void);
 bool rombie_media_fill_save_runs(const uint8_t *runs, uint32_t count,
                                  char **error);
 
-/* Page session thread: a chunk of the disc came, so its sectors are known
- * (netplay's disc runs). */
+/* Page session thread, or the background read's: a chunk of the disc came,
+ * so its sectors are known (netplay's disc runs). */
 void rombie_media_disc_chunk(uint64_t offset, const uint8_t *data,
                              size_t size);
+
+/* The background read of the disc's unknown sectors (any thread):
+ *   _load: true once the disc's first megabyte is known, its sectors file in
+ *     `dir` then loaded;
+ *   _save: that file written, if this engine knows sectors it doesn't have;
+ *   _unknown: the first offset at or after `from`, a multiple of `chunk`,
+ *     whose chunk holds a sector not known, UINT64_MAX when there is none;
+ *     `known` and `count` give the disc's sectors known and in all. */
+bool rombie_media_sectors_load(const char *dir);
+void rombie_media_sectors_save(const char *dir);
+uint64_t rombie_media_sectors_unknown(uint64_t from, uint32_t chunk,
+                                      uint64_t *known, uint64_t *count);
 
 /* Netplay's handoff, on the host: stops the machine where it is (it stays
  * stopped) and makes what every PC boots with, in `dir`'s scratch files:

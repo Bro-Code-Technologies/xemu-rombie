@@ -518,9 +518,33 @@ into a machine that has never run.
   them in runs (disk offset, disc sector, sectors, and a check: the sectors'
   hashes in order). The engine knows a sector by its hash once the page has
   sent its chunk (`rombie_media_disc_chunk`, from `HandleDiscData`), and
-  keeps the hashes in its data folder (`disc-sectors.bin`, one disc, named
-  by its size and its first megabyte), for the engines after it: a
-  restarted host's resync, or a session whose cache an earlier one filled.
+  keeps the hashes in its data folder, a file for each disc
+  (`disc-sectors-<identity>.bin`, the identity from its size and its first
+  megabyte; the one-disc `disc-sectors.bin` before it is merged in while it
+  names the same disc, then removed), for the engines after it: a restarted
+  host's resync, a session whose cache an earlier one filled, a game played
+  again after another. A disc's file is read once a run (when its first
+  megabyte is known, `load_sectors_locked`) and written only when the engine
+  knows sectors it doesn't have (a whole disc's is tens of MB).
+- **The rest of the disc, read once** (`ScanThread` in
+  `ui/xui/rombie-engine.cc`, from the boot). A game that copies its disc to
+  the hard disk once reads those sectors from the disk ever after, so they
+  stayed unknown once their file was gone (Rombie BRAIN-38's room session:
+  the host knew 114 MB of a 688 MB Halo 2 disk as the disc's, and a guest's
+  handoff carried 577.7 MB). While the game runs outside lockstep, a thread
+  reads each 1 MB chunk with a sector not known from the page, hashes it and
+  saves the file every 512 MB and at the end. Its reads have ids of their
+  own (`s_scan_ids`) and never enter the game's chunk cache; it starts 30 s
+  after the boot (past the game's loading and first saves, where Halo 2's
+  frame rate dips anyway), reads one at a time, 40 ms apart, none while the
+  game waits for the page or did in the
+  last 250 ms (a read the engine's chunks answer doesn't count: Halo 2's
+  menus stream from the disc all the time and held it off for minutes), and
+  none in lockstep, where the guests' reads have deadlines a busy page would
+  miss. Its first read is the first megabyte, whose identity names the
+  disc's file, which may already know the rest. On the main PC it reads
+  Halo 2's 4.4 GB at about 21 MB/s, about 3.5 minutes, the game at 59-61
+  vbl throughout.
   On every PC, before the state loads, each run comes from that PC's own
   disc (`fill_from_disc`), unless the disk already holds it (the host's own,
   rebooted with its full disk); a check that doesn't match fails the join

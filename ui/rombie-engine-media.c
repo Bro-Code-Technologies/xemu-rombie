@@ -62,7 +62,10 @@
 #define DISC_SECTOR 2048
 #define RUN_BYTES 24 /* u64 disk offset, u32 disc sector, u32 sectors, u64 check */
 #define DISC_PIECE (8 << 20) /* a run is read from the disc this much at a time */
-#define SECTORS_FILE "disc-sectors.bin"
+/* Each disc's known sectors have a file of their own in the data folder,
+ * disc-sectors-<identity>.bin; this one held a single disc's, which another
+ * replaced, until Rombie BRAIN-38 Phase 10.5. */
+#define LEGACY_SECTORS_FILE "disc-sectors.bin"
 #define SECTORS_MAGIC "RXDS"
 #define SECTORS_FORMAT 1
 #define SECTORS_HEADER 32 /* magic, u32 format, u64 sectors, u64 disc, u64 entries */
@@ -226,9 +229,10 @@ static void set_bios_migratable(bool on)
  * every guest has the disc, so the handoff's disk leaves out each 4 KB block
  * that is two sectors of the disc and names them instead, in runs. The
  * engine knows a sector by its hash once the page has sent it (the game read
- * it), and keeps those in its data folder, for one disc, for the engines
+ * it, or the engine's background read did, rombie-engine.cc's ScanThread),
+ * and keeps those in its data folder, a file for each disc, for the engines
  * after it: a restarted host's resync, a session whose cache an earlier one
- * filled.
+ * filled, a game played again after another.
  */
 #define HASH_P1 0x9E3779B185EBCA87ULL
 #define HASH_P2 0xC2B2AE3D27D4EB4FULL
@@ -238,6 +242,8 @@ static GMutex sectors_lock; /* the page's session thread records */
 static uint64_t sectors_count;
 static uint64_t *sector_hashes;
 static unsigned long *sector_known;
+static uint64_t sectors_loaded; /* the disc whose file has joined these */
+static uint64_t sectors_saved;  /* how many were known when it was written */
 
 typedef struct {
     uint64_t hash;
@@ -304,6 +310,8 @@ void rombie_media_disc_chunk(uint64_t offset, const uint8_t *data, size_t size)
         sectors_count = count;
         sector_hashes = g_new0(uint64_t, count);
         sector_known = bitmap_new(count);
+        sectors_loaded = 0;
+        sectors_saved = 0;
     }
     const uint64_t first = offset / DISC_SECTOR;
     for (size_t i = 0; i < n && first + i < count; i++) {
@@ -349,15 +357,17 @@ static uint64_t disc_identity_locked(void)
     return identity ? identity : 1;
 }
 
-/* sectors_lock held: the folder's sectors for this disc join this engine's. */
-static void merge_sectors_locked(const char *path, uint64_t identity)
+/* sectors_lock held: the file's sectors join this engine's, if it names this
+ * disc. Returns how many it holds, -1 for none of this disc's. */
+static int64_t merge_sectors_locked(const char *path, uint64_t identity)
 {
     gchar *bytes = NULL;
     gsize length = 0;
     if (!g_file_get_contents(path, &bytes, &length, NULL)) {
-        return;
+        return -1;
     }
     const uint8_t *p = (const uint8_t *)bytes;
+    int64_t merged = -1;
     if (length >= SECTORS_HEADER && !memcmp(p, SECTORS_MAGIC, 4) &&
         (uint32_t)ldl_le_p(p + 4) == SECTORS_FORMAT &&
         ldq_le_p(p + 8) == sectors_count && ldq_le_p(p + 16) == identity) {
@@ -371,12 +381,14 @@ static void merge_sectors_locked(const char *path, uint64_t identity)
                     set_bit(s, sector_known);
                 }
             }
+            merged = (int64_t)entries;
         }
     }
     g_free(bytes);
+    return merged;
 }
 
-static void save_sectors_locked(const char *path, uint64_t identity)
+static bool save_sectors_locked(const char *path, uint64_t identity)
 {
     const uint64_t entries = bitmap_count_one(sector_known, sectors_count);
     const size_t size = SECTORS_HEADER + entries * 16;
@@ -393,7 +405,95 @@ static void save_sectors_locked(const char *path, uint64_t identity)
         stq_le_p(e + 8, sector_hashes[s]);
         e += 16;
     }
-    g_file_set_contents(path, (const gchar *)out, (gssize)size, NULL);
+    return g_file_set_contents(path, (const gchar *)out, (gssize)size, NULL);
+}
+
+static char *sectors_path(const char *dir, uint64_t identity)
+{
+    g_autofree char *name =
+        g_strdup_printf("disc-sectors-%016" PRIx64 ".bin", identity);
+    return g_build_filename(dir, name, NULL);
+}
+
+/* sectors_lock held: the disc's file, written if this engine knows sectors
+ * it doesn't have. A whole disc's is tens of MB (16 bytes a sector), so it
+ * isn't written again for nothing. */
+static void save_new_sectors_locked(const char *dir, uint64_t identity)
+{
+    const uint64_t known = bitmap_count_one(sector_known, sectors_count);
+    g_autofree char *path = sectors_path(dir, identity);
+    if (known != sectors_saved && save_sectors_locked(path, identity)) {
+        sectors_saved = known;
+    }
+}
+
+/* sectors_lock held: the disc's identity once its first megabyte is known,
+ * else 0. The first time it is, the disc's file joins what this engine
+ * knows, with the old one-disc file while that names this disc, which then
+ * goes. */
+static uint64_t load_sectors_locked(const char *dir)
+{
+    const uint64_t identity = sectors_count ? disc_identity_locked() : 0;
+    if (!identity || identity == sectors_loaded) {
+        return identity;
+    }
+    g_autofree char *path = sectors_path(dir, identity);
+    g_autofree char *legacy = g_build_filename(dir, LEGACY_SECTORS_FILE, NULL);
+    /* The file as it stands is saved already when it holds every sector this
+     * engine knows now. */
+    const int64_t in_file = merge_sectors_locked(path, identity);
+    if (in_file >= 0 &&
+        (uint64_t)in_file == bitmap_count_one(sector_known, sectors_count)) {
+        sectors_saved = (uint64_t)in_file;
+    }
+    const bool had_legacy = merge_sectors_locked(legacy, identity) >= 0;
+    sectors_loaded = identity;
+    save_new_sectors_locked(dir, identity);
+    if (had_legacy && sectors_saved) {
+        g_remove(legacy);
+    }
+    return identity;
+}
+
+bool rombie_media_sectors_load(const char *dir)
+{
+    g_mutex_lock(&sectors_lock);
+    const bool loaded = load_sectors_locked(dir) != 0;
+    g_mutex_unlock(&sectors_lock);
+    return loaded;
+}
+
+void rombie_media_sectors_save(const char *dir)
+{
+    g_mutex_lock(&sectors_lock);
+    const uint64_t identity = load_sectors_locked(dir);
+    if (identity) {
+        save_new_sectors_locked(dir, identity);
+    }
+    g_mutex_unlock(&sectors_lock);
+}
+
+uint64_t rombie_media_sectors_unknown(uint64_t from, uint32_t chunk,
+                                      uint64_t *known, uint64_t *count)
+{
+    const uint64_t disc = rombie_engine_disc_size();
+    g_mutex_lock(&sectors_lock);
+    uint64_t at = UINT64_MAX;
+    *count = disc / DISC_SECTOR;
+    *known = 0;
+    if (sectors_count != *count) {
+        /* Nothing has come yet. */
+        at = from < disc ? from - from % chunk : UINT64_MAX;
+    } else {
+        *known = bitmap_count_one(sector_known, sectors_count);
+        const uint64_t s =
+            find_next_zero_bit(sector_known, sectors_count, from / DISC_SECTOR);
+        if (s < sectors_count) {
+            at = s * DISC_SECTOR - (s * DISC_SECTOR) % chunk;
+        }
+    }
+    g_mutex_unlock(&sectors_lock);
+    return at;
 }
 
 static int compare_keys(const void *a, const void *b)
@@ -415,12 +515,10 @@ static void disc_index_open(const char *dir, DiscIndex *index)
     /* Its chunk comes, and is known, if it wasn't. */
     g_autofree uint8_t *first = g_malloc(DISC_SECTOR);
     read_disc(0, DISC_SECTOR, first);
-    g_autofree char *path = g_build_filename(dir, SECTORS_FILE, NULL);
     g_mutex_lock(&sectors_lock);
-    const uint64_t identity = sectors_count ? disc_identity_locked() : 0;
+    const uint64_t identity = load_sectors_locked(dir);
     if (identity) {
-        merge_sectors_locked(path, identity);
-        save_sectors_locked(path, identity);
+        save_new_sectors_locked(dir, identity);
         index->count = sectors_count;
         index->hashes = g_memdup2(sector_hashes, sectors_count * 8);
         index->known = g_memdup2(sector_known,

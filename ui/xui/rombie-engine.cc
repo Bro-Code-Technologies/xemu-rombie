@@ -336,6 +336,7 @@ static void StartSave(void);
 static void AfterSave(std::function<void()> work);
 static void SendGameDataNow(void);
 [[noreturn]] static void RestartSelf(void);
+static void ScanThread(std::string dir);
 static void RestartAfterSave(void);
 static uint64_t s_disc_size;
 static std::string s_disc_name;
@@ -435,6 +436,18 @@ static std::unordered_map<uint32_t, uint64_t> s_chunk_ids;
 static uint32_t s_next_read_id;
 static uint64_t s_chunk_clock;
 static double NowMs(void);
+
+/* The background read of the disc's unknown sectors (ScanThread) asks for
+ * chunks outside the game's: they don't go in s_chunks, so they never push
+ * out a chunk the game reads again. s_disc_mutex. */
+struct ScanWait {
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    std::vector<uint8_t> data;
+};
+static std::unordered_map<uint32_t, std::shared_ptr<ScanWait>> s_scan_ids;
+static std::atomic<int64_t> s_last_game_read_ms{0};
 
 /* s_disc_mutex held, every chunk of the read ready. */
 static void CopyFromChunksLocked(const DiscWaiter &w)
@@ -1077,6 +1090,15 @@ static void HandleDiscData(const std::vector<uint8_t> &data)
         std::unique_lock<std::mutex> lock(s_disc_mutex);
         const auto idit = s_chunk_ids.find(id);
         if (idit == s_chunk_ids.end()) {
+            const auto scan = s_scan_ids.find(id);
+            if (scan != s_scan_ids.end()) {
+                ScanWait &w = *scan->second;
+                w.data.assign(data.begin() + 8, data.end());
+                w.ok = !w.data.empty();
+                w.done = true;
+                w.cv.notify_all();
+                s_scan_ids.erase(scan);
+            }
             return;
         }
         const uint64_t index = idit->second;
@@ -1153,6 +1175,11 @@ static void FailAllDiscReads(void)
             UnpinLocked(*w);
         }
         s_chunk_ids.clear();
+        for (auto &scan : s_scan_ids) {
+            scan.second->done = true;
+            scan.second->cv.notify_all();
+        }
+        s_scan_ids.clear();
     }
     for (auto &w : failed) {
         w->cb(w->opaque, false);
@@ -2793,6 +2820,8 @@ void rombie_engine_wait_for_boot(void)
     fprintf(stderr, "rombie-engine: booting '%s' (%llu bytes)\n",
             s_disc_name.c_str(), (unsigned long long)s_disc_size);
     SendEvent("booted", s_disc_name);
+    g_autofree char *data_dir = g_path_get_dirname(g_config.sys.files.hdd_path);
+    std::thread(ScanThread, std::string(data_dir)).detach();
 }
 
 void rombie_engine_run_pending(void)
@@ -2951,6 +2980,12 @@ void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
             }
         }
     }
+    /* Only a read that waits for the page holds the background read off: a
+     * game streaming from the disc (Halo 2's menus) reads it all the time,
+     * nearly all from the chunks here, and held it off for minutes. */
+    if (!done && !failed) {
+        s_last_game_read_ms.store((int64_t)NowMs(), std::memory_order_relaxed);
+    }
     for (const auto &ask : asks) {
         SendChunkRequest(ask.first, ask.second);
     }
@@ -2958,6 +2993,140 @@ void rombie_engine_disc_read(uint64_t offset, uint32_t length, void *dst,
         cb(opaque, true);
     } else if (failed) {
         cb(opaque, false);
+    }
+}
+
+/*
+ * The rest of the disc, read once (Rombie BRAIN-38 Phase 10.5). A save or a
+ * handoff leaves out the disk's grains that are the disc's, but only sectors
+ * the engine knows, and a game that copies its disc to the hard disk once
+ * (Halo 2's maps) reads those sectors from the disk ever after. So while the
+ * game runs outside lockstep, this reads every sector not known yet from the
+ * page, a chunk at a time, and its file in the data folder keeps them for
+ * every engine after. It stays out of the game's way: one read at a time,
+ * none while the game waits for the page or did a moment ago, and none in
+ * lockstep, where the guests' reads have deadlines a busy page would miss.
+ */
+static constexpr int SCAN_START_S = 30;    /* after the boot, its loading and first saves */
+static constexpr int SCAN_GAP_MS = 40;     /* between its reads */
+static constexpr int SCAN_QUIET_MS = 250;  /* after the game last waited */
+static constexpr int SCAN_WAIT_S = 15;     /* for the page's answer */
+static constexpr uint64_t SCAN_SAVE_BYTES = 512ull << 20;
+
+static bool GameDiscReadOut(void)
+{
+    std::unique_lock<std::mutex> lock(s_disc_mutex);
+    for (const auto &chunk : s_chunks) {
+        if (!chunk.second.ready) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ScanRead(uint64_t offset, uint32_t length,
+                     std::vector<uint8_t> &out)
+{
+    auto w = std::make_shared<ScanWait>();
+    uint32_t id;
+    {
+        std::unique_lock<std::mutex> lock(s_disc_mutex);
+        if (!s_page_connected.load(std::memory_order_acquire)) {
+            return false;
+        }
+        id = ++s_next_read_id;
+        s_scan_ids[id] = w;
+    }
+    uint8_t request[20] = { MSG_DISC_READ };
+    memcpy(&request[4], &id, sizeof(id));
+    memcpy(&request[8], &offset, sizeof(offset));
+    memcpy(&request[16], &length, sizeof(length));
+    if (!SendMessageParts(0x2, request, sizeof(request), nullptr, 0)) {
+        std::unique_lock<std::mutex> lock(s_disc_mutex);
+        s_scan_ids.erase(id);
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(s_disc_mutex);
+    if (!w->cv.wait_for(lock, std::chrono::seconds(SCAN_WAIT_S),
+                        [&]() { return w->done; })) {
+        s_scan_ids.erase(id);
+        return false;
+    }
+    if (!w->ok || w->data.size() != length) {
+        return false;
+    }
+    out = std::move(w->data);
+    return true;
+}
+
+static void ScanThread(std::string dir)
+{
+    uint64_t next = 0, read = 0, since_save = 0;
+    bool loaded = false, announced = false;
+    double started = 0;
+    std::vector<uint8_t> data;
+    std::this_thread::sleep_for(std::chrono::seconds(SCAN_START_S));
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(SCAN_GAP_MS));
+        if (!s_page_connected.load(std::memory_order_acquire) ||
+            rombie_engine_lockstep() ||
+            (int64_t)NowMs() - s_last_game_read_ms.load() < SCAN_QUIET_MS ||
+            GameDiscReadOut()) {
+            continue;
+        }
+        if (!loaded) {
+            loaded = rombie_media_sectors_load(dir.c_str());
+        }
+        uint64_t known = 0, count = 0;
+        const uint64_t at =
+            rombie_media_sectors_unknown(next, DISC_CHUNK, &known, &count);
+        if (at == UINT64_MAX) {
+            if (next != 0) {
+                next = 0; /* a chunk skipped before the cursor */
+                continue;
+            }
+            rombie_media_sectors_save(dir.c_str());
+            if (announced) {
+                fprintf(stderr,
+                        "rombie-engine: the whole disc is known: %.0f MB read "
+                        "in %.0f s\n",
+                        read / 1048576.0, (NowMs() - started) / 1000.0);
+            } else {
+                fprintf(stderr, "rombie-engine: the whole disc is known "
+                                "already\n");
+            }
+            return;
+        }
+        if (!loaded) {
+            /* Its first megabyte names the disc's file, which may know the
+             * rest: that comes before anything else. */
+            next = 0;
+        } else if (!announced) {
+            announced = true;
+            started = NowMs();
+            fprintf(stderr,
+                    "rombie-engine: reading the disc's unknown sectors in the "
+                    "background (%.0f of %.0f MB known)\n",
+                    known * 2048.0 / 1048576.0, count * 2048.0 / 1048576.0);
+        }
+        const uint64_t from = loaded ? at : 0;
+        const uint32_t length =
+            (uint32_t)std::min<uint64_t>(DISC_CHUNK, s_disc_size - from);
+        if (!ScanRead(from, length, data)) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
+        rombie_media_disc_chunk(from, data.data(), length);
+        next = from + DISC_CHUNK;
+        read += length;
+        since_save += length;
+        if (since_save >= SCAN_SAVE_BYTES) {
+            since_save = 0;
+            rombie_media_sectors_save(dir.c_str());
+            fprintf(stderr,
+                    "rombie-engine: background read: %.0f of %.0f MB known\n",
+                    known * 2048.0 / 1048576.0, count * 2048.0 / 1048576.0);
+        }
     }
 }
 
